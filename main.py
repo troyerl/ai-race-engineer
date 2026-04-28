@@ -2,10 +2,10 @@ import sys
 import json
 import boto3
 import threading
-from PySide6.QtWidgets import QApplication, QLabel
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
-import irsdk
 import os
+from PySide6.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout, QLabel
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint
+import irsdk
 
 # --- AWS CONFIG ---
 MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
@@ -16,12 +16,18 @@ class BedrockWorker(QObject):
     def invoke_ai(self, race_json):
         def run():
             try:
+                # Read the token from the environment variable inside the worker
+                token = os.getenv("IRACING_BEDROCK_TOKEN")
+                
+                if not token:
+                    self.finished.emit("Error: Env variable IRACING_BEDROCK_TOKEN is not set.")
+                    return
 
-                bedrock_token = "bedrock-api-key-YmVkcm..." # Paste your full token here
-                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = bedrock_token
+                # Set the specific AWS environment variable Bedrock expects
+                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
 
-                # Update region to your specific AWS region
-                client = boto3.client("bedrock-runtime", region_name="us-east-1")
+                # Region set to us-east-2 based on your previous token data
+                client = boto3.client("bedrock-runtime", region_name="us-east-2")
                 
                 prompt = (
                     "Act as a professional race engineer. Analyze this JSON telemetry "
@@ -40,27 +46,61 @@ class BedrockWorker(QObject):
                 advice = response_body['content'][0]['text']
                 self.finished.emit(advice)
             except Exception as e:
-                self.finished.emit(f"Connection Error: {str(e)}")
+                self.finished.emit(f"AI Error: {str(e)}")
         
         threading.Thread(target=run).start()
 
-class AIRaceEngineer(QLabel):
+class AIRaceEngineer(QWidget):
     def __init__(self):
-        super().__init__("Press Ctrl+Shift+A for AI Advice")
+        super().__init__()
         self.ir = irsdk.IRSDK()
         self.ir.startup()
-        
-        # Track currently pressed keys
-        self.pressed_keys = set()
         
         # UI Setup
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setStyleSheet("color: #00FF00; font-family: 'Segoe UI'; font-size: 22px; font-weight: bold;")
-        self.setFixedSize(900, 150)
-        self.setAlignment(Qt.AlignCenter)
+        self.setFixedSize(400, 150)
 
-        # Data Tracking for Lap History
+        self.layout = QVBoxLayout()
+        
+        # Advice Label
+        self.label = QLabel("Engineer Standby")
+        self.label.setStyleSheet("color: #00FF00; font-family: 'Segoe UI'; font-size: 18px; font-weight: bold; background: rgba(0,0,0,100); padding: 5px; border-radius: 5px;")
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setWordWrap(True)
+        
+        # Check if environment variable exists on startup
+        if not os.getenv("IRACING_BEDROCK_TOKEN"):
+            self.label.setText("CRITICAL: Set IRACING_BEDROCK_TOKEN env var!")
+            self.label.setStyleSheet("color: #FF0000; font-weight: bold; background: rgba(0,0,0,150);")
+
+        # Trigger Button
+        self.btn = QPushButton("ASK ENGINEER")
+        self.btn.setCursor(Qt.PointingHandCursor)
+        self.btn.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60;
+                color: white;
+                font-family: 'Segoe UI';
+                font-size: 16px;
+                font-weight: bold;
+                border-radius: 10px;
+                padding: 10px;
+            }
+            QPushButton:hover {
+                background-color: #2ecc71;
+            }
+            QPushButton:pressed {
+                background-color: #1e8449;
+            }
+        """)
+        self.btn.clicked.connect(self.trigger_ai_request)
+
+        self.layout.addWidget(self.label)
+        self.layout.addWidget(self.btn)
+        self.setLayout(self.layout)
+
+        # Data Tracking
         self.lap_history = {}
         self.last_recorded_lap = {}
         
@@ -68,13 +108,12 @@ class AIRaceEngineer(QLabel):
         self.ai_worker = BedrockWorker()
         self.ai_worker.finished.connect(self.display_advice)
 
-        # Telemetry Timer (keeps history updated in background)
+        # Telemetry Timer
         self.telemetry_timer = QTimer()
         self.telemetry_timer.timeout.connect(self.update_history)
         self.telemetry_timer.start(100)
 
     def update_history(self):
-        """Silently tracks lap times in the background so data is ready when requested."""
         if not self.ir.is_connected:
             self.ir.startup()
             return
@@ -90,48 +129,33 @@ class AIRaceEngineer(QLabel):
                 last_time = self.ir['CarIdxLastLapTime'][i]
                 if last_time > 0:
                     self.lap_history[i].append(round(last_time, 3))
-                    self.lap_history[i] = self.lap_history[i][-5:] # Keep last 5
+                    self.lap_history[i] = self.lap_history[i][-5:]
                 self.last_recorded_lap[i] = curr_lap
-
-    def keyPressEvent(self, event):
-        self.pressed_keys.add(event.key())
-        
-        # TRIGGER COMBO: Control + Shift + A
-        trigger_combo = {Qt.Key_Control, Qt.Key_Shift, Qt.Key_A}
-        
-        if trigger_combo.issubset(self.pressed_keys):
-            self.trigger_ai_request()
-
-    def keyReleaseEvent(self, event):
-        if event.key() in self.pressed_keys:
-            self.pressed_keys.remove(event.key())
 
     def trigger_ai_request(self):
         if not self.ir.is_connected:
-            self.setText("ENGINEER: Cannot see the car. Is iRacing open?")
+            self.label.setText("ENGINEER: Connection Lost")
             return
 
-        self.setText("ENGINEER: Analyzing data...")
+        self.label.setText("Consulting Engineer...")
+        self.btn.setEnabled(False) # Prevent double clicking
         
-        # Compile the JSON packet
         packet = {
             "lap": self.ir['Lap'],
             "pos": self.ir['PlayerCarClassPosition'],
             "fuel": round(self.ir['FuelLevel'], 2),
-            "tire_wear": self.ir.get('LFwearL', 1.0), # Note: Live wear isn't always available in all cars
             "history": self.lap_history.get(self.ir['PlayerCarIdx'], [])
         }
         
         self.ai_worker.invoke_ai(json.dumps(packet, separators=(',', ':')))
 
     def display_advice(self, text):
-        self.setText(f"ENGINEER: {text}")
+        self.label.setText(f"STRATEGY: {text}")
+        self.btn.setEnabled(True)
 
-    # Mouse events for moving the overlay
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.offset = event.position().toPoint()
-            self.setFocus(Qt.OtherFocusReason) 
 
     def mouseMoveEvent(self, event):
         if event.buttons() == Qt.LeftButton:
