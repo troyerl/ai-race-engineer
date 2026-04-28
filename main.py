@@ -4,7 +4,7 @@ import boto3
 import threading
 import os
 from PySide6.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout, QLabel
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint
+from PySide6.QtCore import Qt, QTimer, Signal, QObject
 import irsdk
 
 # --- AWS CONFIG ---
