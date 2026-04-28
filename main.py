@@ -3,8 +3,9 @@ import json
 import boto3
 import threading
 import os
+import yaml
 from PySide6.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout, QLabel
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint
 import irsdk
 
 # --- AWS CONFIG ---
@@ -16,22 +17,18 @@ class BedrockWorker(QObject):
     def invoke_ai(self, race_json):
         def run():
             try:
-                # Read the token from the environment variable inside the worker
                 token = os.getenv("IRACING_BEDROCK_TOKEN")
-                
                 if not token:
-                    self.finished.emit("Error: Env variable IRACING_BEDROCK_TOKEN is not set.")
+                    self.finished.emit("Error: Set IRACING_BEDROCK_TOKEN")
                     return
 
-                # Set the specific AWS environment variable Bedrock expects
                 os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
-
-                # Region set to us-east-2 based on your previous token data
                 client = boto3.client("bedrock-runtime", region_name="us-east-2")
                 
                 prompt = (
-                    "Act as a professional race engineer. Analyze this JSON telemetry "
-                    "and provide a concise strategy (10 words max). "
+                    "You are a Lead Race Engineer. Analyze the telemetry for the User and the Field. "
+                    "Compare lap times to determine if the User is losing ground. "
+                    "Provide a 10-word max strategy (e.g., 'Leaders pitting, stay out to gain track position'). "
                     f"Data: {race_json}"
                 )
                 
@@ -59,107 +56,100 @@ class AIRaceEngineer(QWidget):
         # UI Setup
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(400, 150)
+        self.setFixedSize(450, 180)
 
         self.layout = QVBoxLayout()
-        
-        # Advice Label
         self.label = QLabel("Engineer Standby")
-        self.label.setStyleSheet("color: #00FF00; font-family: 'Segoe UI'; font-size: 18px; font-weight: bold; background: rgba(0,0,0,100); padding: 5px; border-radius: 5px;")
+        self.label.setStyleSheet("color: #00FF00; font-family: 'Segoe UI'; font-size: 18px; font-weight: bold; background: rgba(0,0,0,120); padding: 8px; border-radius: 5px;")
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setWordWrap(True)
         
-        # Check if environment variable exists on startup
-        if not os.getenv("IRACING_BEDROCK_TOKEN"):
-            self.label.setText("CRITICAL: Set IRACING_BEDROCK_TOKEN env var!")
-            self.label.setStyleSheet("color: #FF0000; font-weight: bold; background: rgba(0,0,0,150);")
-
-        # Trigger Button
-        self.btn = QPushButton("ASK ENGINEER")
+        self.btn = QPushButton("ANALYZE FIELD & ADVISE")
         self.btn.setCursor(Qt.PointingHandCursor)
-        self.btn.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60;
-                color: white;
-                font-family: 'Segoe UI';
-                font-size: 16px;
-                font-weight: bold;
-                border-radius: 10px;
-                padding: 10px;
-            }
-            QPushButton:hover {
-                background-color: #2ecc71;
-            }
-            QPushButton:pressed {
-                background-color: #1e8449;
-            }
-        """)
+        self.btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; border-radius: 10px; padding: 12px;")
         self.btn.clicked.connect(self.trigger_ai_request)
 
         self.layout.addWidget(self.label)
         self.layout.addWidget(self.btn)
         self.setLayout(self.layout)
 
-        # Data Tracking
-        self.lap_history = {}
-        self.last_recorded_lap = {}
+        # Global Pace Tracking
+        self.field_history = {} # {car_idx: [lap_times]}
+        self.last_recorded_lap = {} # {car_idx: lap_num}
         
-        # AI Worker
         self.ai_worker = BedrockWorker()
         self.ai_worker.finished.connect(self.display_advice)
 
-        # Telemetry Timer
         self.telemetry_timer = QTimer()
-        self.telemetry_timer.timeout.connect(self.update_history)
+        self.telemetry_timer.timeout.connect(self.update_field_history)
         self.telemetry_timer.start(100)
 
-    def update_history(self):
+    def update_field_history(self):
         if not self.ir.is_connected:
             self.ir.startup()
             return
 
         laps = self.ir['CarIdxLap'] or []
+        last_lap_times = self.ir['CarIdxLastLapTime'] or []
+
         for i in range(len(laps)):
             curr_lap = laps[i]
             if i not in self.last_recorded_lap:
                 self.last_recorded_lap[i] = curr_lap
-                self.lap_history[i] = []
+                self.field_history[i] = []
 
+            # When a driver completes a lap
             if curr_lap > self.last_recorded_lap[i]:
-                last_time = self.ir['CarIdxLastLapTime'][i]
-                if last_time > 0:
-                    self.lap_history[i].append(round(last_time, 3))
-                    self.lap_history[i] = self.lap_history[i][-5:]
+                t = last_lap_times[i]
+                if t > 0:
+                    self.field_history[i].append(round(t, 3))
+                    self.field_history[i] = self.field_history[i][-5:]
                 self.last_recorded_lap[i] = curr_lap
 
     def trigger_ai_request(self):
         if not self.ir.is_connected:
-            self.label.setText("ENGINEER: Connection Lost")
+            self.label.setText("ENGINEER: No Signal")
             return
 
-        self.label.setText("Consulting Engineer...")
-        self.btn.setEnabled(False) # Prevent double clicking
+        self.label.setText("Processing Field Data...")
+        self.btn.setEnabled(False)
         
+        player_idx = self.ir['PlayerCarIdx']
+        player_pos = self.ir['PlayerCarClassPosition']
+        
+        # Filter Field Data to save tokens (Top 3 + Immediate Rivals)
+        # We only send data for relevant drivers
+        relevant_history = {}
+        positions = self.ir['CarIdxClassPosition'] or []
+        
+        for idx, pos in enumerate(positions):
+            # Include: Top 3, and anyone within 2 positions of the player
+            if pos <= 3 or abs(pos - player_pos) <= 2:
+                if self.field_history.get(idx):
+                    label = f"P{pos}" if idx != player_idx else "YOU"
+                    relevant_history[label] = self.field_history[idx]
+
         packet = {
-            "lap": self.ir['Lap'],
-            "pos": self.ir['PlayerCarClassPosition'],
-            "fuel": round(self.ir['FuelLevel'], 2),
-            "history": self.lap_history.get(self.ir['PlayerCarIdx'], [])
+            "me": {
+                "lap": self.ir['Lap'],
+                "pos": player_pos,
+                "fuel": round(self.ir['FuelLevel'], 2),
+                "times": self.field_history.get(player_idx, [])
+            },
+            "field": relevant_history
         }
         
         self.ai_worker.invoke_ai(json.dumps(packet, separators=(',', ':')))
 
     def display_advice(self, text):
-        self.label.setText(f"STRATEGY: {text}")
+        self.label.setText(text)
         self.btn.setEnabled(True)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.offset = event.position().toPoint()
+        if event.button() == Qt.LeftButton: self.offset = event.position().toPoint()
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self.offset)
+        if event.buttons() == Qt.LeftButton: self.move(event.globalPosition().toPoint() - self.offset)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
