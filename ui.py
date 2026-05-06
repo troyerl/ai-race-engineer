@@ -31,6 +31,10 @@ FEATURE_VOICE_ENV = "AIRACE_FEATURE_VOICE"
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ai_race_engineer.json")
 
+BTN_LIVE = "ANALYZE FIELD & ADVISE"
+BTN_STRATEGY = "GET RACE STRATEGY"
+BTN_DISCONNECTED = "ANALYZE FIELD & ADVISE"
+
 
 class AIRaceEngineer(QWidget):
     def __init__(self):
@@ -190,7 +194,7 @@ class AIRaceEngineer(QWidget):
             # Hidden until the AI actually recommends a PIT.
             self.rejoin_label.setVisible(False)
 
-        self.btn = QPushButton("ANALYZE FIELD & ADVISE")
+        self.btn = QPushButton(BTN_DISCONNECTED)
         self.btn.setObjectName("analyzeBtn")
         self.btn.setCursor(Qt.PointingHandCursor)
         self.btn.clicked.connect(self.trigger_ai_request)
@@ -346,6 +350,7 @@ class AIRaceEngineer(QWidget):
         self._conn_timer.timeout.connect(self._update_connection_badge)
         self._conn_timer.start(CONNECTION_POLL_MS)
         self._update_connection_badge()
+        self._update_action_button_text()
         self._set_ai_status("Idle")
 
         if self.rejoin_label is not None:
@@ -396,7 +401,12 @@ class AIRaceEngineer(QWidget):
             self.label.setText("ENGINEER: No Signal")
             return
 
-        self.label.setText("Processing Field Data...")
+        mode = self.telemetry.ui_mode()
+        self.label.setText(
+            "Building race strategy..."
+            if mode == "strategy"
+            else "Processing field data..."
+        )
         self.btn.setEnabled(False)
         self._request_watchdog.start(REQUEST_TIMEOUT_MS)
         self._set_ai_status("Requesting")
@@ -409,7 +419,7 @@ class AIRaceEngineer(QWidget):
             tire_sets_remaining=int(self.tire_spin.value()),
             pit_loss_sec=int(self.pit_spin.value()),
         )
-        self.ai_worker.invoke_ai(self._active_request_id, packet_json)
+        self.ai_worker.invoke_ai(self._active_request_id, packet_json, mode=mode)
 
     def clear_and_cancel(self):
         self._request_watchdog.stop()
@@ -508,6 +518,15 @@ class AIRaceEngineer(QWidget):
         if connected and (self._last_sdk_connected is None or self._last_sdk_connected is False):
             self._maybe_set_default_pit_loss()
         self._last_sdk_connected = connected
+        self._update_action_button_text()
+
+    def _update_action_button_text(self):
+        if not self.telemetry.is_connected():
+            self.btn.setText(BTN_DISCONNECTED)
+        elif self.telemetry.ui_mode() == "strategy":
+            self.btn.setText(BTN_STRATEGY)
+        else:
+            self.btn.setText(BTN_LIVE)
 
     def _on_pit_spin_changed(self, _val: int):
         # Mark as user-modified so we don't overwrite with track defaults later.

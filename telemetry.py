@@ -40,6 +40,18 @@ class TelemetryTracker:
         # Lightweight check used by the UI status indicator.
         return bool(self.ir.is_connected)
 
+    def ui_mode(self) -> str:
+        """
+        Live in-car calls vs pre-race garage / off-track planning.
+
+        Heuristic: connected and not physically on track → pre-race strategy.
+        """
+        if not self.is_connected():
+            return "live"
+        if self._ir_get("IsOnTrack", False):
+            return "live"
+        return "strategy"
+
     def _ir_get(self, key: str, default=None):
         try:
             v = self.ir[key]
@@ -462,8 +474,20 @@ class TelemetryTracker:
                 return [drop_nones(v) for v in x]
             return x
 
+        mode = self.ui_mode()
+
+        # Approx laps a full fuel load covers (strategy planning).
+        ftl = None
+        try:
+            fc = self._ir_get("FuelCapacity", None)
+            if fc is not None and fuel_use_per_lap_est:
+                ftl = round(float(fc) / float(fuel_use_per_lap_est), 1)
+        except Exception:
+            pass
+
         # Compact schema to reduce tokens (short keys, no nulls, rounded floats).
         packet = {
+            "x": {"md": mode},
             "s": {  # session
                 "st": self._ir_get("SessionState", None),
                 "tr": self._ir_get("SessionTimeRemain", None),
@@ -504,6 +528,7 @@ class TelemetryTracker:
                 "pl": int(pit_loss_sec),
                 "ts": int(tire_sets_remaining),
                 "fc": self._ir_get("FuelCapacity", None),
+                "ftl": ftl,
             },
             "rv": rivals,
             "f": relevant_history,

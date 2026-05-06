@@ -14,6 +14,60 @@ DEFAULT_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 STREAM_MAX_SECONDS = 50
 
 
+def _build_engineer_prompt(mode: str, race_json: str) -> str:
+    schema = (
+        "Data is compact JSON: "
+        "x{md=live|strategy}; "
+        "s{st=session_state,tr=time_remain,lt=laps_total,ot=is_on_track,ig=is_in_garage}; "
+        "m{l=lap,lr=laps_remain,p=pos,fu=fuel,fph=fuel/hr,fpl=fuel/lap_est,fl=fuel_laps_left,"
+        "mk=can_make,ls=laps_short,lp=last_pit_lap,t=lap_times,pc=pace,fg=flags,fs=flag_state,"
+        "pr=on_pit_road,sl=stint_laps,ga=gap_ahead_s,gb=gap_behind_s,bl=best_lap_s,fo=falloff_s,"
+        "pb=pit_payback_laps,pw=pit_window_open,pwu=laps_until_window,tw,tws,twsl,twr}; "
+        "r{pl=pit_loss,ts=tire_sets_avail,fc=fuel_capacity,ftl=laps_per_full_tank_fuel_est}; "
+        "rv=rivals; f=field. "
+    )
+    base = (
+        "You are a Lead Race Engineer. "
+        + schema
+        + "Use x.md exactly: if strategy, pre-race plan only; if live, in-race advice only. "
+    )
+
+    if mode == "strategy":
+        return (
+            base
+            + "CONTEXT: DRIVER IS OFF TRACK (garage/grid/prep). Build a PRE-RACE plan. "
+            + "Goal: approximate laps BETWEEN pit stops optimizing fuel tank (r.ftl, r.fc, m.fpl) "
+            + "and tire life using r.ts (available sets); mention when to take FUEL ONLY vs 2 vs 4 tires if helpful. "
+            + "Assume green-flag racing unless s says otherwise; note estimates are approximate. "
+            + "OUTPUT (single line, EXACT separators): "
+            "FUEL STINT — TIRE STINT — STOPS EST — NOTE <TAGS>. "
+            "- FUEL STINT: e.g. PIT EVERY N LAPS FOR FUEL (integer N from r.ftl/m.fpl/s.lt). "
+            "- TIRE STINT: e.g. EVERY M LAPS or ALIGN WITH FUEL (use r.ts). "
+            "- STOPS EST: e.g. ~K STOPS. "
+            "- NOTE: <=8 words caveat. "
+            "TAGS: [strategy|fuel|tires] and [H|M|L]. "
+            "Keep total <= 32 words. "
+            f"{race_json}"
+        )
+
+    return (
+        base
+        + "Primary goal: Optimize track position vs fuel/tire life (live race). "
+        + "Use m.fs (GREEN/CAUTION/UNKNOWN) not m.fg. "
+        + "If flag_state is CAUTION: default to STAY OUT unless fuel requires a stop or pitting gains clear track position. "
+        + "If flag_state is GREEN or UNKNOWN: do NOT recommend pitting unless we are inside the pit window or fuel requires it. "
+        + "Use tires: tire_wear_last_known is a baseline from the last pit; project next-stop wear using "
+        + "twsl and twr along with stint m.sl (stale wear when m.tws). "
+        + "Compare m.ga/m.gb to r.pl for undercut/overcut; crossover m.fo vs m.pb. "
+        + "OUTPUT FORMAT (single line, EXACT): "
+        + "<ACTION> — <TIMING> — <SERVICE> — <REASON> <TAGS>. "
+        + "ACTION: STAY OUT | PIT | PIT NOW. TIMING: THIS LAP | PIT IN N LAPS | RECHECK IN N LAPS. "
+        + "SERVICE: FUEL ONLY | 2 TIRES | 4 TIRES (PIT/PIT NOW only; STAY OUT = NONE). "
+        + "TAGS: [fuel|tires|track|flags] and [H|M|L]. <= 20 words. "
+        + f"{race_json}"
+    )
+
+
 class BedrockWorker(QObject):
     """
     Runs Bedrock calls off the UI thread and streams partial output.
@@ -80,7 +134,7 @@ class BedrockWorker(QObject):
             return False
         return True
 
-    def invoke_ai(self, request_id: int, race_json: str) -> None:
+    def invoke_ai(self, request_id: int, race_json: str, mode: str = "live") -> None:
         def run():
             try:
                 token = os.getenv("IRACING_BEDROCK_TOKEN")
@@ -98,41 +152,16 @@ class BedrockWorker(QObject):
                 os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
                 client = self._get_client()
 
-                prompt = (
-                    "You are a Lead Race Engineer. Analyze the telemetry and race status. "
-                    "Primary Goal: Optimize track position vs fuel/tire life. "
-                    "Data is compact JSON with this schema: "
-                    "s{st=session_state,tr=time_remain,lt=laps_total,ot=is_on_track,ig=is_in_garage}; "
-                    "m{l=lap,lr=laps_remain,p=pos,fu=fuel,fph=fuel/hr,fpl=fuel/lap_est,fl=fuel_laps_left,mk=can_make,ls=laps_short,"
-                    "lp=last_pit_lap,t=lap_times,pc=pace,fg=flags,fs=flag_state,pr=on_pit_road,sl=stint_laps,ga=gap_ahead_s,gb=gap_behind_s,"
-                    "bl=best_lap_s,fo=falloff_s,pb=pit_payback_laps,pw=pit_window_open,pwu=laps_until_window,"
-                    "tw=last_wear,tws=wear_stale,twsl=wear_stint_laps,twr=wear_rate}; "
-                    "r{pl=pit_loss,ts=tire_sets,fc=fuel_capacity}; rv=rivals; f=field. "
-                    "Use m.fs (GREEN/CAUTION/UNKNOWN) not m.fg. "
-                    "If flag_state is CAUTION: default to STAY OUT unless fuel requires a stop or pitting gains clear track position. "
-                    "If flag_state is GREEN or UNKNOWN: do NOT recommend pitting unless we are inside the pit window or fuel requires it. "
-                    "Use tires: tire_wear_last_known is a baseline from the last pit; project next-stop wear using "
-                    "tire_wear_last_known_stint_laps and tire_wear_rate_est_per_lap along with current stint_laps_est. "
-                    "Use track position: compare m.ga/m.gb to r.pl for undercut/overcut risk and clean air. "
-                    "Use crossover: if m.fo is large and m.pb is small, tires favor pitting. "
-                    "Look ahead: if pitting is best, recommend PIT NOW or PIT IN N LAPS. If staying out, say RECHECK IN N LAPS. "
-                    "If not racing (s.ot is false or s.st not racing): output a simple fuel strategy plan. "
-                    "OUTPUT FORMAT (single line, EXACT): "
-                    "<ACTION> — <TIMING> — <SERVICE> — <REASON> <TAGS>. "
-                    "Allowed ACTION: STAY OUT | PIT | PIT NOW. "
-                    "Allowed TIMING: THIS LAP | PIT IN N LAPS | RECHECK IN N LAPS. "
-                    "SERVICE (only when ACTION is PIT/PIT NOW): FUEL ONLY | 2 TIRES | 4 TIRES. "
-                    "If ACTION is STAY OUT: SERVICE must be NONE. "
-                    "TAGS: append exactly two tags at the end: "
-                    "[fuel|tires|track|flags] and [H|M|L]. "
-                    "Keep it <= 20 words total. "
-                    f"Data: {race_json}"
-                )
+                m = (mode or "live").lower()
+                if m not in ("live", "strategy"):
+                    m = "live"
+                prompt = _build_engineer_prompt(m, f"Data: {race_json}")
+                max_out = 220 if m == "strategy" else 100
 
                 body = json.dumps(
                     {
                         "anthropic_version": "bedrock-2023-05-31",
-                        "max_tokens": 100,
+                        "max_tokens": max_out,
                         "messages": [{"role": "user", "content": prompt}],
                     }
                 )
