@@ -37,7 +37,8 @@ class AIRaceEngineer(QWidget):
 
         self.setStyleSheet(
             """
-            QWidget { font-family: "Segoe UI"; }
+            /* Avoid hardcoding a missing font (e.g. Segoe UI on macOS) */
+            QWidget { }
             QLabel#statusLabel {
                 color: #E8F5E9;
                 font-size: 18px;
@@ -392,9 +393,13 @@ class AIRaceEngineer(QWidget):
                 subprocess.run(["say", a], check=False)
             elif sys.platform.startswith("win"):
                 # Built-in SAPI (no extra dependency)
+                # Avoid nested quoting issues by sanitizing before embedding in PowerShell.
+                safe = a.replace("'", " ").replace("\n", " ").replace("\r", " ")
                 ps = (
                     "Add-Type -AssemblyName System.Speech; "
-                    f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{a.replace(\"'\", \" \")}')"
+                    "(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("
+                    + repr(safe)
+                    + ")"
                 )
                 subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=False)
         except Exception:
