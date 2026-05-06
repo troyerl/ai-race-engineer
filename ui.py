@@ -50,6 +50,15 @@ class AIRaceEngineer(QWidget):
                 padding: 4px 8px;
                 border-radius: 10px;
             }
+            QLabel#connBadge {
+                color: rgba(255,255,255,245);
+                font-size: 12px;
+                font-weight: 800;
+                background: rgba(20, 22, 28, 235);
+                border: 1px solid rgba(255,255,255,30);
+                padding: 4px 8px;
+                border-radius: 10px;
+            }
             QPushButton#analyzeBtn {
                 background-color: rgba(31, 138, 76, 235);
                 color: white;
@@ -113,6 +122,13 @@ class AIRaceEngineer(QWidget):
         self.label.setWordWrap(True)
         self.label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
 
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        self.conn_badge = QLabel("iRacing: …")
+        self.conn_badge.setObjectName("connBadge")
+        top_row.addWidget(self.conn_badge)
+        top_row.addStretch(1)
+
         self.btn = QPushButton("ANALYZE FIELD & ADVISE")
         self.btn.setObjectName("analyzeBtn")
         self.btn.setCursor(Qt.PointingHandCursor)
@@ -159,6 +175,7 @@ class AIRaceEngineer(QWidget):
         bottom_row.addWidget(self.clear_btn)
         bottom_row.addWidget(self.close_btn)
 
+        self.layout.addLayout(top_row)
         self.layout.addWidget(self.label)
         self.layout.addLayout(tire_row)
         self.layout.addLayout(pit_row)
@@ -192,6 +209,12 @@ class AIRaceEngineer(QWidget):
         self.telemetry_timer.timeout.connect(self.telemetry.update_field_history)
         # 250ms is typically indistinguishable in-race, but cuts polling overhead.
         self.telemetry_timer.start(250)
+
+        # Connection indicator updates (slow cadence to reduce overhead).
+        self._conn_timer = QTimer(self)
+        self._conn_timer.timeout.connect(self._update_connection_badge)
+        self._conn_timer.start(1000)
+        self._update_connection_badge()
 
     def trigger_ai_request(self):
         self._idle_clear_timer.stop()
@@ -277,6 +300,18 @@ class AIRaceEngineer(QWidget):
             app.quit()
         else:
             self.close()
+
+    def _update_connection_badge(self):
+        if self.telemetry.is_connected():
+            self.conn_badge.setText("iRacing: Connected")
+            self.conn_badge.setStyleSheet(
+                "QLabel#connBadge { border-color: rgba(46, 204, 113, 140); }"
+            )
+        else:
+            self.conn_badge.setText("iRacing: No Signal")
+            self.conn_badge.setStyleSheet(
+                "QLabel#connBadge { border-color: rgba(231, 76, 60, 160); }"
+            )
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:

@@ -29,6 +29,10 @@ class TelemetryTracker:
             self.ir.startup()
         return bool(self.ir.is_connected)
 
+    def is_connected(self) -> bool:
+        # Lightweight check used by the UI status indicator.
+        return bool(self.ir.is_connected)
+
     def _ir_get(self, key: str, default=None):
         try:
             v = self.ir[key]
