@@ -12,7 +12,8 @@ REM --icon expects .ico on Windows; convert icon.png -> icon.ico (Pillow require
 py -m pip install -U pillow >nul
 py -c "from PIL import Image; Image.open('icon.png').save('icon.ico', sizes=[(256,256)])"
 
-py -m PyInstaller --noconfirm --windowed --name "AI Race Engineer" --icon icon.ico main.py
+REM Ensure icon.png is available at runtime inside the bundle.
+py -m PyInstaller --noconfirm --windowed --name "AI Race Engineer" --icon icon.ico --add-data "icon.png;." main.py
 
 echo.
 echo Build complete:
