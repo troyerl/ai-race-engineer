@@ -189,7 +189,7 @@ class AIRaceEngineer(QWidget):
 
         self.rejoin_label = None
         if self._feature_rejoin:
-            self.rejoin_label = QLabel("Gap/Rejoin: …")
+            self.rejoin_label = QLabel("Pit-road impact: …")
             self.rejoin_label.setObjectName("subLabel")
             # Hidden until the AI actually recommends a PIT.
             self.rejoin_label.setVisible(False)
@@ -201,7 +201,7 @@ class AIRaceEngineer(QWidget):
 
         tire_row = QHBoxLayout()
         tire_row.setContentsMargins(0, 0, 0, 0)
-        tire_label = QLabel("New tire sets left")
+        tire_label = QLabel("Fresh tire sets remaining")
         tire_label.setObjectName("subLabel")
         self.tire_spin = QSpinBox()
         self.tire_spin.setObjectName("tireSpin")
@@ -228,7 +228,7 @@ class AIRaceEngineer(QWidget):
 
         pit_row = QHBoxLayout()
         pit_row.setContentsMargins(0, 0, 0, 0)
-        pit_label = QLabel("Pit loss (sec)")
+        pit_label = QLabel("Pit-road loss (seconds)")
         pit_label.setObjectName("subLabel")
         self.pit_spin = QSpinBox()
         self.pit_spin.setObjectName("pitSpin")
@@ -240,12 +240,12 @@ class AIRaceEngineer(QWidget):
         pit_row.addWidget(self.pit_spin)
         pit_row.addStretch(1)
 
-        pit_hint = QLabel("Pit loss = pit lane drive-through + stop time")
+        pit_hint = QLabel("Pit-road loss ≈ entry + stop + exit vs green-flag laps")
         pit_hint.setObjectName("subLabel")
 
         pit_defaults_row = QHBoxLayout()
         pit_defaults_row.setContentsMargins(0, 0, 0, 0)
-        self.pit_defaults_btn = QPushButton("Use track default pit loss")
+        self.pit_defaults_btn = QPushButton("Use track-default pit-road loss")
         self.pit_defaults_btn.setObjectName("clearBtn")
         self.pit_defaults_btn.setCursor(Qt.PointingHandCursor)
         self.pit_defaults_btn.clicked.connect(self._apply_track_default_pit_loss)
@@ -253,7 +253,7 @@ class AIRaceEngineer(QWidget):
 
         clear_row = QHBoxLayout()
         clear_row.setContentsMargins(0, 0, 0, 0)
-        clear_label = QLabel("Clear advice after (sec)")
+        clear_label = QLabel("Clear advice after (seconds)")
         clear_label.setObjectName("subLabel")
         self.clear_after_spin = QSpinBox()
         self.clear_after_spin.setObjectName("pitSpin")
@@ -398,14 +398,14 @@ class AIRaceEngineer(QWidget):
         self._partial_flush_timer.stop()
         self._partial_buffer = None
         if not self.telemetry.ensure_connected():
-            self.label.setText("ENGINEER: No Signal")
+            self.label.setText("ENGINEER: NO LINK TO SIM")
             return
 
         mode = self.telemetry.ui_mode()
         self.label.setText(
-            "Building race strategy..."
+            "Sketching race strategy (fuel & tires)…"
             if mode == "strategy"
-            else "Processing field data..."
+            else "Reading the field & corners…"
         )
         self.btn.setEnabled(False)
         self._request_watchdog.start(REQUEST_TIMEOUT_MS)
@@ -451,7 +451,7 @@ class AIRaceEngineer(QWidget):
             # iterating forever and the UI stays stuck even though we re-enabled Analyze.
             self.ai_worker.cancel_active()
             self._active_request_id = 0
-            self.label.setText("Timed out. Try again or Clear/Cancel.")
+            self.label.setText("Timed out — hit Clear/Cancel or try again.")
             self.btn.setEnabled(True)
             self._set_ai_status("Timed out")
 
@@ -503,12 +503,12 @@ class AIRaceEngineer(QWidget):
     def _update_connection_badge(self):
         connected = self.telemetry.is_connected()
         if connected:
-            self.conn_badge.setText("iRacing: Connected")
+            self.conn_badge.setText("iRacing: Online")
             self.conn_badge.setStyleSheet(
                 "QLabel#connBadge { border-color: rgba(46, 204, 113, 140); }"
             )
         else:
-            self.conn_badge.setText("iRacing: No Signal")
+            self.conn_badge.setText("iRacing: Offline")
             self.conn_badge.setStyleSheet(
                 "QLabel#connBadge { border-color: rgba(231, 76, 60, 160); }"
             )
@@ -592,7 +592,7 @@ class AIRaceEngineer(QWidget):
         # Expected format: ACTION — TIMING — REASON [tag] [H|M|L]
         parts = [p.strip() for p in text.split("—")]
         if len(parts) < 2:
-            self.rejoin_label.setText("Pit impact: unknown (bad format)")
+            self.rejoin_label.setText("Pit-road impact: couldn’t read call (bad format)")
             return
         action = parts[0].upper()
         timing = parts[1].upper()
@@ -620,16 +620,16 @@ class AIRaceEngineer(QWidget):
                 pit_in_laps = 0
 
         if pit_in_laps is None:
-            self.rejoin_label.setText("Pit impact: unknown (no timing)")
+            self.rejoin_label.setText("Pit-road impact: need a lap count on the pit call")
             return
 
         est = self.telemetry.predict_pit_position_loss(int(self.pit_spin.value()), int(pit_in_laps))
         lost = est.get("lost")
         if isinstance(lost, int):
             when = "now" if pit_in_laps == 0 else f"in {pit_in_laps} laps"
-            self.rejoin_label.setText(f"Pit impact: If you pit {when}, likely lose ~{lost} pos")
+            self.rejoin_label.setText(f"Pit-road impact: pit {when}, likely give up ~{lost} spots")
         else:
-            self.rejoin_label.setText("Pit impact: unknown")
+            self.rejoin_label.setText("Pit-road impact: unknown")
 
     def _speak_action(self, action: str):
         # Feature-flagged. Speaks only the ACTION (STAY OUT / PIT / PIT NOW).

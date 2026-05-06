@@ -17,27 +17,32 @@ STREAM_MAX_SECONDS = 50
 def _build_engineer_prompt(mode: str, race_json: str) -> str:
     schema = (
         "Data is compact JSON: "
-        "x{md=live|strategy}; "
-        "s{st=session_state,tr=time_remain,lt=laps_total,ot=is_on_track,ig=is_in_garage}; "
-        "m{l=lap,lr=laps_remain,p=pos,fu=fuel,fph=fuel/hr,fpl=fuel/lap_est,fl=fuel_laps_left,"
-        "mk=can_make,ls=laps_short,lp=last_pit_lap,t=lap_times,pc=pace,fg=flags,fs=flag_state,"
+        "x{md=live|strategy,u=us_fuel_gal_and_lb_hr}; "
+        "s{st=session_state,tr=time_remain_s_omit_if_placeholder,lt=laps_total,ot=is_on_track,ig=is_in_garage}; "
+        "m{l=lap,lr=laps_remain,p=pos,fu=fuel_USgal_remaining,fph=fuel_burn_lb_per_hr_SDK_scaled,"
+        "fpe=fuel_USgal_per_lap_ema_if_present,fpl=fuel_USgal_per_lap_est,fcq=fuel_est_quality_hi|med|low,"
+        "fl=fuel_laps_left_est,mk=can_make,ls=laps_short,lp=last_pit_lap,t=lap_times_s,pc=pace_s,fg=flags,fs=flag_state,"
         "pr=on_pit_road,sl=stint_laps,ga=gap_ahead_s,gb=gap_behind_s,bl=best_lap_s,fo=falloff_s,"
         "pb=pit_payback_laps,pw=pit_window_open,pwu=laps_until_window,tw,tws,twsl,twr}; "
-        "r{pl=pit_loss,ts=tire_sets_avail,fc=fuel_capacity,ftl=laps_per_full_tank_fuel_est}; "
+        "r{pl=pit_loss_sec,ts=tire_sets_avail,fc=fuel_tank_USgal_capacity,ftl=laps_per_full_tank_fuel_est}; "
         "rv=rivals; f=field. "
     )
     base = (
         "You are a Lead Race Engineer. "
         + schema
         + "Use x.md exactly: if strategy, pre-race plan only; if live, in-race advice only. "
+        + "Audience: US fan/driver — American motorsports terms (pit road, yellow/caution, green flag, "
+        + "\"pass-through\"/wave-around where apt); tires not tyres. When citing fuel amounts/rates use gal or lb/hr "
+        + "to match x.u=us — avoid liters/kg unless repeating telemetry verbatim is unavoidable. "
     )
 
     if mode == "strategy":
         return (
             base
             + "CONTEXT: DRIVER IS OFF TRACK (garage/grid/prep). Build a PRE-RACE plan. "
-            + "Goal: approximate laps BETWEEN pit stops optimizing fuel tank (r.ftl, r.fc, m.fpl) "
+            + "Goal: approximate laps BETWEEN pit stops optimizing fuel tank (r.ftl, r.fc, m.fpl/m.fpe) "
             + "and tire life using r.ts (available sets); mention when to take FUEL ONLY vs 2 vs 4 tires if helpful. "
+            + "Fuel fields are already US customary (gal, lb/hr); prefer m.fpe when present; respect m.fcq. "
             + "Assume green-flag racing unless s says otherwise; note estimates are approximate. "
             + "OUTPUT (single line, EXACT separators): "
             "FUEL STINT — TIRE STINT — STOPS EST — NOTE <TAGS>. "
@@ -53,6 +58,9 @@ def _build_engineer_prompt(mode: str, race_json: str) -> str:
     return (
         base
         + "Primary goal: Optimize track position vs fuel/tire life (live race). "
+        + "Fuel: x.u=us — m.fph lb/hr (from SDK kg/h), m.fpl/m.fpe US gal/lap (liters converted + lap EMA); "
+        + "m.fcq hi|med|low. Never cite absurd fuel laps vs m.lr "
+        + "(e.g. fl many multiples of lr) unless fcq=hi and pr=false — when fcq low or m.pr true, treat fuel range as uncertain. "
         + "Use m.fs (GREEN/CAUTION/UNKNOWN) not m.fg. "
         + "If flag_state is CAUTION: default to STAY OUT unless fuel requires a stop or pitting gains clear track position. "
         + "If flag_state is GREEN or UNKNOWN: do NOT recommend pitting unless we are inside the pit window or fuel requires it. "

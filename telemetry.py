@@ -14,6 +14,17 @@ from typing import Any
 
 import irsdk
 
+# FuelUsePerHour telemetry is kg/h per iRacing SDK; FuelLevel is liters (or kWh on EVs — heuristic below).
+_GASOLINE_KG_PER_L = 0.75
+
+# AI-facing packet uses US customary fuel units (internal math stays liters + kg/h).
+_L_TO_US_GAL = 0.2641720523581484
+_KG_TO_LB = 2.204622621847693185
+
+
+def _liters_to_us_gal(x: float) -> float:
+    return float(x) * _L_TO_US_GAL
+
 
 class TelemetryTracker:
     def __init__(self):
@@ -30,6 +41,11 @@ class TelemetryTracker:
         self._last_known_tire_wear: dict[str, Any] | None = None
         self._last_known_tire_wear_stint_laps: int | None = None
         self._last_pit_lap: int | None = None
+
+        # Lap-boundary fuel deltas → liters/lap EMA (robust vs idle/pit-road instantaneous kg/h).
+        self._fuel_prev_lap: int | None = None
+        self._fuel_prev_level_L: float | None = None
+        self._fuel_per_lap_ema_L: float | None = None
 
     def ensure_connected(self) -> bool:
         if not self.ir.is_connected:
@@ -58,6 +74,35 @@ class TelemetryTracker:
         except Exception:
             return default
         return default if v is None else v
+
+    def _tick_fuel_per_lap_ema(self, lap_int: Any, fuel_level: float, fuel_capacity: Any) -> None:
+        """Track liters consumed per lap from lap-boundary deltas (more reliable than idle kg/h)."""
+        if not isinstance(lap_int, int):
+            return
+        pl = self._fuel_prev_lap
+        pf = self._fuel_prev_level_L
+        fc_f = None
+        try:
+            if fuel_capacity is not None:
+                fc_f = float(fuel_capacity)
+        except Exception:
+            fc_f = None
+
+        if pl is not None and pf is not None:
+            if lap_int < pl:
+                self._fuel_per_lap_ema_L = None
+            elif lap_int > pl:
+                dl = lap_int - pl
+                df = pf - fuel_level
+                if dl >= 1 and df > 0.02:
+                    sample = df / float(dl)
+                    if fc_f is None or sample <= fc_f * 0.98:
+                        alpha = 0.45
+                        ema = self._fuel_per_lap_ema_L
+                        self._fuel_per_lap_ema_L = sample if ema is None else (alpha * sample + (1 - alpha) * ema)
+
+        self._fuel_prev_lap = lap_int
+        self._fuel_prev_level_L = fuel_level
 
     # ----------------------------
     # Small helpers (shared logic)
@@ -333,9 +378,9 @@ class TelemetryTracker:
 
         fuel_level = float(self._ir_get("FuelLevel", 0.0) or 0.0)
         fuel_use_per_hour_raw = float(self._ir_get("FuelUsePerHour", 0.0) or 0.0)
-        fuel_use_per_hour = max(fuel_use_per_hour_raw, 0.1)
         laps_remain = self._ir_get("SessionLapsRemain", None)
         flags = self._ir_get("SessionFlags", 0)
+        fuel_capacity_raw = self._ir_get("FuelCapacity", None)
 
         def read_tire_wear_snapshot() -> dict[str, Any] | None:
             """
@@ -362,6 +407,7 @@ class TelemetryTracker:
 
         # Stint length estimate (laps since last pit-road exit).
         lap_int = self._ir_get("Lap", None)
+        self._tick_fuel_per_lap_ema(lap_int, fuel_level, fuel_capacity_raw)
         stint_laps = None
         if isinstance(lap_int, int) and isinstance(self._stint_start_lap, int):
             stint_laps = max(0, lap_int - self._stint_start_lap)
@@ -393,16 +439,42 @@ class TelemetryTracker:
         you_times = list(self.field_history.get(player_idx, []))
         you_pace = pace_stats(you_times)
 
-        # Estimate fuel-per-lap using current pace (FuelUsePerHour * lap_time_hours).
+        # Estimate fuel-per-lap: FuelUsePerHour is kg/h (SDK); FuelLevel is liters — convert via nominal density.
         avg_lap_s = None
         if you_pace.get("n", 0) >= 1:
             avg_lap_s = you_pace.get("avg_last3_s") or you_pace.get("avg_last5_s")
         if not avg_lap_s:
             avg_lap_s = 90.0  # fallback; avoids divide-by-zero / nonsense
 
-        fuel_use_per_lap_est = fuel_use_per_hour * (float(avg_lap_s) / 3600.0)
-        fuel_use_per_lap_est = max(fuel_use_per_lap_est, 1e-6)
+        fuel_use_kg_per_h = max(fuel_use_per_hour_raw, 0.05)
+        fuel_use_L_per_h = fuel_use_kg_per_h / _GASOLINE_KG_PER_L
+        fuel_use_per_lap_inst = fuel_use_L_per_h * (float(avg_lap_s) / 3600.0)
+        fuel_use_per_lap_inst = max(fuel_use_per_lap_inst, 1e-6)
+
+        fpl_ema = self._fuel_per_lap_ema_L
+        if fpl_ema is not None:
+            fuel_use_per_lap_est = max(fuel_use_per_lap_inst, float(fpl_ema))
+        else:
+            fuel_use_per_lap_est = fuel_use_per_lap_inst
+
         laps_of_fuel_left_est = float(fuel_level) / fuel_use_per_lap_est
+
+        # Instantaneous kg/h is often nonsense on pit road / slow out-laps — clamp absurd range fuel.
+        try:
+            if laps_remain is not None:
+                lr_d = float(max(int(laps_remain), 1))
+                if laps_of_fuel_left_est > max(lr_d * 2.0, lr_d + 30.0):
+                    fuel_use_per_lap_est = max(fuel_use_per_lap_est, fuel_level / lr_d)
+                    laps_of_fuel_left_est = float(fuel_level) / fuel_use_per_lap_est
+        except Exception:
+            pass
+
+        if self._fuel_per_lap_ema_L is not None and isinstance(lap_int, int) and lap_int >= 3:
+            fuel_calc_quality = "hi"
+        elif on_pit_road and self._fuel_per_lap_ema_L is None:
+            fuel_calc_quality = "low"
+        else:
+            fuel_calc_quality = "med"
 
         can_make_to_end = None
         laps_short_on_fuel = None
@@ -479,18 +551,30 @@ class TelemetryTracker:
         # Approx laps a full fuel load covers (strategy planning).
         ftl = None
         try:
-            fc = self._ir_get("FuelCapacity", None)
+            fc = fuel_capacity_raw
             if fc is not None and fuel_use_per_lap_est:
                 ftl = round(float(fc) / float(fuel_use_per_lap_est), 1)
         except Exception:
             pass
 
+        session_time_remain = self._ir_get("SessionTimeRemain", None)
+        if isinstance(session_time_remain, (int, float)) and float(session_time_remain) >= 86400.0:
+            # Hosted / test sessions often expose ~604800s placeholder — omit so the model does not treat it as real stint clock.
+            session_time_remain = None
+
         # Compact schema to reduce tokens (short keys, no nulls, rounded floats).
+        fc_us_gal = None
+        try:
+            if fuel_capacity_raw is not None:
+                fc_us_gal = round(_liters_to_us_gal(float(fuel_capacity_raw)), 2)
+        except Exception:
+            fc_us_gal = None
+
         packet = {
-            "x": {"md": mode},
+            "x": {"md": mode, "u": "us"},
             "s": {  # session
                 "st": self._ir_get("SessionState", None),
-                "tr": self._ir_get("SessionTimeRemain", None),
+                "tr": session_time_remain,
                 "lt": self._ir_get("SessionLapsTotal", None),
                 "ot": self._ir_get("IsOnTrack", None),
                 "ig": self._ir_get("IsInGarage", None),
@@ -500,9 +584,11 @@ class TelemetryTracker:
                 "lp": last_pit_lap,
                 "lr": laps_remain,
                 "p": player_pos,
-                "fu": round(fuel_level, 2),
-                "fph": round(fuel_use_per_hour_raw, 3),
-                "fpl": round(fuel_use_per_lap_est, 4),
+                "fu": round(_liters_to_us_gal(fuel_level), 3),
+                "fph": round(float(fuel_use_per_hour_raw) * _KG_TO_LB, 3),
+                "fpl": round(_liters_to_us_gal(fuel_use_per_lap_est), 5),
+                "fpe": round(_liters_to_us_gal(float(fpl_ema)), 5) if fpl_ema is not None else None,
+                "fcq": fuel_calc_quality,
                 "fl": round(laps_of_fuel_left_est, 2),
                 "mk": can_make_to_end,
                 "ls": round(laps_short_on_fuel, 2) if laps_short_on_fuel is not None else None,
@@ -527,7 +613,7 @@ class TelemetryTracker:
             "r": {  # race_info
                 "pl": int(pit_loss_sec),
                 "ts": int(tire_sets_remaining),
-                "fc": self._ir_get("FuelCapacity", None),
+                "fc": fc_us_gal,
                 "ftl": ftl,
             },
             "rv": rivals,
