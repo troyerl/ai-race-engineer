@@ -1,6 +1,7 @@
 import sys
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
 
 from ui import AIRaceEngineer
 
@@ -13,6 +14,7 @@ def main():
     except Exception:
         pass
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon("icon.png"))
     window = AIRaceEngineer()
     window.show()
     sys.exit(app.exec())

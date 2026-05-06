@@ -8,7 +8,11 @@ py -m pip install -U pip >nul
 py -m pip install -U pyinstaller >nul
 
 REM Folder build is usually most reliable for PySide6 apps.
-py -m PyInstaller --noconfirm --windowed --name "AI Race Engineer" main.py
+REM --icon expects .ico on Windows; convert icon.png -> icon.ico (Pillow required).
+py -m pip install -U pillow >nul
+py -c "from PIL import Image; Image.open('icon.png').save('icon.ico', sizes=[(256,256)])"
+
+py -m PyInstaller --noconfirm --windowed --name "AI Race Engineer" --icon icon.ico main.py
 
 echo.
 echo Build complete:

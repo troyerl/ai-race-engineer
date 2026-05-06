@@ -64,6 +64,10 @@ build_windows.bat
 Output:
 - `dist\AI Race Engineer\AI Race Engineer.exe`
 
+Notes:
+- The app uses `icon.png` at runtime (Qt window/app icon).
+- The Windows build script converts `icon.png` to `icon.ico` and passes it to PyInstaller (`--icon`) so the `.exe` has the right icon in Explorer/taskbar.
+
 ### Manual build (if you prefer)
 
 ```bat
