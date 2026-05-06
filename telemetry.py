@@ -271,6 +271,64 @@ class TelemetryTracker:
                     "pace": pace_stats(list(self.field_history[behind_idx])),
                 }
 
+        # --- Gap estimates (best-effort) ---
+        car_idx_f2 = self._ir_get("CarIdxF2Time", None)
+        car_idx_dist = self._ir_get("CarIdxLapDistPct", None)
+
+        def gap_est_s(a_idx: int | None, b_idx: int | None) -> float | None:
+            """
+            Estimate time gap between two car indices.
+            Tries F2/relative timing if available; falls back to lap distance percent * avg lap.
+            """
+            if a_idx is None or b_idx is None:
+                return None
+            try:
+                if isinstance(car_idx_f2, (list, tuple)) and a_idx < len(car_idx_f2) and b_idx < len(car_idx_f2):
+                    a = float(car_idx_f2[a_idx])
+                    b = float(car_idx_f2[b_idx])
+                    # Some feeds use -1 for unknown.
+                    if a >= 0 and b >= 0:
+                        return round(abs(a - b), 2)
+            except Exception:
+                pass
+            try:
+                if isinstance(car_idx_dist, (list, tuple)) and a_idx < len(car_idx_dist) and b_idx < len(car_idx_dist):
+                    da = float(car_idx_dist[a_idx])
+                    db = float(car_idx_dist[b_idx])
+                    if 0.0 <= da <= 1.0 and 0.0 <= db <= 1.0:
+                        dd = (db - da) % 1.0
+                        # Convert lap-distance delta to seconds using avg_lap_s.
+                        return round(abs(dd * float(avg_lap_s)), 2)
+            except Exception:
+                pass
+            return None
+
+        gap_ahead_s = gap_est_s(player_idx, ahead_idx if player_pos else None)
+        gap_behind_s = gap_est_s(player_idx, behind_idx if player_pos else None)
+
+        # --- Degradation + pit payback ---
+        best_lap_s = min(you_times) if you_times else None
+        avg3_s = you_pace.get("avg_last3_s") if isinstance(you_pace, dict) else None
+        falloff_s = None
+        if isinstance(best_lap_s, (int, float)) and isinstance(avg3_s, (int, float)):
+            falloff_s = round(float(avg3_s) - float(best_lap_s), 3)  # >0 => slower than best
+
+        pit_payback_laps = None
+        try:
+            if falloff_s is not None and falloff_s > 0 and pit_loss_sec:
+                pit_payback_laps = round(float(pit_loss_sec) / float(falloff_s), 1)
+        except Exception:
+            pass
+
+        # --- Pit window helpers ---
+        pit_window_open = can_make_to_end
+        laps_until_window = None
+        try:
+            if laps_remain is not None:
+                laps_until_window = round(max(0.0, float(laps_remain) - float(laps_of_fuel_left_est)), 2)
+        except Exception:
+            pass
+
         def drop_nones(x: Any) -> Any:
             if isinstance(x, dict):
                 out = {}
@@ -308,6 +366,13 @@ class TelemetryTracker:
                 "fs": flag_state(flags),
                 "pr": on_pit_road,
                 "sl": stint_laps,
+                "ga": gap_ahead_s,
+                "gb": gap_behind_s,
+                "bl": round(best_lap_s, 3) if isinstance(best_lap_s, (int, float)) else None,
+                "fo": falloff_s,
+                "pb": pit_payback_laps,
+                "pw": pit_window_open,
+                "pwu": laps_until_window,
                 "tw": tire_wear_last_known,
                 "tws": (not on_pit_road),
                 "twsl": tire_wear_last_known_stint_laps,
