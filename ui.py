@@ -1,29 +1,39 @@
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (
-    QWidget,
-    QPushButton,
-    QVBoxLayout,
-    QLabel,
-    QSizePolicy,
-    QSpinBox,
-    QHBoxLayout,
-    QApplication,
-)
 import os
-import threading
 import subprocess
 import sys
+import threading
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSpinBox,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from bedrock_worker import BedrockWorker
 from telemetry import TelemetryTracker
+
+
+TELEMETRY_POLL_MS = 250
+CONNECTION_POLL_MS = 1000
+REQUEST_TIMEOUT_MS = 30000
+STREAM_UI_THROTTLE_MS = 80
+
+FEATURE_REJOIN_ENV = "AIRACE_FEATURE_REJOIN"
+FEATURE_VOICE_ENV = "AIRACE_FEATURE_VOICE"
 
 
 class AIRaceEngineer(QWidget):
     def __init__(self):
         super().__init__()
         self.telemetry = TelemetryTracker()
-        self._feature_rejoin = os.getenv("AIRACE_FEATURE_REJOIN", "0") == "1"
-        self._feature_voice = os.getenv("AIRACE_FEATURE_VOICE", "0") == "1"
+        self._feature_rejoin = os.getenv(FEATURE_REJOIN_ENV, "0") == "1"
+        self._feature_voice = os.getenv(FEATURE_VOICE_ENV, "0") == "1"
         self._pit_user_modified = False
         self._last_sdk_connected = None
 
@@ -198,6 +208,22 @@ class AIRaceEngineer(QWidget):
         pit_hint = QLabel("Pit loss = pit lane drive-through + stop time")
         pit_hint.setObjectName("subLabel")
 
+        clear_row = QHBoxLayout()
+        clear_row.setContentsMargins(0, 0, 0, 0)
+        clear_label = QLabel("Clear advice after (sec)")
+        clear_label.setObjectName("subLabel")
+        self.clear_after_spin = QSpinBox()
+        self.clear_after_spin.setObjectName("pitSpin")
+        self.clear_after_spin.setMinimum(0)
+        self.clear_after_spin.setMaximum(600)
+        self.clear_after_spin.setValue(120)
+        clear_row.addWidget(clear_label)
+        clear_row.addWidget(self.clear_after_spin)
+        clear_row.addStretch(1)
+
+        clear_hint = QLabel("0 = never auto-clear")
+        clear_hint.setObjectName("subLabel")
+
         self.clear_btn = QPushButton("CLEAR / CANCEL")
         self.clear_btn.setObjectName("clearBtn")
         self.clear_btn.setCursor(Qt.PointingHandCursor)
@@ -220,6 +246,8 @@ class AIRaceEngineer(QWidget):
         self.layout.addLayout(tire_row)
         self.layout.addLayout(pit_row)
         self.layout.addWidget(pit_hint)
+        self.layout.addLayout(clear_row)
+        self.layout.addWidget(clear_hint)
         self.layout.addWidget(self.btn)
         self.layout.addLayout(bottom_row)
         self.setLayout(self.layout)
@@ -249,12 +277,12 @@ class AIRaceEngineer(QWidget):
         self.telemetry_timer = QTimer(self)
         self.telemetry_timer.timeout.connect(self.telemetry.update_field_history)
         # 250ms is typically indistinguishable in-race, but cuts polling overhead.
-        self.telemetry_timer.start(250)
+        self.telemetry_timer.start(TELEMETRY_POLL_MS)
 
         # Connection indicator updates (slow cadence to reduce overhead).
         self._conn_timer = QTimer(self)
         self._conn_timer.timeout.connect(self._update_connection_badge)
-        self._conn_timer.start(1000)
+        self._conn_timer.start(CONNECTION_POLL_MS)
         self._update_connection_badge()
         self._set_ai_status("Idle")
 
@@ -272,7 +300,7 @@ class AIRaceEngineer(QWidget):
 
         self.label.setText("Processing Field Data...")
         self.btn.setEnabled(False)
-        self._request_watchdog.start(30000)
+        self._request_watchdog.start(REQUEST_TIMEOUT_MS)
         self._set_ai_status("Requesting")
 
         self._next_request_id += 1
@@ -306,7 +334,7 @@ class AIRaceEngineer(QWidget):
         # Buffer and coalesce updates to avoid UI churn.
         self._partial_buffer = text
         if not self._partial_flush_timer.isActive():
-            self._partial_flush_timer.start(80)
+            self._partial_flush_timer.start(STREAM_UI_THROTTLE_MS)
 
     def _on_request_timeout(self):
         if self._active_request_id:
@@ -328,7 +356,9 @@ class AIRaceEngineer(QWidget):
         self.adjustSize()
         # Mark request complete and schedule auto-clear if no further interaction.
         self._active_request_id = 0
-        self._idle_clear_timer.start(120000)
+        clear_ms = int(self.clear_after_spin.value()) * 1000
+        if clear_ms > 0:
+            self._idle_clear_timer.start(clear_ms)
         self._set_ai_status("Error" if str(text).startswith("AI Error") else "Done")
         if self.rejoin_label is not None:
             self._update_pit_impact_from_advice(str(text))

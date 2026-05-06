@@ -47,6 +47,57 @@ class TelemetryTracker:
             return default
         return default if v is None else v
 
+    # ----------------------------
+    # Small helpers (shared logic)
+    # ----------------------------
+
+    def _idx_by_class_pos(self, target_pos: int) -> int | None:
+        positions = self._ir_get("CarIdxClassPosition", []) or []
+        for idx, pos in enumerate(positions):
+            if pos == target_pos:
+                return idx
+        return None
+
+    def _avg_lap_s_for_idx(self, car_idx: int, fallback: float = 90.0) -> float:
+        times = list(self.field_history.get(car_idx, []))
+        if not times:
+            return fallback
+        last = times[-3:]
+        return sum(last) / max(1, len(last))
+
+    def _gap_est_s(self, a_idx: int | None, b_idx: int | None, *, lap_s_fallback: float) -> float | None:
+        """
+        Best-effort gap estimate between two car indices in seconds.
+
+        Prefers iRacing's relative timing (`CarIdxF2Time`) when available.
+        Falls back to lap distance percent delta scaled by a lap time estimate.
+        """
+        if a_idx is None or b_idx is None:
+            return None
+
+        car_idx_f2 = self._ir_get("CarIdxF2Time", None)
+        try:
+            if isinstance(car_idx_f2, (list, tuple)) and a_idx < len(car_idx_f2) and b_idx < len(car_idx_f2):
+                a = float(car_idx_f2[a_idx])
+                b = float(car_idx_f2[b_idx])
+                if a >= 0 and b >= 0:
+                    return round(abs(a - b), 2)
+        except Exception:
+            pass
+
+        car_idx_dist = self._ir_get("CarIdxLapDistPct", None)
+        try:
+            if isinstance(car_idx_dist, (list, tuple)) and a_idx < len(car_idx_dist) and b_idx < len(car_idx_dist):
+                da = float(car_idx_dist[a_idx])
+                db = float(car_idx_dist[b_idx])
+                if 0.0 <= da <= 1.0 and 0.0 <= db <= 1.0:
+                    dd = (db - da) % 1.0
+                    return round(abs(dd * float(lap_s_fallback)), 2)
+        except Exception:
+            pass
+
+        return None
+
     def track_length_miles(self) -> float | None:
         """
         Best-effort track length in miles.
@@ -89,47 +140,13 @@ class TelemetryTracker:
         """
         player_idx = self._ir_get("PlayerCarIdx", 0)
         player_pos = self._ir_get("PlayerCarClassPosition", 0)
-        positions = self._ir_get("CarIdxClassPosition", []) or []
-        car_idx_f2 = self._ir_get("CarIdxF2Time", None)
-        car_idx_dist = self._ir_get("CarIdxLapDistPct", None)
 
-        # Use recent pace as a seconds-per-lap scaling factor for distance-only fallbacks.
-        you_times = list(self.field_history.get(player_idx, []))
-        avg_lap_s = (sum(you_times[-3:]) / max(1, len(you_times[-3:]))) if you_times else 90.0
+        lap_s = self._avg_lap_s_for_idx(player_idx, fallback=90.0)
+        ahead_idx = self._idx_by_class_pos(player_pos - 1) if player_pos else None
+        behind_idx = self._idx_by_class_pos(player_pos + 1) if player_pos else None
 
-        def idx_by_pos(target_pos: int) -> int | None:
-            for idx, pos in enumerate(positions):
-                if pos == target_pos:
-                    return idx
-            return None
-
-        ahead_idx = idx_by_pos(player_pos - 1) if player_pos else None
-        behind_idx = idx_by_pos(player_pos + 1) if player_pos else None
-
-        def gap_est_s(a_idx: int | None, b_idx: int | None) -> float | None:
-            if a_idx is None or b_idx is None:
-                return None
-            try:
-                if isinstance(car_idx_f2, (list, tuple)) and a_idx < len(car_idx_f2) and b_idx < len(car_idx_f2):
-                    a = float(car_idx_f2[a_idx])
-                    b = float(car_idx_f2[b_idx])
-                    if a >= 0 and b >= 0:
-                        return round(abs(a - b), 2)
-            except Exception:
-                pass
-            try:
-                if isinstance(car_idx_dist, (list, tuple)) and a_idx < len(car_idx_dist) and b_idx < len(car_idx_dist):
-                    da = float(car_idx_dist[a_idx])
-                    db = float(car_idx_dist[b_idx])
-                    if 0.0 <= da <= 1.0 and 0.0 <= db <= 1.0:
-                        dd = (db - da) % 1.0
-                        return round(abs(dd * float(avg_lap_s)), 2)
-            except Exception:
-                pass
-            return None
-
-        ga = gap_est_s(player_idx, ahead_idx)
-        gb = gap_est_s(player_idx, behind_idx)
+        ga = self._gap_est_s(player_idx, ahead_idx, lap_s_fallback=lap_s)
+        gb = self._gap_est_s(player_idx, behind_idx, lap_s_fallback=lap_s)
 
         pl = float(pit_loss_sec)
         verdict = "UNKNOWN"
@@ -154,37 +171,8 @@ class TelemetryTracker:
         player_idx = self._ir_get("PlayerCarIdx", 0)
         player_pos = self._ir_get("PlayerCarClassPosition", 0)
         positions = self._ir_get("CarIdxClassPosition", []) or []
-        car_idx_f2 = self._ir_get("CarIdxF2Time", None)
-        car_idx_dist = self._ir_get("CarIdxLapDistPct", None)
 
-        you_times = list(self.field_history.get(player_idx, []))
-        you_avg = (sum(you_times[-3:]) / max(1, len(you_times[-3:]))) if you_times else 90.0
-
-        def avg_lap_for_idx(idx: int) -> float:
-            t = list(self.field_history.get(idx, []))
-            if not t:
-                return you_avg
-            return sum(t[-3:]) / max(1, len(t[-3:]))
-
-        def gap_est_s(a_idx: int, b_idx: int) -> float | None:
-            try:
-                if isinstance(car_idx_f2, (list, tuple)) and a_idx < len(car_idx_f2) and b_idx < len(car_idx_f2):
-                    a = float(car_idx_f2[a_idx])
-                    b = float(car_idx_f2[b_idx])
-                    if a >= 0 and b >= 0:
-                        return abs(a - b)
-            except Exception:
-                pass
-            try:
-                if isinstance(car_idx_dist, (list, tuple)) and a_idx < len(car_idx_dist) and b_idx < len(car_idx_dist):
-                    da = float(car_idx_dist[a_idx])
-                    db = float(car_idx_dist[b_idx])
-                    if 0.0 <= da <= 1.0 and 0.0 <= db <= 1.0:
-                        dd = (db - da) % 1.0
-                        return abs(dd * float(you_avg))
-            except Exception:
-                pass
-            return None
+        you_avg = self._avg_lap_s_for_idx(player_idx, fallback=90.0)
 
         if not player_pos:
             return {"p": player_pos, "n": pit_in_laps, "pl": pit_loss_sec, "lost": None}
@@ -197,11 +185,11 @@ class TelemetryTracker:
 
         lost = 0
         for idx, pos in behind:
-            g = gap_est_s(player_idx, idx)
+            g = self._gap_est_s(player_idx, idx, lap_s_fallback=you_avg)
             if g is None:
                 continue
             # Project gap forward N laps: gap + N * (their_avg - our_avg).
-            their_avg = avg_lap_for_idx(idx)
+            their_avg = self._avg_lap_s_for_idx(idx, fallback=you_avg)
             projected_gap = float(g) + float(pit_in_laps) * (float(their_avg) - float(you_avg))
             if projected_gap < float(pit_loss_sec):
                 lost += 1
@@ -436,39 +424,8 @@ class TelemetryTracker:
                 }
 
         # --- Gap estimates (best-effort) ---
-        car_idx_f2 = self._ir_get("CarIdxF2Time", None)
-        car_idx_dist = self._ir_get("CarIdxLapDistPct", None)
-
-        def gap_est_s(a_idx: int | None, b_idx: int | None) -> float | None:
-            """
-            Estimate time gap between two car indices.
-            Tries F2/relative timing if available; falls back to lap distance percent * avg lap.
-            """
-            if a_idx is None or b_idx is None:
-                return None
-            try:
-                if isinstance(car_idx_f2, (list, tuple)) and a_idx < len(car_idx_f2) and b_idx < len(car_idx_f2):
-                    a = float(car_idx_f2[a_idx])
-                    b = float(car_idx_f2[b_idx])
-                    # Some feeds use -1 for unknown.
-                    if a >= 0 and b >= 0:
-                        return round(abs(a - b), 2)
-            except Exception:
-                pass
-            try:
-                if isinstance(car_idx_dist, (list, tuple)) and a_idx < len(car_idx_dist) and b_idx < len(car_idx_dist):
-                    da = float(car_idx_dist[a_idx])
-                    db = float(car_idx_dist[b_idx])
-                    if 0.0 <= da <= 1.0 and 0.0 <= db <= 1.0:
-                        dd = (db - da) % 1.0
-                        # Convert lap-distance delta to seconds using avg_lap_s.
-                        return round(abs(dd * float(avg_lap_s)), 2)
-            except Exception:
-                pass
-            return None
-
-        gap_ahead_s = gap_est_s(player_idx, ahead_idx if player_pos else None)
-        gap_behind_s = gap_est_s(player_idx, behind_idx if player_pos else None)
+        gap_ahead_s = self._gap_est_s(player_idx, ahead_idx if player_pos else None, lap_s_fallback=float(avg_lap_s))
+        gap_behind_s = self._gap_est_s(player_idx, behind_idx if player_pos else None, lap_s_fallback=float(avg_lap_s))
 
         # --- Degradation + pit payback ---
         best_lap_s = min(you_times) if you_times else None
