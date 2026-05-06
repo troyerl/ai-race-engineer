@@ -24,6 +24,8 @@ class AIRaceEngineer(QWidget):
         self.telemetry = TelemetryTracker()
         self._feature_rejoin = os.getenv("AIRACE_FEATURE_REJOIN", "0") == "1"
         self._feature_voice = os.getenv("AIRACE_FEATURE_VOICE", "0") == "1"
+        self._pit_user_modified = False
+        self._last_sdk_connected = None
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -174,7 +176,7 @@ class AIRaceEngineer(QWidget):
         self.tire_spin.setObjectName("tireSpin")
         self.tire_spin.setMinimum(0)
         self.tire_spin.setMaximum(99)
-        self.tire_spin.setValue(0)
+        self.tire_spin.setValue(2)
         tire_row.addWidget(tire_label)
         tire_row.addWidget(self.tire_spin)
         tire_row.addStretch(1)
@@ -188,9 +190,13 @@ class AIRaceEngineer(QWidget):
         self.pit_spin.setMinimum(0)
         self.pit_spin.setMaximum(300)
         self.pit_spin.setValue(8)
+        self.pit_spin.valueChanged.connect(self._on_pit_spin_changed)
         pit_row.addWidget(pit_label)
         pit_row.addWidget(self.pit_spin)
         pit_row.addStretch(1)
+
+        pit_hint = QLabel("Pit loss = pit lane drive-through + stop time")
+        pit_hint.setObjectName("subLabel")
 
         self.clear_btn = QPushButton("CLEAR / CANCEL")
         self.clear_btn.setObjectName("clearBtn")
@@ -213,6 +219,7 @@ class AIRaceEngineer(QWidget):
         self.layout.addWidget(self.label)
         self.layout.addLayout(tire_row)
         self.layout.addLayout(pit_row)
+        self.layout.addWidget(pit_hint)
         self.layout.addWidget(self.btn)
         self.layout.addLayout(bottom_row)
         self.setLayout(self.layout)
@@ -353,7 +360,8 @@ class AIRaceEngineer(QWidget):
             self.close()
 
     def _update_connection_badge(self):
-        if self.telemetry.is_connected():
+        connected = self.telemetry.is_connected()
+        if connected:
             self.conn_badge.setText("iRacing: Connected")
             self.conn_badge.setStyleSheet(
                 "QLabel#connBadge { border-color: rgba(46, 204, 113, 140); }"
@@ -363,6 +371,51 @@ class AIRaceEngineer(QWidget):
             self.conn_badge.setStyleSheet(
                 "QLabel#connBadge { border-color: rgba(231, 76, 60, 160); }"
             )
+
+        # On (re)connect, set a sensible default pit-loss if the user hasn't overridden it.
+        if self._last_sdk_connected is None:
+            self._last_sdk_connected = connected
+        if connected and not self._last_sdk_connected:
+            self._maybe_set_default_pit_loss()
+        self._last_sdk_connected = connected
+
+    def _on_pit_spin_changed(self, _val: int):
+        # Mark as user-modified so we don't overwrite with track defaults later.
+        self._pit_user_modified = True
+
+    def _maybe_set_default_pit_loss(self):
+        if self._pit_user_modified:
+            return
+
+        name = (self.telemetry.track_name() or "").lower()
+        length_mi = self.telemetry.track_length_miles()
+
+        # Classify track type.
+        track_type = None
+        if "daytona" in name or "talladega" in name:
+            track_type = "super"
+        elif isinstance(length_mi, (int, float)):
+            if length_mi >= 2.3:
+                track_type = "super"
+            elif length_mi <= 1.2:
+                track_type = "short"
+            else:
+                track_type = "intermediate"
+        else:
+            track_type = "intermediate"
+
+        # Defaults based on your ranges (choose midpoints).
+        if track_type == "short":
+            default_sec = 42  # ~40–45
+        elif track_type == "super":
+            default_sec = 58  # "higher than 1.5mi"; conservative
+        else:
+            default_sec = 46  # ~45–48
+
+        # Set without marking as user-modified.
+        self.pit_spin.blockSignals(True)
+        self.pit_spin.setValue(default_sec)
+        self.pit_spin.blockSignals(False)
 
     def _set_ai_status(self, status: str):
         self.ai_badge.setText(f"AI: {status}")

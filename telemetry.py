@@ -47,6 +47,41 @@ class TelemetryTracker:
             return default
         return default if v is None else v
 
+    def track_length_miles(self) -> float | None:
+        """
+        Best-effort track length in miles.
+
+        iRacing can expose track length in different formats depending on build/API:
+        - string like "2.50 mi" / "4.02 km"
+        - numeric (often km-ish). We use heuristics if units are unknown.
+        """
+        v = self._ir_get("TrackLength", None)
+        if v is None:
+            return None
+        try:
+            if isinstance(v, str):
+                s = v.strip().lower()
+                if "mi" in s:
+                    return float(s.replace("mi", "").strip())
+                if "km" in s:
+                    km = float(s.replace("km", "").strip())
+                    return km * 0.621371
+                # Try bare float string (assume km-ish if small).
+                n = float(s)
+                return n * 0.621371 if n <= 10 else n
+            n = float(v)
+            # Heuristic: if <=10 assume km, else already miles.
+            return n * 0.621371 if n <= 10 else n
+        except Exception:
+            return None
+
+    def track_name(self) -> str | None:
+        for key in ("TrackDisplayName", "TrackName"):
+            v = self._ir_get(key, None)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return None
+
     def estimate_rejoin(self, pit_loss_sec: int) -> dict[str, Any]:
         """
         Best-effort rejoin prediction using current gaps + pit loss.

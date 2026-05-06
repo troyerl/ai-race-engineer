@@ -115,12 +115,14 @@ class BedrockWorker(QObject):
                     "Look ahead: if pitting is best, recommend PIT NOW or PIT IN N LAPS. If staying out, say RECHECK IN N LAPS. "
                     "If not racing (s.ot is false or s.st not racing): output a simple fuel strategy plan. "
                     "OUTPUT FORMAT (single line, EXACT): "
-                    "<ACTION> — <TIMING> — <REASON> <TAGS>. "
+                    "<ACTION> — <TIMING> — <SERVICE> — <REASON> <TAGS>. "
                     "Allowed ACTION: STAY OUT | PIT | PIT NOW. "
                     "Allowed TIMING: THIS LAP | PIT IN N LAPS | RECHECK IN N LAPS. "
+                    "SERVICE (only when ACTION is PIT/PIT NOW): FUEL ONLY | 2 TIRES | 4 TIRES. "
+                    "If ACTION is STAY OUT: SERVICE must be NONE. "
                     "TAGS: append exactly two tags at the end: "
                     "[fuel|tires|track|flags] and [H|M|L]. "
-                    "Keep it <= 18 words total. "
+                    "Keep it <= 20 words total. "
                     f"Data: {race_json}"
                 )
 
