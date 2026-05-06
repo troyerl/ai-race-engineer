@@ -49,6 +49,35 @@ From the project folder:
 python3 main.py
 ```
 
+## Packaging a Windows executable
+
+PyInstaller builds are OS-specific, so **run this on a Windows machine**.
+
+### One-command build (recommended)
+
+From the project folder:
+
+```bat
+build_windows.bat
+```
+
+Output:
+- `dist\AI Race Engineer\AI Race Engineer.exe`
+
+### Manual build (if you prefer)
+
+```bat
+py -m pip install -U pip
+py -m pip install -U pyinstaller
+py -m PyInstaller --noconfirm --windowed --name "AI Race Engineer" main.py
+```
+
+If you want a single-file exe (sometimes less reliable with GUI apps):
+
+```bat
+py -m PyInstaller --noconfirm --onefile --windowed --name "AI Race Engineer" main.py
+```
+
 ### UI controls
 
 - **ANALYZE FIELD & ADVISE**: sends the current snapshot to Bedrock and disables itself until:
