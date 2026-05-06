@@ -239,6 +239,14 @@ class AIRaceEngineer(QWidget):
         pit_hint = QLabel("Pit loss = pit lane drive-through + stop time")
         pit_hint.setObjectName("subLabel")
 
+        pit_defaults_row = QHBoxLayout()
+        pit_defaults_row.setContentsMargins(0, 0, 0, 0)
+        self.pit_defaults_btn = QPushButton("Use track default pit loss")
+        self.pit_defaults_btn.setObjectName("clearBtn")
+        self.pit_defaults_btn.setCursor(Qt.PointingHandCursor)
+        self.pit_defaults_btn.clicked.connect(self._apply_track_default_pit_loss)
+        pit_defaults_row.addWidget(self.pit_defaults_btn)
+
         clear_row = QHBoxLayout()
         clear_row.setContentsMargins(0, 0, 0, 0)
         clear_label = QLabel("Clear advice after (sec)")
@@ -266,6 +274,7 @@ class AIRaceEngineer(QWidget):
         settings_layout.setSpacing(6)
         settings_layout.addLayout(pit_row)
         settings_layout.addWidget(pit_hint)
+        settings_layout.addLayout(pit_defaults_row)
         settings_layout.addLayout(clear_row)
         settings_layout.addWidget(clear_hint)
         self.settings_widget.setLayout(settings_layout)
@@ -491,16 +500,20 @@ class AIRaceEngineer(QWidget):
                 "QLabel#connBadge { border-color: rgba(231, 76, 60, 160); }"
             )
 
-        # On (re)connect, set a sensible default pit-loss if the user hasn't overridden it.
-        if self._last_sdk_connected is None:
-            self._last_sdk_connected = connected
-        if connected and not self._last_sdk_connected:
+        # On initial connect or reconnect, set a sensible default pit-loss
+        # (but only if the user hasn't overridden it).
+        if connected and (self._last_sdk_connected is None or self._last_sdk_connected is False):
             self._maybe_set_default_pit_loss()
         self._last_sdk_connected = connected
 
     def _on_pit_spin_changed(self, _val: int):
         # Mark as user-modified so we don't overwrite with track defaults later.
         self._pit_user_modified = True
+
+    def _apply_track_default_pit_loss(self):
+        # Explicit user action: override current value with track-based default.
+        self._pit_user_modified = False
+        self._maybe_set_default_pit_loss()
 
     def _maybe_set_default_pit_loss(self):
         if self._pit_user_modified:
