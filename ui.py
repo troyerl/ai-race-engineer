@@ -41,47 +41,55 @@ class AIRaceEngineer(QWidget):
                 padding: 12px 12px;
                 border-radius: 12px;
             }
-            QLabel#subLabel { color: rgba(255,255,255,190); font-size: 12px; }
+            QLabel#subLabel {
+                color: rgba(255,255,255,245);
+                font-size: 12px;
+                font-weight: 700;
+                background: rgba(20, 22, 28, 235);
+                border: 1px solid rgba(255,255,255,30);
+                padding: 4px 8px;
+                border-radius: 10px;
+            }
             QPushButton#analyzeBtn {
-                background-color: #1F8A4C;
+                background-color: rgba(31, 138, 76, 235);
                 color: white;
                 font-weight: 700;
                 border-radius: 12px;
                 padding: 12px;
-                border: 1px solid rgba(255,255,255,18);
+                border: 1px solid rgba(255,255,255,40);
             }
-            QPushButton#analyzeBtn:hover { background-color: #239A55; }
-            QPushButton#analyzeBtn:pressed { background-color: #197A43; }
+            QPushButton#analyzeBtn:hover { background-color: rgba(35, 154, 85, 245); }
+            QPushButton#analyzeBtn:pressed { background-color: rgba(25, 122, 67, 245); }
             QPushButton#analyzeBtn:disabled {
                 background-color: rgba(31, 138, 76, 90);
                 color: rgba(255,255,255,160);
             }
             QPushButton#clearBtn {
-                background-color: rgba(255,255,255,35);
-                color: rgba(255,255,255,220);
+                background-color: rgba(20, 22, 28, 235);
+                color: rgba(255,255,255,245);
                 font-weight: 700;
                 border-radius: 12px;
                 padding: 10px;
-                border: 1px solid rgba(255,255,255,18);
+                border: 1px solid rgba(255,255,255,40);
             }
-            QPushButton#clearBtn:hover { background-color: rgba(255,255,255,50); }
-            QPushButton#clearBtn:pressed { background-color: rgba(255,255,255,28); }
+            QPushButton#clearBtn:hover { background-color: rgba(28, 30, 38, 245); }
+            QPushButton#clearBtn:pressed { background-color: rgba(16, 18, 24, 245); }
             QPushButton#closeBtn {
-                background-color: rgba(231, 76, 60, 160);
+                background-color: rgba(231, 76, 60, 235);
                 color: rgba(255,255,255,240);
                 font-weight: 800;
                 border-radius: 12px;
                 padding: 10px;
-                border: 1px solid rgba(255,255,255,18);
+                border: 1px solid rgba(255,255,255,40);
             }
-            QPushButton#closeBtn:hover { background-color: rgba(231, 76, 60, 200); }
-            QPushButton#closeBtn:pressed { background-color: rgba(231, 76, 60, 140); }
+            QPushButton#closeBtn:hover { background-color: rgba(231, 76, 60, 245); }
+            QPushButton#closeBtn:pressed { background-color: rgba(200, 55, 45, 245); }
             QSpinBox#tireSpin, QSpinBox#pitSpin {
                 background-color: rgba(8, 10, 14, 215);
                 color: white;
                 border-radius: 10px;
                 padding: 6px 10px;
-                border: 1px solid rgba(255,255,255,22);
+                border: 1px solid rgba(255,255,255,40);
                 min-width: 70px;
                 font-weight: 700;
             }
