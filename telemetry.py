@@ -29,6 +29,7 @@ class TelemetryTracker:
         self._last_on_pit_road: bool | None = None
         self._last_known_tire_wear: dict[str, Any] | None = None
         self._last_known_tire_wear_stint_laps: int | None = None
+        self._last_pit_lap: int | None = None
 
     def ensure_connected(self) -> bool:
         if not self.ir.is_connected:
@@ -46,6 +47,67 @@ class TelemetryTracker:
             return default
         return default if v is None else v
 
+    def estimate_rejoin(self, pit_loss_sec: int) -> dict[str, Any]:
+        """
+        Best-effort rejoin prediction using current gaps + pit loss.
+        Returns compact, UI-friendly values; does not affect the AI token budget.
+        """
+        player_idx = self._ir_get("PlayerCarIdx", 0)
+        player_pos = self._ir_get("PlayerCarClassPosition", 0)
+        positions = self._ir_get("CarIdxClassPosition", []) or []
+        car_idx_f2 = self._ir_get("CarIdxF2Time", None)
+        car_idx_dist = self._ir_get("CarIdxLapDistPct", None)
+
+        # Use recent pace as a seconds-per-lap scaling factor for distance-only fallbacks.
+        you_times = list(self.field_history.get(player_idx, []))
+        avg_lap_s = (sum(you_times[-3:]) / max(1, len(you_times[-3:]))) if you_times else 90.0
+
+        def idx_by_pos(target_pos: int) -> int | None:
+            for idx, pos in enumerate(positions):
+                if pos == target_pos:
+                    return idx
+            return None
+
+        ahead_idx = idx_by_pos(player_pos - 1) if player_pos else None
+        behind_idx = idx_by_pos(player_pos + 1) if player_pos else None
+
+        def gap_est_s(a_idx: int | None, b_idx: int | None) -> float | None:
+            if a_idx is None or b_idx is None:
+                return None
+            try:
+                if isinstance(car_idx_f2, (list, tuple)) and a_idx < len(car_idx_f2) and b_idx < len(car_idx_f2):
+                    a = float(car_idx_f2[a_idx])
+                    b = float(car_idx_f2[b_idx])
+                    if a >= 0 and b >= 0:
+                        return round(abs(a - b), 2)
+            except Exception:
+                pass
+            try:
+                if isinstance(car_idx_dist, (list, tuple)) and a_idx < len(car_idx_dist) and b_idx < len(car_idx_dist):
+                    da = float(car_idx_dist[a_idx])
+                    db = float(car_idx_dist[b_idx])
+                    if 0.0 <= da <= 1.0 and 0.0 <= db <= 1.0:
+                        dd = (db - da) % 1.0
+                        return round(abs(dd * float(avg_lap_s)), 2)
+            except Exception:
+                pass
+            return None
+
+        ga = gap_est_s(player_idx, ahead_idx)
+        gb = gap_est_s(player_idx, behind_idx)
+
+        pl = float(pit_loss_sec)
+        verdict = "UNKNOWN"
+        # Very coarse: compare pit loss to nearest gaps.
+        if gb is not None and pl > gb:
+            verdict = "LIKELY_LOSE_POSITION"
+        elif ga is not None and pl < ga:
+            verdict = "UNDERCUT_POSSIBLE"
+        elif ga is not None or gb is not None:
+            verdict = "REJOIN_NEARBY"
+
+        return {"ga": ga, "gb": gb, "pl": pit_loss_sec, "v": verdict}
+
     def update_field_history(self) -> None:
         if not self.ensure_connected():
             return
@@ -62,6 +124,7 @@ class TelemetryTracker:
             if self._last_on_pit_road and not on_pit_road:
                 if isinstance(lap_now, int):
                     self._stint_start_lap = lap_now
+                    self._last_pit_lap = lap_now
             self._last_on_pit_road = on_pit_road
 
         laps = self.ir["CarIdxLap"] or []
@@ -202,6 +265,7 @@ class TelemetryTracker:
         stint_laps = None
         if isinstance(lap_int, int) and isinstance(self._stint_start_lap, int):
             stint_laps = max(0, lap_int - self._stint_start_lap)
+        last_pit_lap = self._last_pit_lap
 
         on_pit_road = bool(self._ir_get("OnPitRoad", False))
         tire_wear_snapshot = read_tire_wear_snapshot() if on_pit_road else None
@@ -352,6 +416,7 @@ class TelemetryTracker:
             },
             "m": {  # me
                 "l": self._ir_get("Lap", None),
+                "lp": last_pit_lap,
                 "lr": laps_remain,
                 "p": player_pos,
                 "fu": round(fuel_level, 2),

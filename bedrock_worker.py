@@ -101,7 +101,7 @@ class BedrockWorker(QObject):
                     "Data is compact JSON with this schema: "
                     "s{st=session_state,tr=time_remain,lt=laps_total,ot=is_on_track,ig=is_in_garage}; "
                     "m{l=lap,lr=laps_remain,p=pos,fu=fuel,fph=fuel/hr,fpl=fuel/lap_est,fl=fuel_laps_left,mk=can_make,ls=laps_short,"
-                    "t=lap_times,pc=pace,fg=flags,fs=flag_state,pr=on_pit_road,sl=stint_laps,ga=gap_ahead_s,gb=gap_behind_s,"
+                    "lp=last_pit_lap,t=lap_times,pc=pace,fg=flags,fs=flag_state,pr=on_pit_road,sl=stint_laps,ga=gap_ahead_s,gb=gap_behind_s,"
                     "bl=best_lap_s,fo=falloff_s,pb=pit_payback_laps,pw=pit_window_open,pwu=laps_until_window,"
                     "tw=last_wear,tws=wear_stale,twsl=wear_stint_laps,twr=wear_rate}; "
                     "r{pl=pit_loss,ts=tire_sets,fc=fuel_capacity}; rv=rivals; f=field. "
@@ -115,10 +115,12 @@ class BedrockWorker(QObject):
                     "Look ahead: if pitting is best, recommend PIT NOW or PIT IN N LAPS. If staying out, say RECHECK IN N LAPS. "
                     "If not racing (s.ot is false or s.st not racing): output a simple fuel strategy plan. "
                     "OUTPUT FORMAT (single line, EXACT): "
-                    "<ACTION> — <TIMING> — <REASON>. "
+                    "<ACTION> — <TIMING> — <REASON> <TAGS>. "
                     "Allowed ACTION: STAY OUT | PIT | PIT NOW. "
                     "Allowed TIMING: THIS LAP | PIT IN N LAPS | RECHECK IN N LAPS. "
-                    "Keep it <= 14 words total. "
+                    "TAGS: append exactly two tags at the end: "
+                    "[fuel|tires|track|flags] and [H|M|L]. "
+                    "Keep it <= 18 words total. "
                     f"Data: {race_json}"
                 )
 

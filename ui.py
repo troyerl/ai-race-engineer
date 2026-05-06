@@ -9,6 +9,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QApplication,
 )
+import os
+import threading
+import subprocess
+import sys
 
 from bedrock_worker import BedrockWorker
 from telemetry import TelemetryTracker
@@ -18,6 +22,8 @@ class AIRaceEngineer(QWidget):
     def __init__(self):
         super().__init__()
         self.telemetry = TelemetryTracker()
+        self._feature_rejoin = os.getenv("AIRACE_FEATURE_REJOIN", "0") == "1"
+        self._feature_voice = os.getenv("AIRACE_FEATURE_VOICE", "0") == "1"
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -132,6 +138,11 @@ class AIRaceEngineer(QWidget):
         top_row.addWidget(self.ai_badge)
         top_row.addStretch(1)
 
+        self.rejoin_label = None
+        if self._feature_rejoin:
+            self.rejoin_label = QLabel("Gap/Rejoin: …")
+            self.rejoin_label.setObjectName("subLabel")
+
         self.btn = QPushButton("ANALYZE FIELD & ADVISE")
         self.btn.setObjectName("analyzeBtn")
         self.btn.setCursor(Qt.PointingHandCursor)
@@ -179,6 +190,8 @@ class AIRaceEngineer(QWidget):
         bottom_row.addWidget(self.close_btn)
 
         self.layout.addLayout(top_row)
+        if self.rejoin_label is not None:
+            self.layout.addWidget(self.rejoin_label)
         self.layout.addWidget(self.label)
         self.layout.addLayout(tire_row)
         self.layout.addLayout(pit_row)
@@ -219,6 +232,12 @@ class AIRaceEngineer(QWidget):
         self._conn_timer.start(1000)
         self._update_connection_badge()
         self._set_ai_status("Idle")
+
+        if self.rejoin_label is not None:
+            self._rejoin_timer = QTimer(self)
+            self._rejoin_timer.timeout.connect(self._update_rejoin_label)
+            self._rejoin_timer.start(1000)
+            self._update_rejoin_label()
 
     def trigger_ai_request(self):
         self._idle_clear_timer.stop()
@@ -288,6 +307,9 @@ class AIRaceEngineer(QWidget):
         self._active_request_id = 0
         self._idle_clear_timer.start(120000)
         self._set_ai_status("Error" if str(text).startswith("AI Error") else "Done")
+        if self._feature_voice and not str(text).startswith("AI Error"):
+            action = str(text).split("—", 1)[0].strip()
+            threading.Thread(target=self._speak_action, args=(action,), daemon=True).start()
 
     def _flush_partial(self):
         if self._active_request_id == 0 or self._partial_buffer is None:
@@ -338,6 +360,45 @@ class AIRaceEngineer(QWidget):
         else:  # error/unknown
             color = "rgba(231, 76, 60, 170)"
         self.ai_badge.setStyleSheet(f"QLabel#connBadge {{ border-color: {color}; }}")
+
+    def _update_rejoin_label(self):
+        if self.rejoin_label is None:
+            return
+        est = self.telemetry.estimate_rejoin(int(self.pit_spin.value()))
+        ga = est.get("ga")
+        gb = est.get("gb")
+        v = est.get("v", "UNKNOWN")
+        parts = []
+        parts.append(f"GA:{ga:.1f}s" if isinstance(ga, (int, float)) else "GA:—")
+        parts.append(f"GB:{gb:.1f}s" if isinstance(gb, (int, float)) else "GB:—")
+        parts.append(f"PL:{int(self.pit_spin.value())}s")
+        if v == "LIKELY_LOSE_POSITION":
+            verdict = "Rejoin: likely lose 1+"
+        elif v == "UNDERCUT_POSSIBLE":
+            verdict = "Rejoin: undercut possible"
+        elif v == "REJOIN_NEARBY":
+            verdict = "Rejoin: nearby"
+        else:
+            verdict = "Rejoin: unknown"
+        self.rejoin_label.setText("Gap/Rejoin: " + " • ".join(parts) + " • " + verdict)
+
+    def _speak_action(self, action: str):
+        # Feature-flagged. Speaks only the ACTION (STAY OUT / PIT / PIT NOW).
+        try:
+            a = (action or "").strip()
+            if not a:
+                return
+            if sys.platform.startswith("darwin"):
+                subprocess.run(["say", a], check=False)
+            elif sys.platform.startswith("win"):
+                # Built-in SAPI (no extra dependency)
+                ps = (
+                    "Add-Type -AssemblyName System.Speech; "
+                    f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{a.replace(\"'\", \" \")}')"
+                )
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=False)
+        except Exception:
+            pass
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
