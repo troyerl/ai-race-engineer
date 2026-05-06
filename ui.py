@@ -127,6 +127,9 @@ class AIRaceEngineer(QWidget):
         self.conn_badge = QLabel("iRacing: …")
         self.conn_badge.setObjectName("connBadge")
         top_row.addWidget(self.conn_badge)
+        self.ai_badge = QLabel("AI: Idle")
+        self.ai_badge.setObjectName("connBadge")
+        top_row.addWidget(self.ai_badge)
         top_row.addStretch(1)
 
         self.btn = QPushButton("ANALYZE FIELD & ADVISE")
@@ -215,6 +218,7 @@ class AIRaceEngineer(QWidget):
         self._conn_timer.timeout.connect(self._update_connection_badge)
         self._conn_timer.start(1000)
         self._update_connection_badge()
+        self._set_ai_status("Idle")
 
     def trigger_ai_request(self):
         self._idle_clear_timer.stop()
@@ -227,6 +231,7 @@ class AIRaceEngineer(QWidget):
         self.label.setText("Processing Field Data...")
         self.btn.setEnabled(False)
         self._request_watchdog.start(30000)
+        self._set_ai_status("Requesting")
 
         self._next_request_id += 1
         self._active_request_id = self._next_request_id
@@ -248,11 +253,14 @@ class AIRaceEngineer(QWidget):
         self.label.setText("Engineer Standby")
         self.btn.setEnabled(True)
         if cancelled_id:
+            self._set_ai_status("Cancelled")
+        if cancelled_id:
             print(f"[INFO] Cancel requested for request_id={cancelled_id}")
 
     def display_partial(self, request_id: int, text: str):
         if request_id != self._active_request_id:
             return
+        self._set_ai_status("Streaming")
         # Buffer and coalesce updates to avoid UI churn.
         self._partial_buffer = text
         if not self._partial_flush_timer.isActive():
@@ -264,6 +272,7 @@ class AIRaceEngineer(QWidget):
             self._active_request_id = 0
             self.label.setText("Timed out. Try again or Clear/Cancel.")
             self.btn.setEnabled(True)
+            self._set_ai_status("Timed out")
 
     def display_advice(self, request_id: int, text: str):
         if request_id != self._active_request_id:
@@ -278,6 +287,7 @@ class AIRaceEngineer(QWidget):
         # Mark request complete and schedule auto-clear if no further interaction.
         self._active_request_id = 0
         self._idle_clear_timer.start(120000)
+        self._set_ai_status("Error" if str(text).startswith("AI Error") else "Done")
 
     def _flush_partial(self):
         if self._active_request_id == 0 or self._partial_buffer is None:
@@ -292,6 +302,7 @@ class AIRaceEngineer(QWidget):
             self.label.setText("Engineer Standby")
             self.layout.activate()
             self.adjustSize()
+            self._set_ai_status("Idle")
 
     def close_app(self):
         # Quit the entire program (not just hide the overlay widget).
@@ -312,6 +323,21 @@ class AIRaceEngineer(QWidget):
             self.conn_badge.setStyleSheet(
                 "QLabel#connBadge { border-color: rgba(231, 76, 60, 160); }"
             )
+
+    def _set_ai_status(self, status: str):
+        self.ai_badge.setText(f"AI: {status}")
+        status_l = (status or "").lower()
+        if status_l in ("idle", "done"):
+            color = "rgba(46, 204, 113, 140)"
+        elif status_l in ("requesting", "streaming"):
+            color = "rgba(52, 152, 219, 160)"
+        elif status_l in ("timed out", "timeout"):
+            color = "rgba(241, 196, 15, 170)"
+        elif status_l in ("cancelled", "canceled"):
+            color = "rgba(149, 165, 166, 170)"
+        else:  # error/unknown
+            color = "rgba(231, 76, 60, 170)"
+        self.ai_badge.setStyleSheet(f"QLabel#connBadge {{ border-color: {color}; }}")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
