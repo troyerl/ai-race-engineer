@@ -437,6 +437,9 @@ class AIRaceEngineer(QWidget):
     def _on_request_timeout(self):
         if self._active_request_id:
             print(f"[WARN] AI request timed out (request_id={self._active_request_id})")
+            # Vital: cooperative-cancel the worker stream. Without this, boto3 may keep
+            # iterating forever and the UI stays stuck even though we re-enabled Analyze.
+            self.ai_worker.cancel_active()
             self._active_request_id = 0
             self.label.setText("Timed out. Try again or Clear/Cancel.")
             self.btn.setEnabled(True)

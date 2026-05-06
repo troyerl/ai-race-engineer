@@ -1,7 +1,8 @@
 import json
 import os
-import threading
 import sys
+import threading
+import time
 
 import boto3
 from PySide6.QtCore import QObject, Signal
@@ -9,6 +10,8 @@ from botocore.config import Config
 
 
 DEFAULT_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+# Absolute wall-clock guard: some streams can misbehave without a proper end iteration.
+STREAM_MAX_SECONDS = 50
 
 
 class BedrockWorker(QObject):
@@ -146,11 +149,20 @@ class BedrockWorker(QObject):
                     with self._lock:
                         return request_id in self._cancelled_request_ids
 
+                stream_started = time.monotonic()
+                stream_hard_stop = False
+
+                def should_stop_iteration() -> bool:
+                    nonlocal stream_hard_stop
+                    if time.monotonic() - stream_started > STREAM_MAX_SECONDS:
+                        stream_hard_stop = True
+                        return True
+                    return is_cancelled()
+
                 if stream is not None:
                     for event in stream:
-                        if is_cancelled():
-                            self._clear_cancelled(request_id)
-                            return
+                        if should_stop_iteration():
+                            break
                         if not isinstance(event, dict) or "chunk" not in event:
                             continue
                         chunk = event.get("chunk") or {}
@@ -161,6 +173,11 @@ class BedrockWorker(QObject):
                             payload = json.loads(b.decode("utf-8"))
                         except Exception:
                             continue
+
+                        if isinstance(payload, dict):
+                            etype = str(payload.get("type") or "").lower()
+                            if etype == "message_stop":
+                                break
 
                         # Bedrock/Anthropic streaming sends many event types; we only
                         # extract incremental text deltas to build the user-visible advice.
@@ -178,7 +195,16 @@ class BedrockWorker(QObject):
                             if current:
                                 self.partial.emit(request_id, current)
 
+                    if is_cancelled():
+                        self._clear_cancelled(request_id)
+                        return
+
                 advice = "".join(advice_parts).strip()
+                if stream_hard_stop and advice:
+                    advice = advice + " [stream cap]"
+                elif stream_hard_stop and not advice:
+                    advice = "AI Error: Stream timed out."
+
                 if not advice:
                     advice = "AI Error: Empty response."
 
