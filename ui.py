@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QHBoxLayout,
+    QApplication,
 )
 
 from bedrock_worker import BedrockWorker
@@ -65,6 +66,16 @@ class AIRaceEngineer(QWidget):
             }
             QPushButton#clearBtn:hover { background-color: rgba(255,255,255,50); }
             QPushButton#clearBtn:pressed { background-color: rgba(255,255,255,28); }
+            QPushButton#closeBtn {
+                background-color: rgba(231, 76, 60, 160);
+                color: rgba(255,255,255,240);
+                font-weight: 800;
+                border-radius: 12px;
+                padding: 10px;
+                border: 1px solid rgba(255,255,255,18);
+            }
+            QPushButton#closeBtn:hover { background-color: rgba(231, 76, 60, 200); }
+            QPushButton#closeBtn:pressed { background-color: rgba(231, 76, 60, 140); }
             QSpinBox#tireSpin, QSpinBox#pitSpin {
                 background-color: rgba(8, 10, 14, 215);
                 color: white;
@@ -130,11 +141,21 @@ class AIRaceEngineer(QWidget):
         self.clear_btn.setCursor(Qt.PointingHandCursor)
         self.clear_btn.clicked.connect(self.clear_and_cancel)
 
+        self.close_btn = QPushButton("CLOSE")
+        self.close_btn.setObjectName("closeBtn")
+        self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.clicked.connect(self.close_app)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setContentsMargins(0, 0, 0, 0)
+        bottom_row.addWidget(self.clear_btn)
+        bottom_row.addWidget(self.close_btn)
+
         self.layout.addWidget(self.label)
         self.layout.addLayout(tire_row)
         self.layout.addLayout(pit_row)
         self.layout.addWidget(self.btn)
-        self.layout.addWidget(self.clear_btn)
+        self.layout.addLayout(bottom_row)
         self.setLayout(self.layout)
 
         self.ai_worker = BedrockWorker()
@@ -240,6 +261,14 @@ class AIRaceEngineer(QWidget):
             self.label.setText("Engineer Standby")
             self.layout.activate()
             self.adjustSize()
+
+    def close_app(self):
+        # Quit the entire program (not just hide the overlay widget).
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+        else:
+            self.close()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
