@@ -66,7 +66,7 @@ Output:
 
 Notes:
 - The app uses `icon.png` at runtime (Qt window/app icon).
-- The Windows build script converts `icon.png` to `icon.ico` and passes it to PyInstaller (`--icon`) so the `.exe` has the right icon in Explorer/taskbar.
+- The Windows build script generates a **multi-size** `icon.ico` from `icon.png` (via `make_icon_ico.py`) and passes it to PyInstaller (`--icon`). Multi-size ICOs are much more reliable in Explorer/taskbar than single-size ICOs.
 
 ### Manual build (if you prefer)
 
