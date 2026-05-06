@@ -36,6 +36,15 @@ BTN_STRATEGY = "GET RACE STRATEGY"
 BTN_DISCONNECTED = "ANALYZE FIELD & ADVISE"
 
 
+def _first_nonempty_line(text: str) -> str:
+    """Multi-line engineer replies keep the pit call on line 1 for parsers / voice."""
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        s = line.strip()
+        if s:
+            return s
+    return ""
+
+
 class AIRaceEngineer(QWidget):
     def __init__(self):
         super().__init__()
@@ -63,8 +72,9 @@ class AIRaceEngineer(QWidget):
             QWidget { }
             QLabel#statusLabel {
                 color: #E8F5E9;
-                font-size: 18px;
+                font-size: 17px;
                 font-weight: 700;
+                line-height: 142%;
                 background: rgba(8, 10, 14, 215);
                 border: 1px solid rgba(255, 255, 255, 22);
                 padding: 12px 12px;
@@ -474,7 +484,8 @@ class AIRaceEngineer(QWidget):
         if self.rejoin_label is not None:
             self._update_pit_impact_from_advice(str(text))
         if self._feature_voice and not str(text).startswith("AI Error"):
-            action = str(text).split("—", 1)[0].strip()
+            head = _first_nonempty_line(str(text))
+            action = head.split("—", 1)[0].strip() if head else ""
             threading.Thread(target=self._speak_action, args=(action,), daemon=True).start()
 
     def _flush_partial(self):
@@ -590,7 +601,8 @@ class AIRaceEngineer(QWidget):
         if self.rejoin_label is None:
             return
         # Expected format: ACTION — TIMING — REASON [tag] [H|M|L]
-        parts = [p.strip() for p in text.split("—")]
+        head = _first_nonempty_line(text)
+        parts = [p.strip() for p in head.split("—")]
         if len(parts) < 2:
             self.rejoin_label.setText("Pit-road impact: couldn’t read call (bad format)")
             return

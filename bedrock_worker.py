@@ -44,14 +44,13 @@ def _build_engineer_prompt(mode: str, race_json: str) -> str:
             + "and tire life using r.ts (available sets); mention when to take FUEL ONLY vs 2 vs 4 tires if helpful. "
             + "Fuel fields are already US customary (gal, lb/hr); prefer m.fpe when present; respect m.fcq. "
             + "Assume green-flag racing unless s says otherwise; note estimates are approximate. "
-            + "OUTPUT (single line, EXACT separators): "
-            "FUEL STINT — TIRE STINT — STOPS EST — NOTE <TAGS>. "
-            "- FUEL STINT: e.g. PIT EVERY N LAPS FOR FUEL (integer N from r.ftl/m.fpl/s.lt). "
-            "- TIRE STINT: e.g. EVERY M LAPS or ALIGN WITH FUEL (use r.ts). "
-            "- STOPS EST: e.g. ~K STOPS. "
-            "- NOTE: <=8 words caveat. "
-            "TAGS: [strategy|fuel|tires] and [H|M|L]. "
-            "Keep total <= 32 words. "
+            + "OUTPUT FORMAT — exactly 5 lines (one newline between each line; no blank lines): "
+            + "Line1: FUEL: <pit-every-N-laps style plan using r.ftl/m.fpl/s.lt> "
+            + "Line2: TIRES: <every M laps or align with fuel; use r.ts> "
+            + "Line3: STOPS: <~K stops> "
+            + "Line4: NOTE: <one caveat, <=10 words> "
+            + "Line5: TAGS: [strategy|fuel|tires] [H|M|L] "
+            + "Keep lines short (labels FUEL/TIRES/STOPS/NOTE/TAGS exactly); <=40 words total. "
             f"{race_json}"
         )
 
@@ -67,11 +66,14 @@ def _build_engineer_prompt(mode: str, race_json: str) -> str:
         + "Use tires: tire_wear_last_known is a baseline from the last pit; project next-stop wear using "
         + "twsl and twr along with stint m.sl (stale wear when m.tws). "
         + "Compare m.ga/m.gb to r.pl for undercut/overcut; crossover m.fo vs m.pb. "
-        + "OUTPUT FORMAT (single line, EXACT): "
-        + "<ACTION> — <TIMING> — <SERVICE> — <REASON> <TAGS>. "
-        + "ACTION: STAY OUT | PIT | PIT NOW. TIMING: THIS LAP | PIT IN N LAPS | RECHECK IN N LAPS. "
-        + "SERVICE: FUEL ONLY | 2 TIRES | 4 TIRES (PIT/PIT NOW only; STAY OUT = NONE). "
-        + "TAGS: [fuel|tires|track|flags] and [H|M|L]. <= 20 words. "
+        + "OUTPUT FORMAT — exactly 3 lines (one newline between lines; no blank lines; easy to read at speed): "
+        + "Line1: <ACTION> — <TIMING> — <SERVICE> "
+        + "  ACTION: STAY OUT | PIT | PIT NOW. TIMING: THIS LAP | PIT IN N LAPS | RECHECK IN N LAPS. "
+        + "  SERVICE: FUEL ONLY | 2 TIRES | 4 TIRES (PIT/PIT NOW only; STAY OUT = NONE). "
+        + "Line2: WHY: <plain English only — max ~14 words; short phrases separated by semicolons OK; "
+        + "no JSON keys, no m./r. codes, no engineer shorthand>. "
+        + "Line3: TAGS: [fuel|tires|track|flags] [H|M|L] "
+        + "Do not put WHY text on line1; keep line1 to call + timing + service only; <=34 words lines 1–2. "
         + f"{race_json}"
     )
 
@@ -164,7 +166,7 @@ class BedrockWorker(QObject):
                 if m not in ("live", "strategy"):
                     m = "live"
                 prompt = _build_engineer_prompt(m, f"Data: {race_json}")
-                max_out = 220 if m == "strategy" else 100
+                max_out = 220 if m == "strategy" else 130
 
                 body = json.dumps(
                     {
