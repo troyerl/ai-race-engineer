@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QToolButton,
     QSpinBox,
     QSizePolicy,
     QVBoxLayout,
@@ -191,6 +192,19 @@ class AIRaceEngineer(QWidget):
         tire_row.addWidget(self.tire_spin)
         tire_row.addStretch(1)
 
+        settings_toggle_row = QHBoxLayout()
+        settings_toggle_row.setContentsMargins(0, 0, 0, 0)
+        self.settings_toggle = QToolButton()
+        self.settings_toggle.setText("Settings")
+        self.settings_toggle.setCheckable(True)
+        self.settings_toggle.setChecked(False)
+        self.settings_toggle.setArrowType(Qt.RightArrow)
+        self.settings_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.settings_toggle.setCursor(Qt.PointingHandCursor)
+        self.settings_toggle.setObjectName("clearBtn")
+        settings_toggle_row.addWidget(self.settings_toggle)
+        settings_toggle_row.addStretch(1)
+
         pit_row = QHBoxLayout()
         pit_row.setContentsMargins(0, 0, 0, 0)
         pit_label = QLabel("Pit loss (sec)")
@@ -224,6 +238,25 @@ class AIRaceEngineer(QWidget):
         clear_hint = QLabel("0 = never auto-clear")
         clear_hint.setObjectName("subLabel")
 
+        self.settings_widget = QWidget()
+        settings_layout = QVBoxLayout()
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(6)
+        settings_layout.addLayout(pit_row)
+        settings_layout.addWidget(pit_hint)
+        settings_layout.addLayout(clear_row)
+        settings_layout.addWidget(clear_hint)
+        self.settings_widget.setLayout(settings_layout)
+        self.settings_widget.setVisible(False)
+
+        def _toggle_settings(checked: bool):
+            self.settings_widget.setVisible(checked)
+            self.settings_toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+            self.layout.activate()
+            self.adjustSize()
+
+        self.settings_toggle.toggled.connect(_toggle_settings)
+
         self.clear_btn = QPushButton("CLEAR / CANCEL")
         self.clear_btn.setObjectName("clearBtn")
         self.clear_btn.setCursor(Qt.PointingHandCursor)
@@ -244,10 +277,8 @@ class AIRaceEngineer(QWidget):
             self.layout.addWidget(self.rejoin_label)
         self.layout.addWidget(self.label)
         self.layout.addLayout(tire_row)
-        self.layout.addLayout(pit_row)
-        self.layout.addWidget(pit_hint)
-        self.layout.addLayout(clear_row)
-        self.layout.addWidget(clear_hint)
+        self.layout.addLayout(settings_toggle_row)
+        self.layout.addWidget(self.settings_widget)
         self.layout.addWidget(self.btn)
         self.layout.addLayout(bottom_row)
         self.setLayout(self.layout)
