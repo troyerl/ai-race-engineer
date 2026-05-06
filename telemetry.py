@@ -271,45 +271,58 @@ class TelemetryTracker:
                     "pace": pace_stats(list(self.field_history[behind_idx])),
                 }
 
+        def drop_nones(x: Any) -> Any:
+            if isinstance(x, dict):
+                out = {}
+                for k, v in x.items():
+                    v2 = drop_nones(v)
+                    if v2 is not None:
+                        out[k] = v2
+                return out
+            if isinstance(x, list):
+                return [drop_nones(v) for v in x]
+            return x
+
+        # Compact schema to reduce tokens (short keys, no nulls, rounded floats).
         packet = {
-            "session": {
-                # These keys vary by sim/build; we include best-effort context.
-                "state": self._ir_get("SessionState", None),
-                "time_remain": self._ir_get("SessionTimeRemain", None),
-                "laps_total": self._ir_get("SessionLapsTotal", None),
-                "is_on_track": self._ir_get("IsOnTrack", None),
-                "is_in_garage": self._ir_get("IsInGarage", None),
+            "s": {  # session
+                "st": self._ir_get("SessionState", None),
+                "tr": self._ir_get("SessionTimeRemain", None),
+                "lt": self._ir_get("SessionLapsTotal", None),
+                "ot": self._ir_get("IsOnTrack", None),
+                "ig": self._ir_get("IsInGarage", None),
             },
-            "me": {
-                "lap": self._ir_get("Lap", None),
-                "laps_remain": laps_remain,
-                "pos": player_pos,
-                "fuel": round(fuel_level, 2),
-                # Raw iRacing field plus derived estimates to reduce ambiguity.
-                "fuel_use_per_hour": round(fuel_use_per_hour_raw, 3),
-                "fuel_use_per_lap_est": round(fuel_use_per_lap_est, 4),
-                "laps_of_fuel_left_est": round(laps_of_fuel_left_est, 2),
-                "can_make_to_end_on_fuel": can_make_to_end,
-                "laps_short_on_fuel": round(laps_short_on_fuel, 2) if laps_short_on_fuel is not None else None,
-                "times": you_times,
-                "pace": you_pace,
-                "flags": flags,
-                "flag_state": flag_state(flags),
-                "on_pit_road": on_pit_road,
-                "stint_laps_est": stint_laps,
-                "tire_wear_last_known": tire_wear_last_known,
-                "tire_wear_stale": (not on_pit_road),
-                "tire_wear_last_known_stint_laps": tire_wear_last_known_stint_laps,
-                "tire_wear_rate_est_per_lap": tire_wear_rate_est,
+            "m": {  # me
+                "l": self._ir_get("Lap", None),
+                "lr": laps_remain,
+                "p": player_pos,
+                "fu": round(fuel_level, 2),
+                "fph": round(fuel_use_per_hour_raw, 3),
+                "fpl": round(fuel_use_per_lap_est, 4),
+                "fl": round(laps_of_fuel_left_est, 2),
+                "mk": can_make_to_end,
+                "ls": round(laps_short_on_fuel, 2) if laps_short_on_fuel is not None else None,
+                "t": you_times,
+                "pc": you_pace,
+                "fg": int(flags) if flags is not None else None,
+                "fs": flag_state(flags),
+                "pr": on_pit_road,
+                "sl": stint_laps,
+                "tw": tire_wear_last_known,
+                "tws": (not on_pit_road),
+                "twsl": tire_wear_last_known_stint_laps,
+                "twr": tire_wear_rate_est,
             },
-            "race_info": {
-                "pit_loss_sec": int(pit_loss_sec),
-                "tire_sets_remaining": int(tire_sets_remaining),
-                "fuel_capacity": self._ir_get("FuelCapacity", None),
+            "r": {  # race_info
+                "pl": int(pit_loss_sec),
+                "ts": int(tire_sets_remaining),
+                "fc": self._ir_get("FuelCapacity", None),
             },
-            "rivals": rivals,
-            "field": relevant_history,
+            "rv": rivals,
+            "f": relevant_history,
         }
+
+        packet = drop_nones(packet)
 
         return json.dumps(packet, separators=(",", ":"))
 
