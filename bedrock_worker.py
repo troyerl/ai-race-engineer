@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import sys
 
 import boto3
 from PySide6.QtCore import QObject, Signal
@@ -66,13 +67,24 @@ class BedrockWorker(QObject):
                 )
             return self._client
 
+    def _log_enabled(self) -> bool:
+        """
+        Log to console only when running from source (python main.py).
+
+        PyInstaller packaged builds (windowed) should not emit console logs.
+        """
+        if getattr(sys, "frozen", False):
+            return False
+        return True
+
     def invoke_ai(self, request_id: int, race_json: str) -> None:
         def run():
             try:
                 token = os.getenv("IRACING_BEDROCK_TOKEN")
                 if not token:
                     msg = "Error: IRACING_BEDROCK_TOKEN not found in environment."
-                    print(f"[ERROR] {msg}")
+                    if self._log_enabled():
+                        print(f"[ERROR] {msg}")
                     self.finished.emit(request_id, msg)
                     return
 
@@ -118,7 +130,8 @@ class BedrockWorker(QObject):
                     }
                 )
 
-                print(f"[DEBUG] Sending data to AI: {race_json[:100]}...")
+                if self._log_enabled():
+                    print(f"[DEBUG] Sending data to AI: {race_json[:120]}...")
 
                 response = client.invoke_model_with_response_stream(body=body, modelId=self._model_id)
                 stream = response.get("body")
@@ -165,7 +178,8 @@ class BedrockWorker(QObject):
                 if not advice:
                     advice = "AI Error: Empty response."
 
-                print(f"[SUCCESS] AI Advice: {advice}")
+                if self._log_enabled():
+                    print(f"[AI] {advice}")
                 with self._lock:
                     if request_id in self._cancelled_request_ids:
                         self._clear_cancelled(request_id)
@@ -174,7 +188,8 @@ class BedrockWorker(QObject):
                 self.finished.emit(request_id, advice)
                 self._clear_cancelled(request_id)
             except Exception as e:
-                print(f"[ERROR] {str(e)}")
+                if self._log_enabled():
+                    print(f"[ERROR] {str(e)}")
                 with self._lock:
                     if request_id in self._cancelled_request_ids:
                         self._clear_cancelled(request_id)
