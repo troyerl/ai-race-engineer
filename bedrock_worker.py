@@ -86,9 +86,18 @@ class BedrockWorker(QObject):
                 prompt = (
                     "You are a Lead Race Engineer. Analyze the telemetry and race status. "
                     "Primary Goal: Optimize track position vs fuel/tire life. "
-                    "If 'flags' indicates a Caution, prioritize whether to 'Pit Now' or 'Stay Out' based on field behavior and fuel. "
-                    "If Green, compare User lap fall-off against the field. "
-                    "Output: 10 words max. Be decisive (e.g., 'Caution out, Pit Now for tires/fuel' or 'Green. Stay out, +5 laps'). "
+                    "Use me.flag_state (GREEN/CAUTION/UNKNOWN) not the raw flags bitmask. "
+                    "If flag_state is CAUTION: default to STAY OUT unless fuel requires a stop or pitting gains clear track position. "
+                    "If flag_state is GREEN or UNKNOWN: do NOT recommend pitting unless we are inside the pit window or fuel requires it. "
+                    "Use tires: tire_wear_last_known is a baseline from the last pit; project next-stop wear using "
+                    "tire_wear_last_known_stint_laps and tire_wear_rate_est_per_lap along with current stint_laps_est. "
+                    "Look ahead: if pitting is best, recommend PIT NOW or PIT IN N LAPS. If staying out, say RECHECK IN N LAPS. "
+                    "If not racing (session.is_on_track is false or session.state not racing): output a simple fuel strategy plan. "
+                    "OUTPUT FORMAT (single line, EXACT): "
+                    "<ACTION> — <TIMING> — <REASON>. "
+                    "Allowed ACTION: STAY OUT | PIT | PIT NOW. "
+                    "Allowed TIMING: THIS LAP | PIT IN N LAPS | RECHECK IN N LAPS. "
+                    "Keep it <= 14 words total. "
                     f"Data: {race_json}"
                 )
 

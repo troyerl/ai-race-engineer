@@ -24,6 +24,12 @@ class TelemetryTracker:
         self.field_history: dict[int, deque] = {}
         self.last_recorded_lap: dict[int, int] = {}
 
+        # Rough "stint" tracking so we can estimate tire wear even without a direct wear sensor.
+        self._stint_start_lap: int | None = None
+        self._last_on_pit_road: bool | None = None
+        self._last_known_tire_wear: dict[str, Any] | None = None
+        self._last_known_tire_wear_stint_laps: int | None = None
+
     def ensure_connected(self) -> bool:
         if not self.ir.is_connected:
             self.ir.startup()
@@ -43,6 +49,20 @@ class TelemetryTracker:
     def update_field_history(self) -> None:
         if not self.ensure_connected():
             return
+
+        # Track pit road transitions to estimate current tire stint length.
+        on_pit_road = bool(self._ir_get("OnPitRoad", False))
+        lap_now = self._ir_get("Lap", None)
+        if self._last_on_pit_road is None:
+            self._last_on_pit_road = on_pit_road
+            if isinstance(lap_now, int):
+                self._stint_start_lap = lap_now
+        else:
+            # When we leave pit road, assume "fresh stint" (new tires likely / service).
+            if self._last_on_pit_road and not on_pit_road:
+                if isinstance(lap_now, int):
+                    self._stint_start_lap = lap_now
+            self._last_on_pit_road = on_pit_road
 
         laps = self.ir["CarIdxLap"] or []
         last_lap_times = self.ir["CarIdxLastLapTime"] or []
@@ -81,11 +101,11 @@ class TelemetryTracker:
     def build_packet(self, tire_sets_remaining: int, pit_loss_sec: int) -> str:
         # The AI prompt expects a compact JSON payload; keep only what matters for
         # strategy decisions (position, fuel, flags, and recent pace of key rivals).
-        player_idx = self.ir["PlayerCarIdx"]
-        player_pos = self.ir["PlayerCarClassPosition"]
+        player_idx = self._ir_get("PlayerCarIdx", 0)
+        player_pos = self._ir_get("PlayerCarClassPosition", 0)
 
         relevant_history: dict[str, Any] = {}
-        positions = self.ir["CarIdxClassPosition"] or []
+        positions = self._ir_get("CarIdxClassPosition", []) or []
 
         def pace_stats(times: list[float]) -> dict[str, Any]:
             # Decision features: averages + simple trend (improving/slowing).
@@ -103,14 +123,44 @@ class TelemetryTracker:
                 "trend_s": round(avg3 - avg5, 3),
             }
 
-        def flag_state_hint(flags: Any) -> str:
-            # SessionFlags is a bitmask; exact decoding is non-trivial. This hint is
-            # intentionally conservative. The raw bitmask is also included.
+        def flag_state(flags: Any) -> str:
+            """
+            Decode iRacing SessionFlags into a decision-friendly state.
+
+            Important: SessionFlags is a bitmask and can be non-zero for many reasons
+            besides caution/yellow (start lights, debris, etc.). We only return CAUTION
+            when we can positively identify a caution/yellow bit.
+            """
             try:
-                f = int(flags)
+                flags_int = int(flags)
             except Exception:
                 return "UNKNOWN"
-            return "GREEN" if f == 0 else "NON_GREEN"
+
+            # Prefer the irsdk-provided flag definitions when available.
+            Flags = getattr(irsdk, "Flags", None)
+            if Flags is not None:
+                try:
+                    f = Flags(flags_int)
+                    cautionish = []
+                    for name in (
+                        "caution",
+                        "cautionWaving",
+                        "yellow",
+                        "yellowWaving",
+                        "yellowWavingAtStart",
+                        "fullCourseCaution",
+                        "localYellow",
+                    ):
+                        bit = getattr(Flags, name, None)
+                        if bit is not None:
+                            cautionish.append(bit)
+                    if cautionish and any((f & bit) for bit in cautionish):
+                        return "CAUTION"
+                except Exception:
+                    pass
+
+            # Fallback: without knowing exact bits, do NOT assume caution from non-zero.
+            return "GREEN" if flags_int == 0 else "UNKNOWN"
 
         for idx, pos in enumerate(positions):
             if pos <= 3 or abs(pos - player_pos) <= 2:
@@ -118,10 +168,63 @@ class TelemetryTracker:
                     label = f"P{pos}" if idx != player_idx else "YOU"
                     relevant_history[label] = list(self.field_history[idx])
 
-        fuel_level = self.ir["FuelLevel"]
-        fuel_use_per_hour = max(self.ir["FuelUsePerHour"], 0.1)
-        laps_remain = self.ir["SessionLapsRemain"]
-        flags = self.ir["SessionFlags"]
+        fuel_level = float(self._ir_get("FuelLevel", 0.0) or 0.0)
+        fuel_use_per_hour_raw = float(self._ir_get("FuelUsePerHour", 0.0) or 0.0)
+        fuel_use_per_hour = max(fuel_use_per_hour_raw, 0.1)
+        laps_remain = self._ir_get("SessionLapsRemain", None)
+        flags = self._ir_get("SessionFlags", 0)
+
+        def read_tire_wear_snapshot() -> dict[str, Any] | None:
+            """
+            Best-effort read of tire wear/percent remaining from iRacing.
+            Field names vary by car/build; if we can't find anything reliable,
+            return None and let the AI use stint length as a proxy.
+            """
+            candidates = [
+                ("LF", "LFwear"),
+                ("RF", "RFwear"),
+                ("LR", "LRwear"),
+                ("RR", "RRwear"),
+            ]
+            out: dict[str, Any] = {}
+            for corner, key in candidates:
+                v = self._ir_get(key, None)
+                if v is None:
+                    continue
+                try:
+                    out[corner] = round(float(v), 3)
+                except Exception:
+                    out[corner] = v
+            return out or None
+
+        # Stint length estimate (laps since last pit-road exit).
+        lap_int = self._ir_get("Lap", None)
+        stint_laps = None
+        if isinstance(lap_int, int) and isinstance(self._stint_start_lap, int):
+            stint_laps = max(0, lap_int - self._stint_start_lap)
+
+        on_pit_road = bool(self._ir_get("OnPitRoad", False))
+        tire_wear_snapshot = read_tire_wear_snapshot() if on_pit_road else None
+        # Many cars/builds only update tire wear when pitting. Treat wear as "last known".
+        if tire_wear_snapshot is not None:
+            self._last_known_tire_wear = tire_wear_snapshot
+            if isinstance(stint_laps, int):
+                self._last_known_tire_wear_stint_laps = stint_laps
+        tire_wear_last_known = self._last_known_tire_wear
+        tire_wear_last_known_stint_laps = self._last_known_tire_wear_stint_laps
+
+        # Derive a coarse per-lap wear rate from the last-known snapshot.
+        # We do not assume units (could be % used, % remaining, etc.); the AI can
+        # interpret the direction based on typical values and relative change.
+        tire_wear_rate_est = None
+        if tire_wear_last_known and isinstance(tire_wear_last_known_stint_laps, int) and tire_wear_last_known_stint_laps > 0:
+            rates = {}
+            for corner, val in tire_wear_last_known.items():
+                try:
+                    rates[corner] = round(float(val) / float(tire_wear_last_known_stint_laps), 4)
+                except Exception:
+                    continue
+            tire_wear_rate_est = rates or None
 
         you_times = list(self.field_history.get(player_idx, []))
         you_pace = pace_stats(you_times)
@@ -169,13 +272,21 @@ class TelemetryTracker:
                 }
 
         packet = {
+            "session": {
+                # These keys vary by sim/build; we include best-effort context.
+                "state": self._ir_get("SessionState", None),
+                "time_remain": self._ir_get("SessionTimeRemain", None),
+                "laps_total": self._ir_get("SessionLapsTotal", None),
+                "is_on_track": self._ir_get("IsOnTrack", None),
+                "is_in_garage": self._ir_get("IsInGarage", None),
+            },
             "me": {
-                "lap": self.ir["Lap"],
+                "lap": self._ir_get("Lap", None),
                 "laps_remain": laps_remain,
                 "pos": player_pos,
                 "fuel": round(fuel_level, 2),
                 # Raw iRacing field plus derived estimates to reduce ambiguity.
-                "fuel_use_per_hour": round(self.ir["FuelUsePerHour"], 3),
+                "fuel_use_per_hour": round(fuel_use_per_hour_raw, 3),
                 "fuel_use_per_lap_est": round(fuel_use_per_lap_est, 4),
                 "laps_of_fuel_left_est": round(laps_of_fuel_left_est, 2),
                 "can_make_to_end_on_fuel": can_make_to_end,
@@ -183,11 +294,18 @@ class TelemetryTracker:
                 "times": you_times,
                 "pace": you_pace,
                 "flags": flags,
-                "flag_state_hint": flag_state_hint(flags),
+                "flag_state": flag_state(flags),
+                "on_pit_road": on_pit_road,
+                "stint_laps_est": stint_laps,
+                "tire_wear_last_known": tire_wear_last_known,
+                "tire_wear_stale": (not on_pit_road),
+                "tire_wear_last_known_stint_laps": tire_wear_last_known_stint_laps,
+                "tire_wear_rate_est_per_lap": tire_wear_rate_est,
             },
             "race_info": {
                 "pit_loss_sec": int(pit_loss_sec),
                 "tire_sets_remaining": int(tire_sets_remaining),
+                "fuel_capacity": self._ir_get("FuelCapacity", None),
             },
             "rivals": rivals,
             "field": relevant_history,
