@@ -108,6 +108,71 @@ class TelemetryTracker:
 
         return {"ga": ga, "gb": gb, "pl": pit_loss_sec, "v": verdict}
 
+    def predict_pit_position_loss(self, pit_loss_sec: int, pit_in_laps: int) -> dict[str, Any]:
+        """
+        Predict how many class positions you'll likely lose if you pit in N laps.
+
+        This is intentionally coarse (race-safe, low compute):
+        - Uses gap estimates + simple pace deltas to project gaps forward.
+        - Evaluates only the nearby tracked slice (±2 by class position + top 3).
+        """
+        player_idx = self._ir_get("PlayerCarIdx", 0)
+        player_pos = self._ir_get("PlayerCarClassPosition", 0)
+        positions = self._ir_get("CarIdxClassPosition", []) or []
+        car_idx_f2 = self._ir_get("CarIdxF2Time", None)
+        car_idx_dist = self._ir_get("CarIdxLapDistPct", None)
+
+        you_times = list(self.field_history.get(player_idx, []))
+        you_avg = (sum(you_times[-3:]) / max(1, len(you_times[-3:]))) if you_times else 90.0
+
+        def avg_lap_for_idx(idx: int) -> float:
+            t = list(self.field_history.get(idx, []))
+            if not t:
+                return you_avg
+            return sum(t[-3:]) / max(1, len(t[-3:]))
+
+        def gap_est_s(a_idx: int, b_idx: int) -> float | None:
+            try:
+                if isinstance(car_idx_f2, (list, tuple)) and a_idx < len(car_idx_f2) and b_idx < len(car_idx_f2):
+                    a = float(car_idx_f2[a_idx])
+                    b = float(car_idx_f2[b_idx])
+                    if a >= 0 and b >= 0:
+                        return abs(a - b)
+            except Exception:
+                pass
+            try:
+                if isinstance(car_idx_dist, (list, tuple)) and a_idx < len(car_idx_dist) and b_idx < len(car_idx_dist):
+                    da = float(car_idx_dist[a_idx])
+                    db = float(car_idx_dist[b_idx])
+                    if 0.0 <= da <= 1.0 and 0.0 <= db <= 1.0:
+                        dd = (db - da) % 1.0
+                        return abs(dd * float(you_avg))
+            except Exception:
+                pass
+            return None
+
+        if not player_pos:
+            return {"p": player_pos, "n": pit_in_laps, "pl": pit_loss_sec, "lost": None}
+
+        # Consider cars behind within a few class positions that we likely track.
+        behind = []
+        for idx, pos in enumerate(positions):
+            if isinstance(pos, int) and pos > player_pos and pos <= player_pos + 5:
+                behind.append((idx, pos))
+
+        lost = 0
+        for idx, pos in behind:
+            g = gap_est_s(player_idx, idx)
+            if g is None:
+                continue
+            # Project gap forward N laps: gap + N * (their_avg - our_avg).
+            their_avg = avg_lap_for_idx(idx)
+            projected_gap = float(g) + float(pit_in_laps) * (float(their_avg) - float(you_avg))
+            if projected_gap < float(pit_loss_sec):
+                lost += 1
+
+        return {"p": player_pos, "n": int(pit_in_laps), "pl": int(pit_loss_sec), "lost": lost}
+
     def update_field_history(self) -> None:
         if not self.ensure_connected():
             return

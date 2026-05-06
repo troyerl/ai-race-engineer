@@ -104,21 +104,36 @@ class AIRaceEngineer(QWidget):
                 background-color: rgba(8, 10, 14, 215);
                 color: white;
                 border-radius: 10px;
-                padding: 6px 10px;
+                padding: 8px 12px;
                 border: 1px solid rgba(255,255,255,40);
-                min-width: 70px;
+                min-width: 110px;
                 font-weight: 700;
+                font-size: 14px;
             }
             QSpinBox#tireSpin::up-button, QSpinBox#tireSpin::down-button,
             QSpinBox#pitSpin::up-button, QSpinBox#pitSpin::down-button {
-                width: 20px;
-                border-radius: 8px;
-                background: rgba(255,255,255,14);
-                border: none;
+                width: 34px;
+                border-radius: 10px;
+                background: rgba(255,255,255,55);
+                border: 1px solid rgba(255,255,255,80);
             }
             QSpinBox#tireSpin::up-button:hover, QSpinBox#tireSpin::down-button:hover,
             QSpinBox#pitSpin::up-button:hover, QSpinBox#pitSpin::down-button:hover {
-                background: rgba(255,255,255,22);
+                background: rgba(255,255,255,75);
+            }
+            QSpinBox#tireSpin::up-button:pressed, QSpinBox#tireSpin::down-button:pressed,
+            QSpinBox#pitSpin::up-button:pressed, QSpinBox#pitSpin::down-button:pressed {
+                background: rgba(255,255,255,45);
+            }
+            QSpinBox#tireSpin::up-arrow, QSpinBox#pitSpin::up-arrow {
+                width: 18px;
+                height: 18px;
+                image: url("assets/spin_up.svg");
+            }
+            QSpinBox#tireSpin::down-arrow, QSpinBox#pitSpin::down-arrow {
+                width: 18px;
+                height: 18px;
+                image: url("assets/spin_down.svg");
             }
             """
         )
@@ -235,10 +250,7 @@ class AIRaceEngineer(QWidget):
         self._set_ai_status("Idle")
 
         if self.rejoin_label is not None:
-            self._rejoin_timer = QTimer(self)
-            self._rejoin_timer.timeout.connect(self._update_rejoin_label)
-            self._rejoin_timer.start(1000)
-            self._update_rejoin_label()
+            self.rejoin_label.setText("Pit impact: (waiting for advice)")
 
     def trigger_ai_request(self):
         self._idle_clear_timer.stop()
@@ -308,6 +320,8 @@ class AIRaceEngineer(QWidget):
         self._active_request_id = 0
         self._idle_clear_timer.start(120000)
         self._set_ai_status("Error" if str(text).startswith("AI Error") else "Done")
+        if self.rejoin_label is not None:
+            self._update_pit_impact_from_advice(str(text))
         if self._feature_voice and not str(text).startswith("AI Error"):
             action = str(text).split("—", 1)[0].strip()
             threading.Thread(target=self._speak_action, args=(action,), daemon=True).start()
@@ -362,26 +376,48 @@ class AIRaceEngineer(QWidget):
             color = "rgba(231, 76, 60, 170)"
         self.ai_badge.setStyleSheet(f"QLabel#connBadge {{ border-color: {color}; }}")
 
-    def _update_rejoin_label(self):
+    def _update_pit_impact_from_advice(self, text: str):
         if self.rejoin_label is None:
             return
-        est = self.telemetry.estimate_rejoin(int(self.pit_spin.value()))
-        ga = est.get("ga")
-        gb = est.get("gb")
-        v = est.get("v", "UNKNOWN")
-        parts = []
-        parts.append(f"GA:{ga:.1f}s" if isinstance(ga, (int, float)) else "GA:—")
-        parts.append(f"GB:{gb:.1f}s" if isinstance(gb, (int, float)) else "GB:—")
-        parts.append(f"PL:{int(self.pit_spin.value())}s")
-        if v == "LIKELY_LOSE_POSITION":
-            verdict = "Rejoin: likely lose 1+"
-        elif v == "UNDERCUT_POSSIBLE":
-            verdict = "Rejoin: undercut possible"
-        elif v == "REJOIN_NEARBY":
-            verdict = "Rejoin: nearby"
+        # Expected format: ACTION — TIMING — REASON [tag] [H|M|L]
+        parts = [p.strip() for p in text.split("—")]
+        if len(parts) < 2:
+            self.rejoin_label.setText("Pit impact: unknown (bad format)")
+            return
+        action = parts[0].upper()
+        timing = parts[1].upper()
+
+        pit_in_laps = None
+        if action == "PIT NOW":
+            pit_in_laps = 0
+        elif action == "PIT":
+            if "PIT IN" in timing and "LAP" in timing:
+                # e.g. "PIT IN 5 LAPS"
+                try:
+                    tokens = timing.replace("LAPS", "").replace("LAP", "").split()
+                    pit_in_laps = int(tokens[tokens.index("IN") + 1])
+                except Exception:
+                    pit_in_laps = None
+            elif "THIS LAP" in timing:
+                pit_in_laps = 0
+
+        if pit_in_laps is None:
+            # STAY OUT or unknown pit timing: still show pit-now impact as a helpful reference.
+            est = self.telemetry.predict_pit_position_loss(int(self.pit_spin.value()), 0)
+            lost = est.get("lost")
+            if isinstance(lost, int):
+                self.rejoin_label.setText(f"Pit impact: Pit now likely loses ~{lost} pos")
+            else:
+                self.rejoin_label.setText("Pit impact: unknown")
+            return
+
+        est = self.telemetry.predict_pit_position_loss(int(self.pit_spin.value()), int(pit_in_laps))
+        lost = est.get("lost")
+        if isinstance(lost, int):
+            when = "now" if pit_in_laps == 0 else f"in {pit_in_laps} laps"
+            self.rejoin_label.setText(f"Pit impact: If you pit {when}, likely lose ~{lost} pos")
         else:
-            verdict = "Rejoin: unknown"
-        self.rejoin_label.setText("Gap/Rejoin: " + " • ".join(parts) + " • " + verdict)
+            self.rejoin_label.setText("Pit impact: unknown")
 
     def _speak_action(self, action: str):
         # Feature-flagged. Speaks only the ACTION (STAY OUT / PIT / PIT NOW).
