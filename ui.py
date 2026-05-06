@@ -158,6 +158,8 @@ class AIRaceEngineer(QWidget):
         if self._feature_rejoin:
             self.rejoin_label = QLabel("Gap/Rejoin: …")
             self.rejoin_label.setObjectName("subLabel")
+            # Hidden until the AI actually recommends a PIT.
+            self.rejoin_label.setVisible(False)
 
         self.btn = QPushButton("ANALYZE FIELD & ADVISE")
         self.btn.setObjectName("analyzeBtn")
@@ -250,7 +252,8 @@ class AIRaceEngineer(QWidget):
         self._set_ai_status("Idle")
 
         if self.rejoin_label is not None:
-            self.rejoin_label.setText("Pit impact: (waiting for advice)")
+            # Intentionally blank/hidden until the first PIT recommendation.
+            pass
 
     def trigger_ai_request(self):
         self._idle_clear_timer.stop()
@@ -387,6 +390,14 @@ class AIRaceEngineer(QWidget):
         action = parts[0].upper()
         timing = parts[1].upper()
 
+        # Only show pit impact when the AI recommends pitting.
+        # Hide it on STAY OUT so the overlay stays uncluttered.
+        if action not in ("PIT", "PIT NOW"):
+            self.rejoin_label.setVisible(False)
+            self.rejoin_label.setText("")
+            return
+        self.rejoin_label.setVisible(True)
+
         pit_in_laps = None
         if action == "PIT NOW":
             pit_in_laps = 0
@@ -402,13 +413,7 @@ class AIRaceEngineer(QWidget):
                 pit_in_laps = 0
 
         if pit_in_laps is None:
-            # STAY OUT or unknown pit timing: still show pit-now impact as a helpful reference.
-            est = self.telemetry.predict_pit_position_loss(int(self.pit_spin.value()), 0)
-            lost = est.get("lost")
-            if isinstance(lost, int):
-                self.rejoin_label.setText(f"Pit impact: Pit now likely loses ~{lost} pos")
-            else:
-                self.rejoin_label.setText("Pit impact: unknown")
+            self.rejoin_label.setText("Pit impact: unknown (no timing)")
             return
 
         est = self.telemetry.predict_pit_position_loss(int(self.pit_spin.value()), int(pit_in_laps))
