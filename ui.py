@@ -103,6 +103,17 @@ class AIRaceEngineer(QWidget):
             }
             QPushButton#clearBtn:hover { background-color: rgba(28, 30, 38, 245); }
             QPushButton#clearBtn:pressed { background-color: rgba(16, 18, 24, 245); }
+            QToolButton#settingsBtn {
+                background-color: rgba(20, 22, 28, 235);
+                color: rgba(255,255,255,245);
+                font-weight: 900;
+                border-radius: 12px;
+                padding: 10px 12px;
+                border: 1px solid rgba(255,255,255,80);
+                text-align: left;
+            }
+            QToolButton#settingsBtn:hover { background-color: rgba(28, 30, 38, 245); }
+            QToolButton#settingsBtn:pressed { background-color: rgba(16, 18, 24, 245); }
             QPushButton#closeBtn {
                 background-color: rgba(231, 76, 60, 235);
                 color: rgba(255,255,255,240);
@@ -195,15 +206,16 @@ class AIRaceEngineer(QWidget):
         settings_toggle_row = QHBoxLayout()
         settings_toggle_row.setContentsMargins(0, 0, 0, 0)
         self.settings_toggle = QToolButton()
-        self.settings_toggle.setText("Settings")
+        self.settings_toggle.setText("SETTINGS")
         self.settings_toggle.setCheckable(True)
         self.settings_toggle.setChecked(False)
         self.settings_toggle.setArrowType(Qt.RightArrow)
         self.settings_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.settings_toggle.setCursor(Qt.PointingHandCursor)
-        self.settings_toggle.setObjectName("clearBtn")
-        settings_toggle_row.addWidget(self.settings_toggle)
-        settings_toggle_row.addStretch(1)
+        self.settings_toggle.setObjectName("settingsBtn")
+        self.settings_toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.settings_toggle.setMinimumHeight(40)
+        settings_toggle_row.addWidget(self.settings_toggle, 1)
 
         pit_row = QHBoxLayout()
         pit_row.setContentsMargins(0, 0, 0, 0)
