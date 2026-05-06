@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import threading
+import json
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -28,6 +29,8 @@ STREAM_UI_THROTTLE_MS = 80
 FEATURE_REJOIN_ENV = "AIRACE_FEATURE_REJOIN"
 FEATURE_VOICE_ENV = "AIRACE_FEATURE_VOICE"
 
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ai_race_engineer.json")
+
 
 class AIRaceEngineer(QWidget):
     def __init__(self):
@@ -37,6 +40,8 @@ class AIRaceEngineer(QWidget):
         self._feature_voice = os.getenv(FEATURE_VOICE_ENV, "0") == "1"
         self._pit_user_modified = False
         self._last_sdk_connected = None
+        self._ensure_default_config_file()
+        self._config = self._load_config()
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -242,13 +247,18 @@ class AIRaceEngineer(QWidget):
         self.clear_after_spin.setObjectName("pitSpin")
         self.clear_after_spin.setMinimum(0)
         self.clear_after_spin.setMaximum(600)
-        self.clear_after_spin.setValue(120)
+        self.clear_after_spin.setValue(int(self._config.get("clear_after_sec", 120)))
         clear_row.addWidget(clear_label)
         clear_row.addWidget(self.clear_after_spin)
         clear_row.addStretch(1)
 
         clear_hint = QLabel("0 = never auto-clear")
         clear_hint.setObjectName("subLabel")
+
+        self._save_config_timer = QTimer(self)
+        self._save_config_timer.setSingleShot(True)
+        self._save_config_timer.timeout.connect(self._save_config)
+        self.clear_after_spin.valueChanged.connect(self._schedule_save_config)
 
         self.settings_widget = QWidget()
         settings_layout = QVBoxLayout()
@@ -331,6 +341,42 @@ class AIRaceEngineer(QWidget):
 
         if self.rejoin_label is not None:
             # Intentionally blank/hidden until the first PIT recommendation.
+            pass
+
+    def _load_config(self) -> dict:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _schedule_save_config(self, _val: int):
+        # Debounce disk writes while user is clicking.
+        self._save_config_timer.start(400)
+
+    def _save_config(self):
+        try:
+            data = dict(self._config)
+            data["clear_after_sec"] = int(self.clear_after_spin.value())
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, CONFIG_PATH)
+            self._config = data
+        except Exception:
+            pass
+
+    def _ensure_default_config_file(self):
+        # Create a config file on first run so racers can find/edit it.
+        if os.path.exists(CONFIG_PATH):
+            return
+        try:
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"clear_after_sec": 120}, f)
+            os.replace(tmp, CONFIG_PATH)
+        except Exception:
             pass
 
     def trigger_ai_request(self):
