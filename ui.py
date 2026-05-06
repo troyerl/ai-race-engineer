@@ -148,11 +148,26 @@ class AIRaceEngineer(QWidget):
         self._request_watchdog.setSingleShot(True)
         self._request_watchdog.timeout.connect(self._on_request_timeout)
 
+        # Throttle streaming UI updates (stream chunks can arrive very frequently).
+        self._partial_buffer = None
+        self._partial_flush_timer = QTimer(self)
+        self._partial_flush_timer.setSingleShot(True)
+        self._partial_flush_timer.timeout.connect(self._flush_partial)
+
+        # Clears the last shown advice after a period of inactivity.
+        self._idle_clear_timer = QTimer(self)
+        self._idle_clear_timer.setSingleShot(True)
+        self._idle_clear_timer.timeout.connect(self._clear_if_idle)
+
         self.telemetry_timer = QTimer(self)
         self.telemetry_timer.timeout.connect(self.telemetry.update_field_history)
-        self.telemetry_timer.start(100)
+        # 250ms is typically indistinguishable in-race, but cuts polling overhead.
+        self.telemetry_timer.start(250)
 
     def trigger_ai_request(self):
+        self._idle_clear_timer.stop()
+        self._partial_flush_timer.stop()
+        self._partial_buffer = None
         if not self.telemetry.ensure_connected():
             self.label.setText("ENGINEER: No Signal")
             return
@@ -173,6 +188,9 @@ class AIRaceEngineer(QWidget):
 
     def clear_and_cancel(self):
         self._request_watchdog.stop()
+        self._idle_clear_timer.stop()
+        self._partial_flush_timer.stop()
+        self._partial_buffer = None
         cancelled_id = self.ai_worker.cancel_active()
         self._active_request_id = 0
         self.label.setText("Engineer Standby")
@@ -183,9 +201,10 @@ class AIRaceEngineer(QWidget):
     def display_partial(self, request_id: int, text: str):
         if request_id != self._active_request_id:
             return
-        self.label.setText(text)
-        self.layout.activate()
-        self.adjustSize()
+        # Buffer and coalesce updates to avoid UI churn.
+        self._partial_buffer = text
+        if not self._partial_flush_timer.isActive():
+            self._partial_flush_timer.start(80)
 
     def _on_request_timeout(self):
         if self._active_request_id:
@@ -198,10 +217,29 @@ class AIRaceEngineer(QWidget):
         if request_id != self._active_request_id:
             return
         self._request_watchdog.stop()
+        self._partial_flush_timer.stop()
+        self._partial_buffer = None
         self.label.setText(text)
         self.btn.setEnabled(True)
         self.layout.activate()
         self.adjustSize()
+        # Mark request complete and schedule auto-clear if no further interaction.
+        self._active_request_id = 0
+        self._idle_clear_timer.start(120000)
+
+    def _flush_partial(self):
+        if self._active_request_id == 0 or self._partial_buffer is None:
+            return
+        self.label.setText(self._partial_buffer)
+        self.layout.activate()
+        self.adjustSize()
+
+    def _clear_if_idle(self):
+        # Only clear if we are not currently waiting on a request.
+        if self._active_request_id == 0 and self.btn.isEnabled():
+            self.label.setText("Engineer Standby")
+            self.layout.activate()
+            self.adjustSize()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
