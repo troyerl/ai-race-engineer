@@ -11,6 +11,16 @@ DEFAULT_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
 class BedrockWorker(QObject):
+    """
+    Runs Bedrock calls off the UI thread and streams partial output.
+
+    Design notes:
+    - Uses a request_id so the UI can ignore late results from cancelled/timeouts.
+    - "Cancel" is cooperative: we can't reliably abort an in-flight HTTPS request,
+      but we stop emitting updates and the UI immediately resets.
+    - Reuses the boto3 Bedrock client to reduce per-click overhead.
+    """
+
     partial = Signal(int, str)
     finished = Signal(int, str)
 
@@ -32,6 +42,7 @@ class BedrockWorker(QObject):
         with self._lock:
             req_id = self._active_request_id
             if req_id:
+                # Mark cancelled so streaming loop stops emitting updates.
                 self._cancelled_request_ids.add(req_id)
                 self._active_request_id = 0
             return req_id
@@ -43,6 +54,7 @@ class BedrockWorker(QObject):
     def _get_client(self):
         with self._lock:
             if self._client is None:
+                # Explicit timeouts prevent "wait forever" if the network/service stalls.
                 self._client = boto3.client(
                     "bedrock-runtime",
                     region_name=self._region_name,
@@ -115,6 +127,8 @@ class BedrockWorker(QObject):
                         except Exception:
                             continue
 
+                        # Bedrock/Anthropic streaming sends many event types; we only
+                        # extract incremental text deltas to build the user-visible advice.
                         text = None
                         if isinstance(payload, dict):
                             delta = payload.get("delta")
