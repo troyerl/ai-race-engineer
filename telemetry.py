@@ -597,6 +597,10 @@ class TelemetryTracker:
                 "fg": int(flags) if flags is not None else None,
                 "fs": flag_state(flags),
                 "pr": on_pit_road,
+                "ps": bool(self._ir_get("PlayerCarInPitStall", False)),
+                # Repairs are only exposed while in the stall (per SDK docs); keep in the packet anyway.
+                "rr": self._ir_get("PitRepairLeft", None),
+                "or": self._ir_get("PitOptRepairLeft", None),
                 "sl": stint_laps,
                 "ga": gap_ahead_s,
                 "gb": gap_behind_s,

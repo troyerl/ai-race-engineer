@@ -14,6 +14,50 @@ DEFAULT_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 STREAM_MAX_SECONDS = 50
 
 
+def _estimate_tokens_chars(text: str) -> int:
+    """Rough tokenizer-free estimate (~4 chars/token for English)."""
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def _accum_usage_from_stream_payload(payload: dict, acc: dict) -> None:
+    """
+    Merge Anthropic/Bedrock streaming usage fields into acc (input_tokens / output_tokens).
+    Values are cumulative maxima across chunks when the API reports running totals.
+    """
+    u = payload.get("usage")
+    if isinstance(u, dict):
+        it = u.get("input_tokens")
+        ot = u.get("output_tokens")
+        if isinstance(it, (int, float)):
+            acc["input_tokens"] = max(acc["input_tokens"], int(it))
+        if isinstance(ot, (int, float)):
+            acc["output_tokens"] = max(acc["output_tokens"], int(ot))
+
+    ut = str(payload.get("type") or "").lower()
+    if ut == "message_start":
+        msg = payload.get("message")
+        if isinstance(msg, dict):
+            mu = msg.get("usage")
+            if isinstance(mu, dict):
+                it = mu.get("input_tokens")
+                ot = mu.get("output_tokens")
+                if isinstance(it, (int, float)):
+                    acc["input_tokens"] = max(acc["input_tokens"], int(it))
+                if isinstance(ot, (int, float)):
+                    acc["output_tokens"] = max(acc["output_tokens"], int(ot))
+
+    meta = payload.get("amazon-bedrock-invocationMetrics")
+    if isinstance(meta, dict):
+        it = meta.get("inputTokenCount")
+        ot = meta.get("outputTokenCount")
+        if isinstance(it, (int, float)):
+            acc["input_tokens"] = max(acc["input_tokens"], int(it))
+        if isinstance(ot, (int, float)):
+            acc["output_tokens"] = max(acc["output_tokens"], int(ot))
+
+
 def _build_engineer_prompt(mode: str, race_json: str) -> str:
     schema = (
         "Data is compact JSON: "
@@ -22,7 +66,7 @@ def _build_engineer_prompt(mode: str, race_json: str) -> str:
         "m{l=lap,lr=laps_remain,p=pos,fu=fuel_USgal_remaining,fph=fuel_burn_lb_per_hr_SDK_scaled,"
         "fpe=fuel_USgal_per_lap_ema_if_present,fpl=fuel_USgal_per_lap_est,fcq=fuel_est_quality_hi|med|low,"
         "fl=fuel_laps_left_est,mk=can_make,ls=laps_short,lp=last_pit_lap,t=lap_times_s,pc=pace_s,fg=flags,fs=flag_state,"
-        "pr=on_pit_road,sl=stint_laps,ga=gap_ahead_s,gb=gap_behind_s,bl=best_lap_s,fo=falloff_s,"
+        "pr=on_pit_road,ps=in_pit_stall,rr=req_repair_s_left,or=opt_repair_s_left,sl=stint_laps,ga=gap_ahead_s,gb=gap_behind_s,bl=best_lap_s,fo=falloff_s,"
         "pb=pit_payback_laps,pw=pit_window_open,pwu=laps_until_window,tw,tws,twsl,twr}; "
         "r{pl=pit_loss_sec,ts=tire_sets_avail,fc=fuel_tank_USgal_capacity,ftl=laps_per_full_tank_fuel_est}; "
         "rv=rivals; f=field. "
@@ -49,8 +93,8 @@ def _build_engineer_prompt(mode: str, race_json: str) -> str:
             + "Line2: TIRES: <every M laps or align with fuel; use r.ts> "
             + "Line3: STOPS: <~K stops> "
             + "Line4: NOTE: <one caveat, <=10 words> "
-            + "Line5: TAGS: [strategy|fuel|tires] [H|M|L] "
-            + "Keep lines short (labels FUEL/TIRES/STOPS/NOTE/TAGS exactly); <=40 words total. "
+            + "Line5: TRIGGER: FUEL|TIRES|REPAIR  CONF: H|M|L "
+            + "Keep lines short (labels FUEL/TIRES/STOPS/NOTE/TRIGGER exactly); <=40 words total. "
             f"{race_json}"
         )
 
@@ -60,6 +104,7 @@ def _build_engineer_prompt(mode: str, race_json: str) -> str:
         + "Fuel: x.u=us — m.fph lb/hr (from SDK kg/h), m.fpl/m.fpe US gal/lap (liters converted + lap EMA); "
         + "m.fcq hi|med|low. Never cite absurd fuel laps vs m.lr "
         + "(e.g. fl many multiples of lr) unless fcq=hi and pr=false — when fcq low or m.pr true, treat fuel range as uncertain. "
+        + "Repairs: if m.rr > 0 and m.ps true, you are stuck until it hits 0 — treat as mandatory service. "
         + "Use m.fs (GREEN/CAUTION/UNKNOWN) not m.fg. "
         + "If flag_state is CAUTION: default to STAY OUT unless fuel requires a stop or pitting gains clear track position. "
         + "If flag_state is GREEN or UNKNOWN: do NOT recommend pitting unless we are inside the pit window or fuel requires it. "
@@ -72,7 +117,7 @@ def _build_engineer_prompt(mode: str, race_json: str) -> str:
         + "  SERVICE: FUEL ONLY | 2 TIRES | 4 TIRES (PIT/PIT NOW only; STAY OUT = NONE). "
         + "Line2: WHY: <plain English only — max ~14 words; short phrases separated by semicolons OK; "
         + "no JSON keys, no m./r. codes, no engineer shorthand>. "
-        + "Line3: TAGS: [fuel|tires|track|flags] [H|M|L] "
+        + "Line3: TRIGGER: FUEL|TIRES|TRACK|FLAGS|REPAIR  CONF: H|M|L "
         + "Do not put WHY text on line1; keep line1 to call + timing + service only; <=34 words lines 1–2. "
         + f"{race_json}"
     )
@@ -91,6 +136,8 @@ class BedrockWorker(QObject):
 
     partial = Signal(int, str)
     finished = Signal(int, str)
+    # Reported when a request completes without cooperative cancel (includes AI Error text replies).
+    usage_report = Signal(int, int)
 
     def __init__(self, model_id: str = DEFAULT_MODEL_ID, region_name: str = "us-east-2"):
         super().__init__()
@@ -183,6 +230,7 @@ class BedrockWorker(QObject):
                 stream = response.get("body")
 
                 advice_parts = []
+                usage_acc = {"input_tokens": 0, "output_tokens": 0}
 
                 def is_cancelled() -> bool:
                     with self._lock:
@@ -214,6 +262,7 @@ class BedrockWorker(QObject):
                             continue
 
                         if isinstance(payload, dict):
+                            _accum_usage_from_stream_payload(payload, usage_acc)
                             etype = str(payload.get("type") or "").lower()
                             if etype == "message_stop":
                                 break
@@ -254,6 +303,14 @@ class BedrockWorker(QObject):
                         self._clear_cancelled(request_id)
                         return
 
+                inp_u = int(usage_acc["input_tokens"])
+                outp_u = int(usage_acc["output_tokens"])
+                if inp_u <= 0:
+                    inp_u = _estimate_tokens_chars(prompt)
+                if outp_u <= 0 and advice and not advice.startswith("AI Error:"):
+                    outp_u = _estimate_tokens_chars(advice)
+
+                self.usage_report.emit(inp_u, outp_u)
                 self.finished.emit(request_id, advice)
                 self._clear_cancelled(request_id)
             except Exception as e:

@@ -31,9 +31,40 @@ FEATURE_VOICE_ENV = "AIRACE_FEATURE_VOICE"
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ai_race_engineer.json")
 
+# AWS does not expose “remaining free tier tokens” in the API — this is your own spending cap for the counter UI.
+DEFAULT_BEDROCK_TOKEN_BUDGET = 500_000
+
 BTN_LIVE = "ANALYZE FIELD & ADVISE"
 BTN_STRATEGY = "GET RACE STRATEGY"
 BTN_DISCONNECTED = "ANALYZE FIELD & ADVISE"
+
+
+def _migrate_token_counts(c: dict) -> None:
+    """Legacy configs only had combined totals; split into prior (you set) + runtime (this app)."""
+    if "bedrock_tokens_runtime_input" not in c:
+        c["bedrock_tokens_runtime_input"] = int(c.get("bedrock_tokens_input_total", 0) or 0)
+        c["bedrock_tokens_runtime_output"] = int(c.get("bedrock_tokens_output_total", 0) or 0)
+    c.setdefault("bedrock_tokens_prior_input", 0)
+    c.setdefault("bedrock_tokens_prior_output", 0)
+
+
+def _sync_legacy_total_keys(data: dict) -> None:
+    """Keep bedrock_tokens_*_total as prior+runtime so older tooling still reads one number."""
+    pi = int(data.get("bedrock_tokens_prior_input", 0) or 0)
+    po = int(data.get("bedrock_tokens_prior_output", 0) or 0)
+    ri = int(data.get("bedrock_tokens_runtime_input", 0) or 0)
+    ro = int(data.get("bedrock_tokens_runtime_output", 0) or 0)
+    data["bedrock_tokens_input_total"] = pi + ri
+    data["bedrock_tokens_output_total"] = po + ro
+
+
+def _merge_config_defaults(cfg: dict) -> dict:
+    c = dict(cfg) if isinstance(cfg, dict) else {}
+    c.setdefault("clear_after_sec", 120)
+    c.setdefault("bedrock_token_budget", DEFAULT_BEDROCK_TOKEN_BUDGET)
+    c.setdefault("voice_read_why", False)
+    _migrate_token_counts(c)
+    return c
 
 
 def _first_nonempty_line(text: str) -> str:
@@ -54,7 +85,7 @@ class AIRaceEngineer(QWidget):
         self._pit_user_modified = False
         self._last_sdk_connected = None
         self._ensure_default_config_file()
-        self._config = self._load_config()
+        self._config = _merge_config_defaults(self._load_config())
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -197,6 +228,15 @@ class AIRaceEngineer(QWidget):
         top_row.addWidget(self.ai_badge)
         top_row.addStretch(1)
 
+        self.token_label = QLabel("")
+        self.token_label.setObjectName("subLabel")
+        self.token_label.setWordWrap(True)
+        self.token_label.setToolTip(
+            "Total = prior usage (you set in Settings) + tokens counted by this app since install. "
+            "Per-request counts come from Bedrock when present, else estimated. "
+            "Budget is your own cap — AWS does not publish remaining free-tier tokens here."
+        )
+
         self.rejoin_label = None
         if self._feature_rejoin:
             self.rejoin_label = QLabel("Pit-road impact: …")
@@ -277,10 +317,88 @@ class AIRaceEngineer(QWidget):
         clear_hint = QLabel("0 = never auto-clear")
         clear_hint.setObjectName("subLabel")
 
+        voice_row = QHBoxLayout()
+        voice_row.setContentsMargins(0, 0, 0, 0)
+        voice_label = QLabel("Voice reads WHY")
+        voice_label.setObjectName("subLabel")
+        self.voice_why_toggle = QToolButton()
+        self.voice_why_toggle.setObjectName("settingsBtn")
+        self.voice_why_toggle.setText("OFF")
+        self.voice_why_toggle.setCheckable(True)
+        self.voice_why_toggle.setChecked(bool(self._config.get("voice_read_why", False)))
+        self.voice_why_toggle.toggled.connect(lambda v: self.voice_why_toggle.setText("ON" if v else "OFF"))
+        self.voice_why_toggle.setText("ON" if self.voice_why_toggle.isChecked() else "OFF")
+        voice_row.addWidget(voice_label)
+        voice_row.addWidget(self.voice_why_toggle)
+        voice_row.addStretch(1)
+
+        voice_hint = QLabel("If enabled, speaks the WHY line after the call (requires voice feature flag).")
+        voice_hint.setObjectName("subLabel")
+        voice_hint.setWordWrap(True)
+
+        budget_row = QHBoxLayout()
+        budget_row.setContentsMargins(0, 0, 0, 0)
+        budget_label = QLabel("Bedrock token budget")
+        budget_label.setObjectName("subLabel")
+        self.token_budget_spin = QSpinBox()
+        self.token_budget_spin.setObjectName("pitSpin")
+        self.token_budget_spin.setMinimum(1_000)
+        self.token_budget_spin.setMaximum(99_999_999)
+        self.token_budget_spin.setSingleStep(10_000)
+        self.token_budget_spin.setValue(int(self._config.get("bedrock_token_budget", DEFAULT_BEDROCK_TOKEN_BUDGET)))
+        budget_row.addWidget(budget_label)
+        budget_row.addWidget(self.token_budget_spin)
+        budget_row.addStretch(1)
+
+        budget_hint = QLabel(
+            "Budget is yours to set (not read from AWS). Totals persist across sessions in the JSON file."
+        )
+        budget_hint.setObjectName("subLabel")
+        budget_hint.setWordWrap(True)
+
+        prior_in_row = QHBoxLayout()
+        prior_in_row.setContentsMargins(0, 0, 0, 0)
+        prior_in_label = QLabel("Prior Bedrock usage (input tokens)")
+        prior_in_label.setObjectName("subLabel")
+        self.prior_input_spin = QSpinBox()
+        self.prior_input_spin.setObjectName("pitSpin")
+        self.prior_input_spin.setMinimum(0)
+        self.prior_input_spin.setMaximum(2_147_483_647)
+        self.prior_input_spin.setSingleStep(10_000)
+        self.prior_input_spin.setValue(int(self._config.get("bedrock_tokens_prior_input", 0)))
+        prior_in_row.addWidget(prior_in_label)
+        prior_in_row.addWidget(self.prior_input_spin)
+        prior_in_row.addStretch(1)
+
+        prior_out_row = QHBoxLayout()
+        prior_out_row.setContentsMargins(0, 0, 0, 0)
+        prior_out_label = QLabel("Prior Bedrock usage (output tokens)")
+        prior_out_label.setObjectName("subLabel")
+        self.prior_output_spin = QSpinBox()
+        self.prior_output_spin.setObjectName("pitSpin")
+        self.prior_output_spin.setMinimum(0)
+        self.prior_output_spin.setMaximum(2_147_483_647)
+        self.prior_output_spin.setSingleStep(10_000)
+        self.prior_output_spin.setValue(int(self._config.get("bedrock_tokens_prior_output", 0)))
+        prior_out_row.addWidget(prior_out_label)
+        prior_out_row.addWidget(self.prior_output_spin)
+        prior_out_row.addStretch(1)
+
+        prior_hint = QLabel(
+            "Use this for tokens you already burned (e.g. from AWS billing) before this overlay started counting. "
+            "Shown total = prior + tracked-in-session."
+        )
+        prior_hint.setObjectName("subLabel")
+        prior_hint.setWordWrap(True)
+
         self._save_config_timer = QTimer(self)
         self._save_config_timer.setSingleShot(True)
         self._save_config_timer.timeout.connect(self._save_config)
         self.clear_after_spin.valueChanged.connect(self._schedule_save_config)
+        self.token_budget_spin.valueChanged.connect(self._schedule_save_config)
+        self.prior_input_spin.valueChanged.connect(self._schedule_save_config)
+        self.prior_output_spin.valueChanged.connect(self._schedule_save_config)
+        self.voice_why_toggle.toggled.connect(lambda _v: self._schedule_save_config(0))
 
         self.settings_widget = QWidget()
         settings_layout = QVBoxLayout()
@@ -291,6 +409,13 @@ class AIRaceEngineer(QWidget):
         settings_layout.addLayout(pit_defaults_row)
         settings_layout.addLayout(clear_row)
         settings_layout.addWidget(clear_hint)
+        settings_layout.addLayout(voice_row)
+        settings_layout.addWidget(voice_hint)
+        settings_layout.addLayout(budget_row)
+        settings_layout.addWidget(budget_hint)
+        settings_layout.addLayout(prior_in_row)
+        settings_layout.addLayout(prior_out_row)
+        settings_layout.addWidget(prior_hint)
         self.settings_widget.setLayout(settings_layout)
         self.settings_widget.setVisible(False)
 
@@ -318,6 +443,7 @@ class AIRaceEngineer(QWidget):
         bottom_row.addWidget(self.close_btn)
 
         self.layout.addLayout(top_row)
+        self.layout.addWidget(self.token_label)
         if self.rejoin_label is not None:
             self.layout.addWidget(self.rejoin_label)
         self.layout.addWidget(self.label)
@@ -331,6 +457,7 @@ class AIRaceEngineer(QWidget):
         self.ai_worker = BedrockWorker()
         self.ai_worker.partial.connect(self.display_partial)
         self.ai_worker.finished.connect(self.display_advice)
+        self.ai_worker.usage_report.connect(self._on_bedrock_usage_report)
 
         self._next_request_id = 0
         self._active_request_id = 0
@@ -362,6 +489,7 @@ class AIRaceEngineer(QWidget):
         self._update_connection_badge()
         self._update_action_button_text()
         self._set_ai_status("Idle")
+        self._refresh_token_budget_label()
 
         if self.rejoin_label is not None:
             # Intentionally blank/hidden until the first PIT recommendation.
@@ -379,15 +507,46 @@ class AIRaceEngineer(QWidget):
         # Debounce disk writes while user is clicking.
         self._save_config_timer.start(400)
 
+    def _refresh_token_budget_label(self):
+        pi = int(self.prior_input_spin.value())
+        po = int(self.prior_output_spin.value())
+        ri = int(self._config.get("bedrock_tokens_runtime_input", 0))
+        ro = int(self._config.get("bedrock_tokens_runtime_output", 0))
+        bi = pi + ri
+        bo = po + ro
+        total_used = bi + bo
+        budget = int(self.token_budget_spin.value())
+        if total_used <= budget:
+            remaining = budget - total_used
+            tail = f"{remaining:,} left"
+        else:
+            tail = f"{total_used - budget:,} over budget"
+        self.token_label.setText(
+            f"Bedrock tokens: {total_used:,} / {budget:,} · {tail} · in {bi:,} · out {bo:,} · tracked {ri + ro:,}"
+        )
+
+    def _on_bedrock_usage_report(self, inp: int, outp: int):
+        inp = max(0, int(inp))
+        outp = max(0, int(outp))
+        self._config["bedrock_tokens_runtime_input"] = int(self._config.get("bedrock_tokens_runtime_input", 0)) + inp
+        self._config["bedrock_tokens_runtime_output"] = int(self._config.get("bedrock_tokens_runtime_output", 0)) + outp
+        self._save_config()
+
     def _save_config(self):
         try:
             data = dict(self._config)
             data["clear_after_sec"] = int(self.clear_after_spin.value())
+            data["bedrock_token_budget"] = int(self.token_budget_spin.value())
+            data["bedrock_tokens_prior_input"] = int(self.prior_input_spin.value())
+            data["bedrock_tokens_prior_output"] = int(self.prior_output_spin.value())
+            data["voice_read_why"] = bool(self.voice_why_toggle.isChecked())
+            _sync_legacy_total_keys(data)
             tmp = CONFIG_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f)
             os.replace(tmp, CONFIG_PATH)
             self._config = data
+            self._refresh_token_budget_label()
         except Exception:
             pass
 
@@ -398,7 +557,19 @@ class AIRaceEngineer(QWidget):
         try:
             tmp = CONFIG_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"clear_after_sec": 120}, f)
+                json.dump(
+                    {
+                        "clear_after_sec": 120,
+                        "bedrock_token_budget": DEFAULT_BEDROCK_TOKEN_BUDGET,
+                        "bedrock_tokens_prior_input": 0,
+                        "bedrock_tokens_prior_output": 0,
+                        "bedrock_tokens_runtime_input": 0,
+                        "bedrock_tokens_runtime_output": 0,
+                        "bedrock_tokens_input_total": 0,
+                        "bedrock_tokens_output_total": 0,
+                    },
+                    f,
+                )
             os.replace(tmp, CONFIG_PATH)
         except Exception:
             pass
@@ -484,9 +655,27 @@ class AIRaceEngineer(QWidget):
         if self.rejoin_label is not None:
             self._update_pit_impact_from_advice(str(text))
         if self._feature_voice and not str(text).startswith("AI Error"):
-            head = _first_nonempty_line(str(text))
+            full = str(text)
+            head = _first_nonempty_line(full)
             action = head.split("—", 1)[0].strip() if head else ""
             threading.Thread(target=self._speak_action, args=(action,), daemon=True).start()
+            if self.voice_why_toggle.isChecked():
+                why = ""
+                for line in full.replace("\r\n", "\n").split("\n"):
+                    s = line.strip()
+                    if s.upper().startswith("WHY:"):
+                        why = s[4:].strip()
+                        break
+                if why:
+                    def speak_why():
+                        try:
+                            import time as _t
+                            _t.sleep(0.25)
+                        except Exception:
+                            pass
+                        self._speak_action(why)
+
+                    threading.Thread(target=speak_why, daemon=True).start()
 
     def _flush_partial(self):
         if self._active_request_id == 0 or self._partial_buffer is None:
