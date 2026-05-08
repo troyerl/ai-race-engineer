@@ -32,7 +32,7 @@ FEATURE_VOICE_ENV = "AIRACE_FEATURE_VOICE"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ai_race_engineer.json")
 
 # Rough $ estimate for the usage counter (edit if your model/region pricing differs).
-BEDROCK_USD_PER_MILLION_INPUT = 1.0
+BEDROCK_USD_PER_MILLION_INPUT = 1.25
 BEDROCK_USD_PER_MILLION_OUTPUT = 5.0
 
 BTN_LIVE = "ANALYZE FIELD & ADVISE"
