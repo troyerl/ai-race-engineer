@@ -31,8 +31,9 @@ FEATURE_VOICE_ENV = "AIRACE_FEATURE_VOICE"
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ai_race_engineer.json")
 
-# AWS does not expose “remaining free tier tokens” in the API — this is your own spending cap for the counter UI.
-DEFAULT_BEDROCK_TOKEN_BUDGET = 500_000
+# Rough $ estimate for the usage counter (edit if your model/region pricing differs).
+BEDROCK_USD_PER_MILLION_INPUT = 1.0
+BEDROCK_USD_PER_MILLION_OUTPUT = 5.0
 
 BTN_LIVE = "ANALYZE FIELD & ADVISE"
 BTN_STRATEGY = "GET RACE STRATEGY"
@@ -61,10 +62,25 @@ def _sync_legacy_total_keys(data: dict) -> None:
 def _merge_config_defaults(cfg: dict) -> dict:
     c = dict(cfg) if isinstance(cfg, dict) else {}
     c.setdefault("clear_after_sec", 120)
-    c.setdefault("bedrock_token_budget", DEFAULT_BEDROCK_TOKEN_BUDGET)
     c.setdefault("voice_read_why", False)
+    c.setdefault("auto_apply_track_pit_loss", True)
     _migrate_token_counts(c)
     return c
+
+
+def _bedrock_estimated_charge_usd(input_tokens: int, output_tokens: int) -> float:
+    """User-facing estimate: $1 / 1M input, $5 / 1M output."""
+    return (max(0, int(input_tokens)) / 1_000_000.0) * BEDROCK_USD_PER_MILLION_INPUT + (
+        max(0, int(output_tokens)) / 1_000_000.0
+    ) * BEDROCK_USD_PER_MILLION_OUTPUT
+
+
+def _format_charge_usd(amount: float) -> str:
+    if amount <= 0:
+        return "$0.00"
+    if amount < 0.01:
+        return f"${amount:.4f}"
+    return f"${amount:.2f}"
 
 
 def _first_nonempty_line(text: str) -> str:
@@ -77,6 +93,27 @@ def _first_nonempty_line(text: str) -> str:
 
 
 class AIRaceEngineer(QWidget):
+    @staticmethod
+    def _settings_heading(text: str) -> QLabel:
+        lab = QLabel(text)
+        lab.setObjectName("settingsSectionTitle")
+        return lab
+
+    def _pill_toggle(self, checked: bool) -> QToolButton:
+        b = QToolButton()
+        b.setObjectName("toggleChip")
+        b.setCheckable(True)
+        b.setChecked(checked)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFixedHeight(28)
+
+        def _label(on: bool) -> None:
+            b.setText("ON" if on else "OFF")
+
+        _label(checked)
+        b.toggled.connect(_label)
+        return b
+
     def __init__(self):
         super().__init__()
         self.telemetry = TelemetryTracker()
@@ -209,6 +246,53 @@ class AIRaceEngineer(QWidget):
                 height: 18px;
                 image: url("assets/spin_down.svg");
             }
+            QWidget#settingsPanel {
+                background-color: rgb(22, 24, 32);
+                border: 1px solid rgba(255, 255, 255, 70);
+                border-radius: 12px;
+            }
+            QLabel#settingsSectionTitle {
+                color: rgba(190, 200, 215, 255);
+                font-size: 11px;
+                font-weight: 800;
+                background: transparent;
+                border: none;
+                padding: 6px 0 2px 0;
+                letter-spacing: 0.04em;
+            }
+            QLabel#settingsHint {
+                color: rgba(175, 185, 200, 230);
+                font-size: 11px;
+                font-weight: 600;
+                background: transparent;
+                border: none;
+                padding: 0 0 4px 0;
+            }
+            QToolButton#toggleChip {
+                background-color: rgba(55, 58, 70, 255);
+                color: rgba(255, 255, 255, 245);
+                font-weight: 800;
+                font-size: 12px;
+                border-radius: 14px;
+                padding: 6px 14px;
+                border: 1px solid rgba(255, 255, 255, 45);
+                min-width: 52px;
+                max-width: 52px;
+            }
+            QToolButton#toggleChip:hover {
+                background-color: rgba(65, 68, 82, 255);
+            }
+            QToolButton#toggleChip:checked {
+                background-color: rgba(31, 138, 76, 255);
+                border: 1px solid rgba(180, 255, 200, 70);
+            }
+            QToolButton#toggleChip:checked:hover {
+                background-color: rgba(35, 154, 85, 255);
+            }
+            QToolButton#toggleChip:disabled {
+                color: rgba(255, 255, 255, 120);
+                background-color: rgba(40, 42, 50, 200);
+            }
             """
         )
 
@@ -232,9 +316,9 @@ class AIRaceEngineer(QWidget):
         self.token_label.setObjectName("subLabel")
         self.token_label.setWordWrap(True)
         self.token_label.setToolTip(
-            "Total = prior usage (you set in Settings) + tokens counted by this app since install. "
-            "Per-request counts come from Bedrock when present, else estimated. "
-            "Budget is your own cap — AWS does not publish remaining free-tier tokens here."
+            "Input and output = prior (Settings) + counted since install. "
+            f"Cost estimate: ${BEDROCK_USD_PER_MILLION_INPUT:g} per 1M input, "
+            f"${BEDROCK_USD_PER_MILLION_OUTPUT:g} per 1M output (not official AWS billing)."
         )
 
         self.rejoin_label = None
@@ -278,87 +362,83 @@ class AIRaceEngineer(QWidget):
 
         pit_row = QHBoxLayout()
         pit_row.setContentsMargins(0, 0, 0, 0)
-        pit_label = QLabel("Pit-road loss (seconds)")
+        pit_label = QLabel("Pit-road loss")
         pit_label.setObjectName("subLabel")
         self.pit_spin = QSpinBox()
         self.pit_spin.setObjectName("pitSpin")
         self.pit_spin.setMinimum(0)
         self.pit_spin.setMaximum(300)
+        self.pit_spin.setSuffix(" s")
         self.pit_spin.setValue(8)
+        self.pit_spin.setToolTip("Seconds lost versus green-flag laps (entry + stop + exit).")
         self.pit_spin.valueChanged.connect(self._on_pit_spin_changed)
         pit_row.addWidget(pit_label)
         pit_row.addWidget(self.pit_spin)
         pit_row.addStretch(1)
 
-        pit_hint = QLabel("Pit-road loss ≈ entry + stop + exit vs green-flag laps")
-        pit_hint.setObjectName("subLabel")
+        auto_pit_row = QHBoxLayout()
+        auto_pit_row.setContentsMargins(0, 0, 0, 0)
+        auto_pit_label = QLabel("Auto pit loss on connect")
+        auto_pit_label.setObjectName("subLabel")
+        self.auto_track_pit_toggle = self._pill_toggle(bool(self._config.get("auto_apply_track_pit_loss", True)))
+        self.auto_track_pit_toggle.setToolTip(
+            "When on, applies a track-length-based default when iRacing connects (unless you changed pit loss)."
+        )
+        auto_pit_row.addWidget(auto_pit_label)
+        auto_pit_row.addStretch(1)
+        auto_pit_row.addWidget(self.auto_track_pit_toggle)
 
-        pit_defaults_row = QHBoxLayout()
-        pit_defaults_row.setContentsMargins(0, 0, 0, 0)
-        self.pit_defaults_btn = QPushButton("Use track-default pit-road loss")
+        self.pit_defaults_btn = QPushButton("Apply track default now")
         self.pit_defaults_btn.setObjectName("clearBtn")
         self.pit_defaults_btn.setCursor(Qt.PointingHandCursor)
+        self.pit_defaults_btn.setToolTip("Sets pit-road loss from track length immediately.")
         self.pit_defaults_btn.clicked.connect(self._apply_track_default_pit_loss)
-        pit_defaults_row.addWidget(self.pit_defaults_btn)
 
-        clear_row = QHBoxLayout()
-        clear_row.setContentsMargins(0, 0, 0, 0)
-        clear_label = QLabel("Clear advice after (seconds)")
-        clear_label.setObjectName("subLabel")
+        clear_sec_init = int(self._config.get("clear_after_sec", 120))
+        clear_on = clear_sec_init > 0
+        auto_clear_row = QHBoxLayout()
+        auto_clear_row.setContentsMargins(0, 0, 0, 0)
+        auto_clear_label = QLabel("Auto-clear advice")
+        auto_clear_label.setObjectName("subLabel")
+        self.auto_clear_toggle = self._pill_toggle(clear_on)
         self.clear_after_spin = QSpinBox()
         self.clear_after_spin.setObjectName("pitSpin")
-        self.clear_after_spin.setMinimum(0)
+        self.clear_after_spin.setMinimum(10)
         self.clear_after_spin.setMaximum(600)
-        self.clear_after_spin.setValue(int(self._config.get("clear_after_sec", 120)))
-        clear_row.addWidget(clear_label)
-        clear_row.addWidget(self.clear_after_spin)
-        clear_row.addStretch(1)
+        self.clear_after_spin.setSuffix(" s")
+        self.clear_after_spin.setValue(max(10, min(600, clear_sec_init)) if clear_on else 120)
+        self.clear_after_spin.setVisible(clear_on)
+        self.clear_after_spin.setEnabled(clear_on)
+        self.clear_after_spin.setToolTip("How long to show the last call before the overlay clears.")
+        auto_clear_row.addWidget(auto_clear_label)
+        auto_clear_row.addStretch(1)
+        auto_clear_row.addWidget(self.clear_after_spin)
+        auto_clear_row.addWidget(self.auto_clear_toggle)
 
-        clear_hint = QLabel("0 = never auto-clear")
-        clear_hint.setObjectName("subLabel")
+        clear_hint = QLabel("Off = message stays until you clear or request again.")
+        clear_hint.setObjectName("settingsHint")
+        clear_hint.setWordWrap(True)
 
         voice_row = QHBoxLayout()
         voice_row.setContentsMargins(0, 0, 0, 0)
-        voice_label = QLabel("Voice reads WHY")
+        voice_label = QLabel("Speak WHY after call")
         voice_label.setObjectName("subLabel")
-        self.voice_why_toggle = QToolButton()
-        self.voice_why_toggle.setObjectName("settingsBtn")
-        self.voice_why_toggle.setText("OFF")
-        self.voice_why_toggle.setCheckable(True)
-        self.voice_why_toggle.setChecked(bool(self._config.get("voice_read_why", False)))
-        self.voice_why_toggle.toggled.connect(lambda v: self.voice_why_toggle.setText("ON" if v else "OFF"))
-        self.voice_why_toggle.setText("ON" if self.voice_why_toggle.isChecked() else "OFF")
+        self.voice_why_toggle = self._pill_toggle(bool(self._config.get("voice_read_why", False)))
+        self.voice_why_toggle.setToolTip("After the action line, reads the WHY line aloud (if voice is enabled).")
+        if not self._feature_voice:
+            self.voice_why_toggle.setEnabled(False)
+            self.voice_why_toggle.setToolTip("Set AIRACE_FEATURE_VOICE=1 to enable speech.")
         voice_row.addWidget(voice_label)
-        voice_row.addWidget(self.voice_why_toggle)
         voice_row.addStretch(1)
+        voice_row.addWidget(self.voice_why_toggle)
 
-        voice_hint = QLabel("If enabled, speaks the WHY line after the call (requires voice feature flag).")
-        voice_hint.setObjectName("subLabel")
+        voice_hint = QLabel("Voice uses macOS `say`, Windows SAPI, or `espeak` on Linux when the feature flag is on.")
+        voice_hint.setObjectName("settingsHint")
         voice_hint.setWordWrap(True)
-
-        budget_row = QHBoxLayout()
-        budget_row.setContentsMargins(0, 0, 0, 0)
-        budget_label = QLabel("Bedrock token budget")
-        budget_label.setObjectName("subLabel")
-        self.token_budget_spin = QSpinBox()
-        self.token_budget_spin.setObjectName("pitSpin")
-        self.token_budget_spin.setMinimum(1_000)
-        self.token_budget_spin.setMaximum(99_999_999)
-        self.token_budget_spin.setSingleStep(10_000)
-        self.token_budget_spin.setValue(int(self._config.get("bedrock_token_budget", DEFAULT_BEDROCK_TOKEN_BUDGET)))
-        budget_row.addWidget(budget_label)
-        budget_row.addWidget(self.token_budget_spin)
-        budget_row.addStretch(1)
-
-        budget_hint = QLabel(
-            "Budget is yours to set (not read from AWS). Totals persist across sessions in the JSON file."
-        )
-        budget_hint.setObjectName("subLabel")
-        budget_hint.setWordWrap(True)
 
         prior_in_row = QHBoxLayout()
         prior_in_row.setContentsMargins(0, 0, 0, 0)
-        prior_in_label = QLabel("Prior Bedrock usage (input tokens)")
+        prior_in_label = QLabel("Prior usage · in")
         prior_in_label.setObjectName("subLabel")
         self.prior_input_spin = QSpinBox()
         self.prior_input_spin.setObjectName("pitSpin")
@@ -372,7 +452,7 @@ class AIRaceEngineer(QWidget):
 
         prior_out_row = QHBoxLayout()
         prior_out_row.setContentsMargins(0, 0, 0, 0)
-        prior_out_label = QLabel("Prior Bedrock usage (output tokens)")
+        prior_out_label = QLabel("Prior usage · out")
         prior_out_label.setObjectName("subLabel")
         self.prior_output_spin = QSpinBox()
         self.prior_output_spin.setObjectName("pitSpin")
@@ -385,34 +465,38 @@ class AIRaceEngineer(QWidget):
         prior_out_row.addStretch(1)
 
         prior_hint = QLabel(
-            "Use this for tokens you already burned (e.g. from AWS billing) before this overlay started counting. "
-            "Shown total = prior + tracked-in-session."
+            f"Adds Bedrock tokens you used before this app. Cost line: ${BEDROCK_USD_PER_MILLION_INPUT:g}/1M in, "
+            f"${BEDROCK_USD_PER_MILLION_OUTPUT:g}/1M out."
         )
-        prior_hint.setObjectName("subLabel")
+        prior_hint.setObjectName("settingsHint")
         prior_hint.setWordWrap(True)
 
         self._save_config_timer = QTimer(self)
         self._save_config_timer.setSingleShot(True)
         self._save_config_timer.timeout.connect(self._save_config)
         self.clear_after_spin.valueChanged.connect(self._schedule_save_config)
-        self.token_budget_spin.valueChanged.connect(self._schedule_save_config)
         self.prior_input_spin.valueChanged.connect(self._schedule_save_config)
         self.prior_output_spin.valueChanged.connect(self._schedule_save_config)
         self.voice_why_toggle.toggled.connect(lambda _v: self._schedule_save_config(0))
+        self.auto_track_pit_toggle.toggled.connect(lambda _v: self._schedule_save_config(0))
+        self.auto_clear_toggle.toggled.connect(self._on_auto_clear_toggled)
 
         self.settings_widget = QWidget()
+        self.settings_widget.setObjectName("settingsPanel")
         settings_layout = QVBoxLayout()
-        settings_layout.setContentsMargins(0, 0, 0, 0)
-        settings_layout.setSpacing(6)
+        settings_layout.setContentsMargins(12, 10, 12, 12)
+        settings_layout.setSpacing(8)
+        settings_layout.addWidget(self._settings_heading("RACE · Pit"))
         settings_layout.addLayout(pit_row)
-        settings_layout.addWidget(pit_hint)
-        settings_layout.addLayout(pit_defaults_row)
-        settings_layout.addLayout(clear_row)
+        settings_layout.addLayout(auto_pit_row)
+        settings_layout.addWidget(self.pit_defaults_btn)
+        settings_layout.addWidget(self._settings_heading("ADVICE"))
+        settings_layout.addLayout(auto_clear_row)
         settings_layout.addWidget(clear_hint)
+        settings_layout.addWidget(self._settings_heading("VOICE"))
         settings_layout.addLayout(voice_row)
         settings_layout.addWidget(voice_hint)
-        settings_layout.addLayout(budget_row)
-        settings_layout.addWidget(budget_hint)
+        settings_layout.addWidget(self._settings_heading("USAGE · Prior tokens"))
         settings_layout.addLayout(prior_in_row)
         settings_layout.addLayout(prior_out_row)
         settings_layout.addWidget(prior_hint)
@@ -489,7 +573,7 @@ class AIRaceEngineer(QWidget):
         self._update_connection_badge()
         self._update_action_button_text()
         self._set_ai_status("Idle")
-        self._refresh_token_budget_label()
+        self._refresh_bedrock_usage_label()
 
         if self.rejoin_label is not None:
             # Intentionally blank/hidden until the first PIT recommendation.
@@ -507,22 +591,23 @@ class AIRaceEngineer(QWidget):
         # Debounce disk writes while user is clicking.
         self._save_config_timer.start(400)
 
-    def _refresh_token_budget_label(self):
+    def _on_auto_clear_toggled(self, on: bool):
+        self.clear_after_spin.setVisible(on)
+        self.clear_after_spin.setEnabled(on)
+        if on and self.clear_after_spin.value() < 10:
+            self.clear_after_spin.blockSignals(True)
+            self.clear_after_spin.setValue(120)
+            self.clear_after_spin.blockSignals(False)
+        self._schedule_save_config(0)
+
+    def _refresh_bedrock_usage_label(self):
         pi = int(self.prior_input_spin.value())
         po = int(self.prior_output_spin.value())
-        ri = int(self._config.get("bedrock_tokens_runtime_input", 0))
-        ro = int(self._config.get("bedrock_tokens_runtime_output", 0))
-        bi = pi + ri
-        bo = po + ro
-        total_used = bi + bo
-        budget = int(self.token_budget_spin.value())
-        if total_used <= budget:
-            remaining = budget - total_used
-            tail = f"{remaining:,} left"
-        else:
-            tail = f"{total_used - budget:,} over budget"
+        bi = pi + int(self._config.get("bedrock_tokens_runtime_input", 0))
+        bo = po + int(self._config.get("bedrock_tokens_runtime_output", 0))
+        charge = _bedrock_estimated_charge_usd(bi, bo)
         self.token_label.setText(
-            f"Bedrock tokens: {total_used:,} / {budget:,} · {tail} · in {bi:,} · out {bo:,} · tracked {ri + ro:,}"
+            f"Bedrock: {bi:,} in · {bo:,} out · est. {_format_charge_usd(charge)} total"
         )
 
     def _on_bedrock_usage_report(self, inp: int, outp: int):
@@ -535,8 +620,10 @@ class AIRaceEngineer(QWidget):
     def _save_config(self):
         try:
             data = dict(self._config)
-            data["clear_after_sec"] = int(self.clear_after_spin.value())
-            data["bedrock_token_budget"] = int(self.token_budget_spin.value())
+            data["clear_after_sec"] = (
+                int(self.clear_after_spin.value()) if self.auto_clear_toggle.isChecked() else 0
+            )
+            data["auto_apply_track_pit_loss"] = bool(self.auto_track_pit_toggle.isChecked())
             data["bedrock_tokens_prior_input"] = int(self.prior_input_spin.value())
             data["bedrock_tokens_prior_output"] = int(self.prior_output_spin.value())
             data["voice_read_why"] = bool(self.voice_why_toggle.isChecked())
@@ -546,7 +633,7 @@ class AIRaceEngineer(QWidget):
                 json.dump(data, f)
             os.replace(tmp, CONFIG_PATH)
             self._config = data
-            self._refresh_token_budget_label()
+            self._refresh_bedrock_usage_label()
         except Exception:
             pass
 
@@ -560,7 +647,8 @@ class AIRaceEngineer(QWidget):
                 json.dump(
                     {
                         "clear_after_sec": 120,
-                        "bedrock_token_budget": DEFAULT_BEDROCK_TOKEN_BUDGET,
+                        "auto_apply_track_pit_loss": True,
+                        "voice_read_why": False,
                         "bedrock_tokens_prior_input": 0,
                         "bedrock_tokens_prior_output": 0,
                         "bedrock_tokens_runtime_input": 0,
@@ -648,7 +736,9 @@ class AIRaceEngineer(QWidget):
         self.adjustSize()
         # Mark request complete and schedule auto-clear if no further interaction.
         self._active_request_id = 0
-        clear_ms = int(self.clear_after_spin.value()) * 1000
+        clear_ms = (
+            int(self.clear_after_spin.value()) * 1000 if self.auto_clear_toggle.isChecked() else 0
+        )
         if clear_ms > 0:
             self._idle_clear_timer.start(clear_ms)
         self._set_ai_status("Error" if str(text).startswith("AI Error") else "Done")
@@ -739,6 +829,8 @@ class AIRaceEngineer(QWidget):
 
     def _maybe_set_default_pit_loss(self):
         if self._pit_user_modified:
+            return
+        if not self.auto_track_pit_toggle.isChecked():
             return
 
         name = (self.telemetry.track_name() or "").lower()
