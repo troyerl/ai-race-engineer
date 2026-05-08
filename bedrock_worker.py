@@ -61,7 +61,8 @@ def _accum_usage_from_stream_payload(payload: dict, acc: dict) -> None:
 def _build_engineer_prompt(mode: str, race_json: str) -> str:
     schema = (
         "Data is compact JSON: "
-        "x{md=live|strategy,u=us_fuel_gal_and_lb_hr}; "
+        "x{md=live|strategy,u=us_fuel_gal_and_lb_hr,fe=fuel_OK_for_numeric_stint_math_0_or_1,"
+        "ll=laps_total_or_remain_trustworthy_0_or_1}; "
         "s{st=session_state,tr=time_remain_s_omit_if_placeholder,lt=laps_total,ot=is_on_track,ig=is_in_garage}; "
         "m{l=lap,lr=laps_remain,p=pos,fu=fuel_USgal_remaining,fph=fuel_burn_lb_per_hr_SDK_scaled,"
         "fpe=fuel_USgal_per_lap_ema_if_present,fpl=fuel_USgal_per_lap_est,fcq=fuel_est_quality_hi|med|low,"
@@ -84,14 +85,15 @@ def _build_engineer_prompt(mode: str, race_json: str) -> str:
         return (
             base
             + "CONTEXT: DRIVER IS OFF TRACK (garage/grid/prep). Build a PRE-RACE plan. "
-            + "Goal: approximate laps BETWEEN pit stops optimizing fuel tank (r.ftl, r.fc, m.fpl/m.fpe) "
-            + "and tire life using r.ts (available sets); mention when to take FUEL ONLY vs 2 vs 4 tires if helpful. "
-            + "Fuel fields are already US customary (gal, lb/hr); prefer m.fpe when present; respect m.fcq. "
-            + "Assume green-flag racing unless s says otherwise; note estimates are approximate. "
+            + "iRacing often omits s.lt / m.lr when unset (sentinel); x.ll=0 means neither is trustworthy — do NOT assume race lap "
+            + "count; use session length from iRacing UI if unsure. "
+            + "x.fe=0 means fuel-per-lap / laps-to-empty are NOT trustworthy (common in garage before on-track pace); do NOT quote "
+            + "numeric laps/tank or pit-every-N from fuel math — give tire-set-focused plan + say verify fuel on first flying laps. "
+            + "Never write numbers like thousands of laps per tank. "
             + "OUTPUT FORMAT — exactly 5 lines (one newline between each line; no blank lines): "
-            + "Line1: FUEL: <pit-every-N-laps style plan using r.ftl/m.fpl/s.lt> "
+            + "Line1: FUEL: <if x.fe=1 use r.ftl/m.fpl/s.lt; if x.fe=0 say VERIFY ON TRACK / align stops with tires or session clock> "
             + "Line2: TIRES: <every M laps or align with fuel; use r.ts> "
-            + "Line3: STOPS: <~K stops> "
+            + "Line3: STOPS: <~K stops; if x.ll=0 say TBD from session info> "
             + "Line4: NOTE: <one caveat, <=10 words> "
             + "Line5: TRIGGER: FUEL|TIRES|REPAIR  CONF: H|M|L "
             + "Keep lines short (labels FUEL/TIRES/STOPS/NOTE/TRIGGER exactly); <=40 words total. "
@@ -100,7 +102,7 @@ def _build_engineer_prompt(mode: str, race_json: str) -> str:
 
     return (
         base
-        + "Primary goal: Optimize track position vs fuel/tire life (live race). "
+        + "Respect x.fe: if 0, fuel stint numbers in JSON are unreliable—do not use them as truth. "
         + "Fuel: x.u=us — m.fph lb/hr (from SDK kg/h), m.fpl/m.fpe US gal/lap (liters converted + lap EMA); "
         + "m.fcq hi|med|low. Never cite absurd fuel laps vs m.lr "
         + "(e.g. fl many multiples of lr) unless fcq=hi and pr=false — when fcq low or m.pr true, treat fuel range as uncertain. "

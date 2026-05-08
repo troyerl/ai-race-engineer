@@ -26,6 +26,22 @@ def _liters_to_us_gal(x: float) -> float:
     return float(x) * _L_TO_US_GAL
 
 
+# iRacing uses large sentinels (commonly 32767) for unknown / unlimited lap counts.
+_IRACING_LAPS_UNKNOWN_MIN = 32000
+
+
+def _sanitize_lap_count(v: Any) -> int | None:
+    if v is None:
+        return None
+    try:
+        i = int(v)
+    except (TypeError, ValueError):
+        return None
+    if i < 0 or i >= _IRACING_LAPS_UNKNOWN_MIN:
+        return None
+    return i
+
+
 class TelemetryTracker:
     def __init__(self):
         self.ir = irsdk.IRSDK()
@@ -378,8 +394,10 @@ class TelemetryTracker:
 
         fuel_level = float(self._ir_get("FuelLevel", 0.0) or 0.0)
         fuel_use_per_hour_raw = float(self._ir_get("FuelUsePerHour", 0.0) or 0.0)
-        laps_remain = self._ir_get("SessionLapsRemain", None)
+        laps_remain = _sanitize_lap_count(self._ir_get("SessionLapsRemain", None))
+        laps_total = _sanitize_lap_count(self._ir_get("SessionLapsTotal", None))
         flags = self._ir_get("SessionFlags", 0)
+        is_on_track = bool(self._ir_get("IsOnTrack", False))
         fuel_capacity_raw = self._ir_get("FuelCapacity", None)
 
         def read_tire_wear_snapshot() -> dict[str, Any] | None:
@@ -546,8 +564,6 @@ class TelemetryTracker:
                 return [drop_nones(v) for v in x]
             return x
 
-        mode = self.ui_mode()
-
         # Approx laps a full fuel load covers (strategy planning).
         ftl = None
         try:
@@ -556,11 +572,26 @@ class TelemetryTracker:
                 ftl = round(float(fc) / float(fuel_use_per_lap_est), 1)
         except Exception:
             pass
+        if ftl is not None and (ftl > 320 or ftl < 0.8):
+            ftl = None
+
+        fpl_us = _liters_to_us_gal(fuel_use_per_lap_est)
+        fuel_est_ok = True
+        if fpl_us < 0.012 and fuel_calc_quality != "hi":
+            fuel_est_ok = False
+        if laps_of_fuel_left_est > 420:
+            fuel_est_ok = False
+        if not is_on_track and int(you_pace.get("n", 0) or 0) < 1 and fuel_calc_quality != "hi":
+            fuel_est_ok = False
+
+        lap_data_ok = laps_remain is not None or laps_total is not None
 
         session_time_remain = self._ir_get("SessionTimeRemain", None)
         if isinstance(session_time_remain, (int, float)) and float(session_time_remain) >= 86400.0:
             # Hosted / test sessions often expose ~604800s placeholder — omit so the model does not treat it as real stint clock.
             session_time_remain = None
+
+        mode = self.ui_mode()
 
         # Compact schema to reduce tokens (short keys, no nulls, rounded floats).
         fc_us_gal = None
@@ -571,12 +602,12 @@ class TelemetryTracker:
             fc_us_gal = None
 
         packet = {
-            "x": {"md": mode, "u": "us"},
+            "x": {"md": mode, "u": "us", "fe": (1 if fuel_est_ok else 0), "ll": (1 if lap_data_ok else 0)},
             "s": {  # session
                 "st": self._ir_get("SessionState", None),
                 "tr": session_time_remain,
-                "lt": self._ir_get("SessionLapsTotal", None),
-                "ot": self._ir_get("IsOnTrack", None),
+                "lt": laps_total,
+                "ot": is_on_track,
                 "ig": self._ir_get("IsInGarage", None),
             },
             "m": {  # me
@@ -623,6 +654,15 @@ class TelemetryTracker:
             "rv": rivals,
             "f": relevant_history,
         }
+
+        if not fuel_est_ok:
+            mm = packet.get("m")
+            if isinstance(mm, dict):
+                for k in ("fpl", "fpe", "fl", "mk", "ls", "pw", "pwu"):
+                    mm.pop(k, None)
+            rr = packet.get("r")
+            if isinstance(rr, dict):
+                rr.pop("ftl", None)
 
         packet = drop_nones(packet)
 

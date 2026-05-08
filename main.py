@@ -42,6 +42,10 @@ def main():
         _set_windows_app_user_model_id("ai-race-engineer.overlay")
 
     app = QApplication(sys.argv)
+    _f = app.font()
+    if _f.pointSizeF() <= 0:
+        _f.setPointSizeF(10.0)
+    app.setFont(_f)
     icon_path = _resource_path("icon.png")
     icon = QIcon(icon_path)
     app.setWindowIcon(icon)

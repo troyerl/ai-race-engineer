@@ -4,7 +4,7 @@ import sys
 import threading
 import json
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -127,8 +127,12 @@ class AIRaceEngineer(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
 
-        self.setMinimumWidth(450)
-        self.setMaximumWidth(500)
+        self.setMinimumWidth(520)
+        self.setMaximumWidth(720)
+        _scr = QGuiApplication.primaryScreen()
+        if _scr is not None:
+            _ah = _scr.availableGeometry().height()
+            self.setMaximumHeight(max(620, int(_ah * 0.92)))
 
         self.layout = QVBoxLayout()
         self.layout.setContentsMargins(12, 12, 12, 12)
@@ -136,8 +140,9 @@ class AIRaceEngineer(QWidget):
 
         self.setStyleSheet(
             """
-            /* Avoid hardcoding a missing font (e.g. Segoe UI on macOS) */
-            QWidget { }
+            QWidget {
+                font-size: 13px;
+            }
             QLabel#statusLabel {
                 color: #E8F5E9;
                 font-size: 17px;
@@ -507,7 +512,7 @@ class AIRaceEngineer(QWidget):
             self.settings_widget.setVisible(checked)
             self.settings_toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
             self.layout.activate()
-            self.adjustSize()
+            self._relayout_overlay()
 
         self.settings_toggle.toggled.connect(_toggle_settings)
 
@@ -590,6 +595,18 @@ class AIRaceEngineer(QWidget):
     def _schedule_save_config(self, _val: int):
         # Debounce disk writes while user is clicking.
         self._save_config_timer.start(400)
+
+    def _relayout_overlay(self):
+        self.adjustSize()
+        w = min(max(self.minimumWidth(), self.width()), self.maximumWidth())
+        h = min(max(self.minimumHeight(), self.height()), self.maximumHeight())
+        scr = self.screen()
+        if scr is not None:
+            ag = scr.availableGeometry()
+            h = min(h, max(400, ag.height() - 8))
+            w = min(w, max(self.minimumWidth(), ag.width() - 8))
+        if w > 0 and h > 0:
+            self.resize(w, h)
 
     def _on_auto_clear_toggled(self, on: bool):
         self.clear_after_spin.setVisible(on)
@@ -733,7 +750,7 @@ class AIRaceEngineer(QWidget):
         self.label.setText(text)
         self.btn.setEnabled(True)
         self.layout.activate()
-        self.adjustSize()
+        self._relayout_overlay()
         # Mark request complete and schedule auto-clear if no further interaction.
         self._active_request_id = 0
         clear_ms = (
@@ -772,14 +789,14 @@ class AIRaceEngineer(QWidget):
             return
         self.label.setText(self._partial_buffer)
         self.layout.activate()
-        self.adjustSize()
+        self._relayout_overlay()
 
     def _clear_if_idle(self):
         # Only clear if we are not currently waiting on a request.
         if self._active_request_id == 0 and self.btn.isEnabled():
             self.label.setText("Engineer Standby")
             self.layout.activate()
-            self.adjustSize()
+            self._relayout_overlay()
             self._set_ai_status("Idle")
 
     def close_app(self):
