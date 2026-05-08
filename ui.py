@@ -4,6 +4,7 @@ import sys
 import threading
 import json
 
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
