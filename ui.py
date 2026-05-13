@@ -4,7 +4,6 @@ import sys
 import threading
 import json
 
-from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -33,8 +32,8 @@ FEATURE_VOICE_ENV = "AIRACE_FEATURE_VOICE"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ai_race_engineer.json")
 
 # Rough $ estimate for the usage counter (edit if your model/region pricing differs).
-BEDROCK_USD_PER_MILLION_INPUT = 1.25
-BEDROCK_USD_PER_MILLION_OUTPUT = 5.0
+BEDROCK_USD_PER_MILLION_INPUT = 3.0
+BEDROCK_USD_PER_MILLION_OUTPUT = 15.0
 
 BTN_LIVE = "ANALYZE FIELD & ADVISE"
 BTN_STRATEGY = "GET RACE STRATEGY"
@@ -790,7 +789,7 @@ class AIRaceEngineer(QWidget):
             return
         self.label.setText(self._partial_buffer)
         self.layout.activate()
-        self._relayout_overlay()
+        self.adjustSize()
 
     def _clear_if_idle(self):
         # Only clear if we are not currently waiting on a request.

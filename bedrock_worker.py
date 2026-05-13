@@ -9,7 +9,7 @@ from PySide6.QtCore import QObject, Signal
 from botocore.config import Config
 
 
-DEFAULT_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+DEFAULT_MODEL_ID = "us.anthropic.claude-sonnet-4-6-v1:0"
 # Absolute wall-clock guard: some streams can misbehave without a proper end iteration.
 STREAM_MAX_SECONDS = 50
 
