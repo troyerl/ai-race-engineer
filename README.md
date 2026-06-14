@@ -170,32 +170,42 @@ PyInstaller builds are OS-specific, so **run this on a Windows machine**.
 
 ### One-command build (recommended)
 
-From the project folder:
+From the project folder on **Windows**:
 
 ```bat
 build_windows.bat
 ```
+
+The script installs `requirements.txt` + build tools, generates `icon.ico`, and runs PyInstaller via `ai_race_engineer.spec`.
 
 Output:
 - `dist\AI Race Engineer\AI Race Engineer.exe`
 
 Notes:
 - The app uses `icon.png` at runtime (Qt window/app icon).
-- The Windows build script generates a **multi-size** `icon.ico` from `icon.png` (via `make_icon_ico.py`) and passes it to PyInstaller (`--icon`). Multi-size ICOs are much more reliable in Explorer/taskbar than single-size ICOs.
+- The Windows build script generates a **multi-size** `icon.ico` from `icon.png` (via `make_icon_ico.py`).
+- iRacing SDK package is **`pyirsdk`** on PyPI (`import irsdk` in code). If pip says *no matching distribution for irsdk*, use `pyirsdk`.
 
 ### Manual build (if you prefer)
 
 ```bat
-py -m pip install -U pip
-py -m pip install -U pyinstaller
-py -m PyInstaller --noconfirm --windowed --name "AI Race Engineer" main.py
+py -m pip install -r requirements.txt
+py -m pip install -r requirements-build.txt
+py make_icon_ico.py
+py -m PyInstaller --noconfirm --clean ai_race_engineer.spec
 ```
 
-If you want a single-file exe (sometimes less reliable with GUI apps):
+### Build troubleshooting
 
-```bat
-py -m PyInstaller --noconfirm --onefile --windowed --name "AI Race Engineer" main.py
-```
+| Error | Fix |
+|-------|-----|
+| `No matching distribution found for irsdk` | Use `pyirsdk`: `pip install pyirsdk` |
+| `ModuleNotFoundError` during PyInstaller analysis | Run `pip install -r requirements.txt` first |
+| `'py' is not recognized` | Use `python` instead, or install the [Python launcher](https://docs.python.org/3/using/windows.html#python-launcher-for-windows) |
+| `icon.png not found` | Run the build from the project root (same folder as `main.py`) |
+| Build succeeds but exe crashes on start | Rebuild with `build_windows.bat` (uses `ai_race_engineer.spec` with PySide6/boto3 bundled) |
+
+**Mac/Linux:** PyInstaller builds are OS-specific. You can build a Mac `.app` for the receiver UI, but the Windows `.exe` must be built on Windows.
 
 ### UI controls
 
