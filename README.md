@@ -22,20 +22,26 @@ A small always-on-top iRacing overlay that sends a compact “strategy snapshot�
 ## Requirements
 
 - Python 3.10+ recommended
-- iRacing running (and the iRacing SDK accessible to Python via `irsdk`)
+- iRacing running (and the iRacing SDK accessible to Python via `pyirsdk` — imported as `irsdk` in code)
 - AWS Bedrock access to the configured model
 
 Python packages used:
 - `PySide6`
 - `boto3` (and `botocore`)
-- `irsdk`
+- `pyirsdk` (PyPI name; `import irsdk` in code)
 - Optional: `python-dotenv` (loads `.env` on startup)
 - Optional: `pynput` (global hotkey while iRacing has focus; macOS needs Accessibility)
 
 Install everything:
 
 ```bash
-pip install PySide6 boto3 irsdk python-dotenv pynput
+pip install -r requirements.txt
+```
+
+Or manually:
+
+```bash
+pip install PySide6 boto3 pyirsdk python-dotenv pynput
 ```
 
 Or with a virtual environment:
@@ -43,7 +49,7 @@ Or with a virtual environment:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install PySide6 boto3 irsdk python-dotenv pynput
+pip install -r requirements.txt
 ```
 
 ## Configuration
@@ -236,7 +242,7 @@ Notes:
 ## Troubleshooting
 
 - **Overlay says “ENGINEER: No Signal”**:
-  - iRacing isn’t connected yet, or `irsdk` can’t read the telemetry.
+  - iRacing isn’t connected yet, or `pyirsdk` can’t read the telemetry.
   - Start iRacing first, then run the overlay.
 - **Analyze hangs**:
   - It should no longer hang indefinitely. You’ll either get a response, or the watchdog will re-enable Analyze after ~30s.
