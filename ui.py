@@ -658,9 +658,9 @@ class AIRaceEngineer(QWidget):
         voice_row.addWidget(self.voice_why_toggle)
 
         voice_hint = self._setting_desc(
-            "Sim PC: macOS say, Windows SAPI, or espeak."
+            "Sim PC: Windows neural voice (edge-tts) or SAPI; macOS say; Linux espeak."
             if self._is_receiver
-            else "Reads calls on this PC using macOS say, Windows SAPI, or espeak."
+            else "Reads calls on this PC (Windows: neural edge-tts when installed; macOS say; Linux espeak)."
         )
 
         auto_pit_desc = self._setting_desc("Sets pit-road loss from track length when telemetry connects.")
@@ -1042,8 +1042,14 @@ class AIRaceEngineer(QWidget):
                 self.lan_device_list.addItem(item)
             if hasattr(self, "lan_status_label"):
                 n = len(devices)
-                self.lan_status_label.setText(f"{n} sim PC{'s' if n != 1 else ''} on LAN — click to connect.")
+                if self._receiver_link and self._receiver_link.is_linked():
+                    self.lan_status_label.setText(f"{n} sim PC{'s' if n != 1 else ''} on LAN.")
+                else:
+                    self.lan_status_label.setText(
+                        f"{n} sim PC{'s' if n != 1 else ''} on LAN — auto-connecting to best match…"
+                    )
 
+        self._maybe_auto_connect_lan(devices)
         self.layout.activate()
         self._relayout_overlay()
 
@@ -1064,6 +1070,39 @@ class AIRaceEngineer(QWidget):
         self._schedule_save_config(0)
         if hasattr(self, "lan_status_label"):
             self.lan_status_label.setText(f"Connecting to {host}:{port}…")
+
+    def _maybe_auto_connect_lan(self, devices: list | None = None) -> None:
+        """Connect to the best discovered broadcaster when not already linked."""
+        if self._role != "receiver" or self._receiver_link is None:
+            return
+        if self._receiver_link.is_linked():
+            return
+        if devices is None:
+            devices = self._lan_discovery.devices() if self._lan_discovery is not None else []
+        if not devices:
+            return
+        pick = next((d for d in devices if d.get("iracing")), devices[0])
+        host = str(pick.get("host") or "").strip()
+        if not host:
+            return
+        try:
+            port = int(pick.get("port", DEFAULT_RACE_LINK_PORT))
+        except (TypeError, ValueError):
+            port = DEFAULT_RACE_LINK_PORT
+        cur_host = str(getattr(self, "_link_host", "")).strip()
+        try:
+            cur_port = int(getattr(self, "_link_port", DEFAULT_RACE_LINK_PORT))
+        except (TypeError, ValueError):
+            cur_port = DEFAULT_RACE_LINK_PORT
+        if cur_host == host and cur_port == port:
+            return
+        self._link_host = host
+        self._link_port = port
+        self._connect_receiver_link()
+        self._schedule_save_config(0)
+        if hasattr(self, "lan_status_label"):
+            name = str(pick.get("name") or host).strip() or host
+            self.lan_status_label.setText(f"Auto-connecting to {name} ({host}:{port})…")
 
     def _connect_receiver_link(self) -> None:
         if self._receiver_link is None:
