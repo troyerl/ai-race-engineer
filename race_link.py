@@ -262,9 +262,10 @@ class ReceiverClient(QObject):
         partial: bool = False,
         speak: bool = True,
         include_why: bool = True,
-    ) -> None:
+    ) -> bool:
+        """Send finished advice to the sim PC. Returns False if not linked or socket write fails."""
         if not self.is_linked():
-            return
+            return False
         msg = _encode_line(
             {
                 "t": "advice",
@@ -275,9 +276,20 @@ class ReceiverClient(QObject):
             }
         )
         try:
-            self._sock.write(msg)
-        except Exception:
-            pass
+            pending = self._sock.bytesToWrite()
+            if pending > 65536:
+                print(f"[WARN] race_link advice queue large ({pending} bytes); dropping partial={partial}")
+            n = self._sock.write(msg)
+            if n < 0:
+                return False
+            self._sock.flush()
+            if not self._sock.waitForBytesWritten(3000):
+                print("[WARN] race_link advice write timed out")
+                return False
+            return True
+        except Exception as exc:
+            print(f"[WARN] race_link send_advice failed: {exc}")
+            return False
 
     def _try_connect(self) -> None:
         if not self._want_link or not self._host:

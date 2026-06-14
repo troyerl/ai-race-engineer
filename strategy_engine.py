@@ -529,6 +529,8 @@ REQUIRED_PYIRSDK_VARIABLES = [
     "CarIdxTrackSurface",
     "TrackWetness",
     "Precipitation",
+    "TireSetsAvailable",
+    "PlayerCarDryTireSetLimit",
     "CarIdxLapTires",
     "EngineWarnings",
     "FuelLevelPct",

@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from race_memory import RaceMemory
-from telemetry import _is_caution_flags
+from telemetry import _is_caution_flags, parse_tire_sets_available
 
 
 class RemoteTelemetrySource:
@@ -87,6 +87,15 @@ class RemoteTelemetrySource:
 
     def track_length_miles(self) -> float | None:
         return self._track_mi
+
+    def read_tire_sets_remaining(self) -> int | None:
+        """Sets left from the broadcaster packet (``r.ts``), when the series reports a limit."""
+        if not self._fresh() or not isinstance(self._packet, dict):
+            return None
+        r = self._packet.get("r")
+        if not isinstance(r, dict):
+            return None
+        return parse_tire_sets_available(r.get("ts"))
 
     def build_packet(self, tire_sets_remaining: int, pit_loss_sec: int) -> str:
         if not self._packet:

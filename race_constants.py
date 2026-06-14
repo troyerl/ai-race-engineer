@@ -20,6 +20,9 @@ DEFAULT_CAUTION_BURN_L = 0.20
 # Section 5: Start/Finish spatial midpoint divider
 LAP_DIST_WRAP_HALF = 0.5
 
+# iRacing SDK: TireSetsAvailable == 255 means unlimited sets for the session
+IRSDK_TIRE_SETS_UNLIMITED = 255
+
 # Section 2.1: Green-flag filtering smoothing factor
 FUEL_EMA_ALPHA = 0.45
 

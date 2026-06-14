@@ -123,6 +123,7 @@ class AIRaceEngineer(QWidget):
             self.telemetry = TelemetryTracker()
 
         self._pit_user_modified = False
+        self._tire_user_modified = False
         self._last_sdk_connected = None
         self._auto_last_lap: int | None = None
         self._auto_last_caution = False
@@ -493,6 +494,11 @@ class AIRaceEngineer(QWidget):
         self.tire_spin.setMinimum(0)
         self.tire_spin.setMaximum(99)
         self.tire_spin.setValue(2)
+        self.tire_spin.setToolTip(
+            "Auto-updates from iRacing when the series limits tire sets (SDK TireSetsAvailable). "
+            "Change manually to override; 255/unlimited sessions keep your value."
+        )
+        self.tire_spin.valueChanged.connect(self._on_tire_spin_changed)
         pit_label = QLabel("Pit-road loss")
         pit_label.setObjectName("subLabel")
         self.pit_spin = QSpinBox()
@@ -1085,15 +1091,18 @@ class AIRaceEngineer(QWidget):
         connected = self.telemetry.is_connected()
         if connected and (self._last_sdk_connected is None or self._last_sdk_connected is False):
             self._maybe_set_default_pit_loss()
+            self._maybe_sync_tire_sets_from_sdk()
         if not connected and self._last_sdk_connected:
             self._reset_auto_monitor()
         self._last_sdk_connected = connected
         self._update_connection_badge()
         self._update_action_button_text()
+        self._maybe_sync_tire_sets_from_sdk()
         self._check_auto_strategy()
 
     def _on_telemetry_poll(self) -> None:
         self.telemetry.update_field_history()
+        self._maybe_sync_tire_sets_from_sdk()
         self._check_auto_strategy()
 
     def _style_status_pill(self, label: QLabel, tone: str) -> None:
@@ -1391,6 +1400,7 @@ class AIRaceEngineer(QWidget):
         # (but only if the user hasn't overridden it).
         if connected and (self._last_sdk_connected is None or self._last_sdk_connected is False):
             self._maybe_set_default_pit_loss()
+            self._maybe_sync_tire_sets_from_sdk()
             self._reset_auto_monitor()
         self._last_sdk_connected = connected
         self._update_action_button_text()
@@ -1418,6 +1428,26 @@ class AIRaceEngineer(QWidget):
     def _on_pit_spin_changed(self, _val: int):
         # Mark as user-modified so we don't overwrite with track defaults later.
         self._pit_user_modified = True
+
+    def _on_tire_spin_changed(self, _val: int):
+        self._tire_user_modified = True
+
+    def _maybe_sync_tire_sets_from_sdk(self) -> None:
+        if self._tire_user_modified:
+            return
+        if not self.telemetry.is_connected():
+            return
+        read_fn = getattr(self.telemetry, "read_tire_sets_remaining", None)
+        if not callable(read_fn):
+            return
+        sdk_ts = read_fn()
+        if sdk_ts is None:
+            return
+        if int(self.tire_spin.value()) == int(sdk_ts):
+            return
+        self.tire_spin.blockSignals(True)
+        self.tire_spin.setValue(int(sdk_ts))
+        self.tire_spin.blockSignals(False)
 
     def _apply_track_default_pit_loss(self):
         # Explicit user action: override current value with track-based default.
@@ -1539,13 +1569,17 @@ class AIRaceEngineer(QWidget):
         if self._role != "receiver" or self._receiver_link is None:
             return
         if not self._receiver_link.is_linked():
+            print("[WARN] Advice not relayed — engineer PC not linked to sim PC")
             return
-        self._receiver_link.send_advice(
+        speak = bool(self.voice_sim_toggle.isChecked())
+        sent = self._receiver_link.send_advice(
             text,
             partial=partial,
-            speak=bool(self.voice_sim_toggle.isChecked()),
+            speak=speak,
             include_why=bool(self.voice_why_toggle.isChecked()),
         )
+        if speak and not sent:
+            print("[WARN] Advice voice relay to sim PC failed (socket write)")
 
     def _should_speak_locally(self) -> bool:
         if not bool(self.voice_enabled_toggle.isChecked()):

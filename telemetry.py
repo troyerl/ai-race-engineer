@@ -20,6 +20,7 @@ from race_constants import (
     FUEL_LAPS_CLAMP_MULTIPLIER,
     FUEL_LAPS_CLAMP_OFFSET,
     HERD_POSITION_WINDOW,
+    IRSDK_TIRE_SETS_UNLIMITED,
     LAP_HISTORY_DEPTH,
     REENTRY_WINDOW_PCT,
     _L_TO_US_GAL,
@@ -34,6 +35,25 @@ from race_constants import (
 
 # AI-facing packet uses US customary fuel units (internal math stays liters + kg/h).
 _KG_TO_LB = 2.204622621847693185
+
+DEFAULT_TIRE_SETS_FALLBACK = 2
+
+
+def parse_tire_sets_available(value: Any) -> int | None:
+    """
+    Parse iRacing TireSetsAvailable (and similar) for remaining full sets.
+
+    Returns None when unlimited (255) or invalid — caller keeps manual UI default.
+    """
+    try:
+        if value is None:
+            return None
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    if v < 0 or v >= IRSDK_TIRE_SETS_UNLIMITED:
+        return None
+    return v
 
 
 def _liters_to_us_gal(x: float) -> float:
@@ -381,6 +401,12 @@ class TelemetryTracker:
     def is_connected(self) -> bool:
         # Lightweight check used by the UI status indicator.
         return bool(self.ir.is_connected)
+
+    def read_tire_sets_remaining(self) -> int | None:
+        """Remaining full tire sets from SDK (None = unlimited or unavailable)."""
+        if not self.is_connected():
+            return None
+        return parse_tire_sets_available(self._ir_get("TireSetsAvailable", None))
 
     def ui_mode(self) -> str:
         """

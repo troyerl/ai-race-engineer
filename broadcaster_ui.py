@@ -13,15 +13,14 @@ from app_config import ensure_default_config_file, load_config, write_config
 from race_link import DEFAULT_RACE_LINK_PORT, BroadcasterService
 from lan_discovery import BroadcasterBeacon
 from speech import speak_engineer_advice
-from telemetry import TelemetryTracker
+from telemetry import DEFAULT_TIRE_SETS_FALLBACK, TelemetryTracker
 
-# Receiver overrides tire/pit inputs when it runs analyze.
-_BCAST_TIRE_SETS = 2
+# Receiver overrides pit loss on the engineer PC; tire sets stream from SDK on the sim PC.
 _BCAST_PIT_LOSS_SEC = 8
 
 
 class BroadcasterWindow(QWidget):
-    _voice_done = Signal()
+    _voice_done = Signal(bool)
 
     def __init__(self, bind_host: str = "0.0.0.0", port: int = DEFAULT_RACE_LINK_PORT):
         super().__init__()
@@ -228,9 +227,11 @@ class BroadcasterWindow(QWidget):
         packet = None
         if connected:
             try:
+                sdk_ts = self.telemetry.read_tire_sets_remaining()
+                tire_sets = sdk_ts if sdk_ts is not None else DEFAULT_TIRE_SETS_FALLBACK
                 packet = json.loads(
                     self.telemetry.build_packet(
-                        tire_sets_remaining=_BCAST_TIRE_SETS,
+                        tire_sets_remaining=int(tire_sets),
                         pit_loss_sec=_BCAST_PIT_LOSS_SEC,
                     )
                 )
@@ -245,7 +246,10 @@ class BroadcasterWindow(QWidget):
         }
 
     def _on_advice(self, text: str, partial: bool, speak: bool, include_why: bool) -> None:
-        if partial or not speak:
+        if partial:
+            return
+        if not speak:
+            self.voice_badge.setText("Voice: muted — enable Speak on sim PC on engineer PC")
             return
         body = (text or "").strip()
         if not body or body.startswith(("AI Error", "Error:")):
@@ -257,14 +261,20 @@ class BroadcasterWindow(QWidget):
         self.voice_badge.setText("Voice: speaking engineer call…")
 
         def _speak() -> None:
+            ok = False
             try:
-                speak_engineer_advice(body, include_why=include_why)
+                ok = bool(speak_engineer_advice(body, include_why=include_why))
+            except Exception as exc:
+                print(f"[WARN] broadcaster TTS failed: {exc}")
             finally:
-                self._voice_done.emit()
+                self._voice_done.emit(ok)
 
         threading.Thread(target=_speak, daemon=True).start()
 
-    def _on_voice_done(self) -> None:
+    def _on_voice_done(self, ok: bool = True) -> None:
+        if not ok:
+            self.voice_badge.setText("Voice: TTS failed — check Windows sound / PowerShell")
+            return
         if self._service.client_count() > 0:
             self.voice_badge.setText("Voice: ready")
         else:
