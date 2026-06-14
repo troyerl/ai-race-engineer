@@ -14,11 +14,25 @@ from typing import Any
 
 import irsdk
 
-# FuelUsePerHour telemetry is kg/h per iRacing SDK; FuelLevel is liters (or kWh on EVs — heuristic below).
-_GASOLINE_KG_PER_L = 0.75
+from race_constants import (
+    DEFAULT_AVG_LAP_S,
+    FUEL_EMA_ALPHA,
+    FUEL_LAPS_CLAMP_MULTIPLIER,
+    FUEL_LAPS_CLAMP_OFFSET,
+    HERD_POSITION_WINDOW,
+    LAP_HISTORY_DEPTH,
+    REENTRY_WINDOW_PCT,
+    _L_TO_US_GAL,
+    clamp_avg_lap_seconds,
+    clamp_lap_distance_pct,
+    clamp_nonneg_liters,
+    clamp_positive_rate,
+    resolve_combined_burn_rate,
+    triangular_payback_lap,
+    wrap_lap_distance_delta,
+)
 
 # AI-facing packet uses US customary fuel units (internal math stays liters + kg/h).
-_L_TO_US_GAL = 0.2641720523581484
 _KG_TO_LB = 2.204622621847693185
 
 
@@ -380,6 +394,15 @@ class TelemetryTracker:
             return "live"
         return "strategy"
 
+    def get_monitor_state(self) -> tuple[int | None, bool]:
+        """Current player lap and whether yellow/caution is active (for auto alerts)."""
+        if not self.is_connected():
+            return None, False
+        lap = _sanitize_lap_count(self._ir_get("Lap", None))
+        flags = _parse_session_flags_bools(self._ir_get("SessionFlags", 0), self._ir_get("PitsOpen", None))
+        is_caution = bool(flags.get("yel") or flags.get("cau"))
+        return lap, is_caution
+
     def _ir_get(self, key: str, default=None):
         try:
             v = self.ir[key]
@@ -410,7 +433,7 @@ class TelemetryTracker:
                 if dl >= 1 and df > 0.02:
                     sample = df / float(dl)
                     if fc_f is None or sample <= fc_f * 0.98:
-                        alpha = 0.45
+                        alpha = FUEL_EMA_ALPHA
                         ema = self._fuel_per_lap_ema_L
                         self._fuel_per_lap_ema_L = sample if ema is None else (alpha * sample + (1 - alpha) * ema)
                         if dl == 1:
@@ -441,29 +464,24 @@ class TelemetryTracker:
         surfaces: list | None,
         pit_loss_sec: float,
         lap_s: float,
-        traffic_window: float = 0.035,
+        traffic_window: float = REENTRY_WINDOW_PCT,
     ) -> dict[str, Any]:
         """Estimate whether a pit now merges into clean air or a traffic pack."""
         if not isinstance(lap_dist, (list, tuple)) or player_idx >= len(lap_dist):
             return {"v": "UNKNOWN"}
-        try:
-            player_dist = float(lap_dist[player_idx])
-        except (TypeError, ValueError):
-            return {"v": "UNKNOWN"}
-        if not (0.0 <= player_dist <= 1.0) or lap_s <= 0:
+        player_dist = clamp_lap_distance_pct(lap_dist[player_idx])
+        lap_s = clamp_avg_lap_seconds(lap_s)
+        if player_dist is None or lap_s <= 0:
             return {"v": "UNKNOWN"}
 
-        pit_frac = (float(pit_loss_sec) / float(lap_s)) % 1.0
+        pit_frac = (float(pit_loss_sec) / lap_s) % 1.0
         reentry_dist = (player_dist + pit_frac) % 1.0
         pack = 0
         for idx, dist in enumerate(lap_dist):
             if idx == player_idx:
                 continue
-            try:
-                d = float(dist)
-            except (TypeError, ValueError):
-                continue
-            if not (0.0 <= d <= 1.0):
+            d = clamp_lap_distance_pct(dist)
+            if d is None:
                 continue
             if isinstance(surfaces, (list, tuple)) and idx < len(surfaces):
                 try:
@@ -471,7 +489,7 @@ class TelemetryTracker:
                         continue
                 except (TypeError, ValueError):
                     pass
-            dd = abs((d - reentry_dist + 0.5) % 1.0 - 0.5)
+            dd = abs(wrap_lap_distance_delta(reentry_dist, d))
             if dd <= traffic_window:
                 pack += 1
 
@@ -491,7 +509,7 @@ class TelemetryTracker:
         surfaces: list | None,
         on_pit_road: list | None,
         *,
-        window: int = 5,
+        window: int = HERD_POSITION_WINDOW,
         caution: bool,
     ) -> dict[str, Any]:
         if not caution or player_pos <= 0:
@@ -535,7 +553,7 @@ class TelemetryTracker:
         positions: list,
         surfaces: list | None,
         *,
-        window: int = 5,
+        window: int = HERD_POSITION_WINDOW,
     ) -> dict[str, int]:
         counts = {"apa": 0, "apb": 0, "isa": 0, "isb": 0}
         if player_pos <= 0 or not isinstance(surfaces, (list, tuple)):
@@ -694,10 +712,10 @@ class TelemetryTracker:
         car_idx_dist = self._ir_get("CarIdxLapDistPct", None)
         try:
             if isinstance(car_idx_dist, (list, tuple)) and a_idx < len(car_idx_dist) and b_idx < len(car_idx_dist):
-                da = float(car_idx_dist[a_idx])
-                db = float(car_idx_dist[b_idx])
-                if 0.0 <= da <= 1.0 and 0.0 <= db <= 1.0:
-                    dd = (db - da) % 1.0
+                da = clamp_lap_distance_pct(car_idx_dist[a_idx])
+                db = clamp_lap_distance_pct(car_idx_dist[b_idx])
+                if da is not None and db is not None:
+                    dd = wrap_lap_distance_delta(da, db)
                     return round(abs(dd * float(lap_s_fallback)), 2)
         except Exception:
             pass
@@ -738,6 +756,27 @@ class TelemetryTracker:
             if isinstance(v, str) and v.strip():
                 return v.strip()
         return None
+
+    def get_session_yaml_dict(self) -> dict[str, Any] | None:
+        """Parse iRacing SessionInfo YAML for pre-race strategy."""
+        if not self.is_connected():
+            return None
+        try:
+            import yaml
+
+            raw = self.ir["SessionInfo"]
+            if not raw:
+                return None
+            data = yaml.safe_load(raw)
+            if not isinstance(data, dict):
+                return None
+            slim: dict[str, Any] = {}
+            for key in ("WeekendInfo", "SessionInfo", "DriverInfo"):
+                if key in data:
+                    slim[key] = data[key]
+            return slim or data
+        except Exception:
+            return None
 
     def estimate_rejoin(self, pit_loss_sec: int) -> dict[str, Any]:
         """
@@ -909,7 +948,7 @@ class TelemetryTracker:
                 self.last_recorded_lap.pop(idx, None)
                 self._last_car_surface.pop(idx, None)
 
-        fuel_level = float(self._ir_get("FuelLevel", 0.0) or 0.0)
+        fuel_level = clamp_nonneg_liters(self._ir_get("FuelLevel", 0.0))
         fuel_capacity = self._ir_get("FuelCapacity", None)
         if isinstance(lap_now, int):
             self._tick_fuel_per_lap_ema(lap_now, fuel_level, fuel_capacity)
@@ -920,7 +959,7 @@ class TelemetryTracker:
             curr_lap = laps[i]
             if i not in self.last_recorded_lap:
                 self.last_recorded_lap[i] = curr_lap
-                self.field_history[i] = deque(maxlen=5)
+                self.field_history[i] = deque(maxlen=LAP_HISTORY_DEPTH)
 
             # Only append a lap time when the lap counter increments.
             if curr_lap > self.last_recorded_lap[i]:
@@ -979,7 +1018,7 @@ class TelemetryTracker:
                     label = f"P{pos}" if idx != player_idx else "YOU"
                     relevant_history[label] = list(self.field_history[idx])
 
-        fuel_level = float(self._ir_get("FuelLevel", 0.0) or 0.0)
+        fuel_level = clamp_nonneg_liters(self._ir_get("FuelLevel", 0.0))
         fuel_level_pct = self._ir_get("FuelLevelPct", None)
         try:
             if fuel_level_pct is not None:
@@ -1040,18 +1079,16 @@ class TelemetryTracker:
         if you_pace.get("n", 0) >= 1:
             avg_lap_s = you_pace.get("avg_last3_s") or you_pace.get("avg_last5_s")
         if not avg_lap_s:
-            avg_lap_s = 90.0  # fallback; avoids divide-by-zero / nonsense
+            avg_lap_s = DEFAULT_AVG_LAP_S
 
-        fuel_use_kg_per_h = max(fuel_use_per_hour_raw, 0.05)
-        fuel_use_L_per_h = fuel_use_kg_per_h / _GASOLINE_KG_PER_L
-        fuel_use_per_lap_inst = fuel_use_L_per_h * (float(avg_lap_s) / 3600.0)
-        fuel_use_per_lap_inst = max(fuel_use_per_lap_inst, 1e-6)
-
+        is_caution = bool(flags_bools.get("cau") or flags_bools.get("yel"))
         fpl_ema = self._fuel_per_lap_ema_L
-        if fpl_ema is not None:
-            fuel_use_per_lap_est = max(fuel_use_per_lap_inst, float(fpl_ema))
-        else:
-            fuel_use_per_lap_est = fuel_use_per_lap_inst
+        fuel_use_per_lap_est = resolve_combined_burn_rate(
+            fuel_use_per_hour_raw,
+            clamp_avg_lap_seconds(avg_lap_s),
+            fpl_ema,
+            is_caution=is_caution,
+        )
 
         laps_of_fuel_left_est = float(fuel_level) / fuel_use_per_lap_est
 
@@ -1059,7 +1096,10 @@ class TelemetryTracker:
         try:
             if laps_remain is not None:
                 lr_d = float(max(int(laps_remain), 1))
-                if laps_of_fuel_left_est > max(lr_d * 2.0, lr_d + 30.0):
+                if laps_of_fuel_left_est > max(
+                    lr_d * FUEL_LAPS_CLAMP_MULTIPLIER,
+                    lr_d + FUEL_LAPS_CLAMP_OFFSET,
+                ):
                     fuel_use_per_lap_est = max(fuel_use_per_lap_est, fuel_level / lr_d)
                     laps_of_fuel_left_est = float(fuel_level) / fuel_use_per_lap_est
         except Exception:
@@ -1112,12 +1152,19 @@ class TelemetryTracker:
         avg3_s = you_pace.get("avg_last3_s") if isinstance(you_pace, dict) else None
         falloff_s = None
         if isinstance(best_lap_s, (int, float)) and isinstance(avg3_s, (int, float)):
-            falloff_s = round(float(avg3_s) - float(best_lap_s), 3)  # >0 => slower than best
+            raw_falloff = float(avg3_s) - float(best_lap_s)
+            if raw_falloff > 0:
+                falloff_s = round(raw_falloff, 3)
 
         pit_payback_laps = None
         try:
-            if falloff_s is not None and falloff_s > 0 and pit_loss_sec:
-                pit_payback_laps = round(float(pit_loss_sec) / float(falloff_s), 1)
+            if falloff_s is not None and pit_loss_sec:
+                payback_lap = triangular_payback_lap(
+                    float(pit_loss_sec),
+                    clamp_positive_rate(falloff_s, minimum=0.01, default=0.01),
+                )
+                if payback_lap is not None:
+                    pit_payback_laps = round(float(payback_lap), 1)
         except Exception:
             pass
 
@@ -1142,12 +1189,13 @@ class TelemetryTracker:
                 return [drop_nones(v) for v in x]
             return x
 
-        # Approx laps a full fuel load covers (strategy planning).
+        # Full-tank stint uses green-flag EMA when available (not caution-instant burn).
         ftl = None
         try:
             fc = fuel_capacity_raw
-            if fc is not None and fuel_use_per_lap_est:
-                ftl = round(float(fc) / float(fuel_use_per_lap_est), 1)
+            ftl_burn_L = float(fpl_ema) if fpl_ema is not None else fuel_use_per_lap_est
+            if fc is not None and ftl_burn_L > 0:
+                ftl = round(float(fc) / ftl_burn_L, 1)
         except Exception:
             pass
         if ftl is not None and (ftl > 320 or ftl < 0.8):
@@ -1345,6 +1393,10 @@ class TelemetryTracker:
             packet["fi"] = field_intel
         if twl:
             packet["twl"] = twl
+
+        session_yaml = self.get_session_yaml_dict()
+        if session_yaml:
+            packet["sy"] = session_yaml
 
         if not fuel_est_ok:
             mm = packet.get("m")

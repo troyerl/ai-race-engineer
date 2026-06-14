@@ -13,7 +13,9 @@ binaries = []
 hiddenimports = [
     "irsdk",
     "app_config",
-    "bedrock_worker",
+    "pre_race_strategy",
+    "strategy_engine",
+    "strategy_worker",
     "broadcaster_ui",
     "hotkey",
     "lan_discovery",
@@ -27,7 +29,7 @@ hiddenimports = [
     "ui",
 ]
 
-for pkg in ("PySide6", "boto3", "botocore"):
+for pkg in ("PySide6",):
     tmp_ret = collect_all(pkg)
     datas += tmp_ret[0]
     binaries += tmp_ret[1]

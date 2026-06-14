@@ -10,61 +10,44 @@ from race_link import DEFAULT_RACE_LINK_PORT
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ai_race_engineer.json")
 
-FEATURE_REJOIN_ENV = "AIRACE_FEATURE_REJOIN"
-FEATURE_VOICE_ENV = "AIRACE_FEATURE_VOICE"
-
-REQUEST_TIMEOUT_MIN_SEC = 15
-REQUEST_TIMEOUT_MAX_SEC = 60
-DEFAULT_REQUEST_TIMEOUT_SEC = 30
+FEATURE_DEFAULTS_KEY = "feature_defaults_all_on"
 
 
-def _migrate_token_counts(c: dict) -> None:
-    if "bedrock_tokens_runtime_input" not in c:
-        c["bedrock_tokens_runtime_input"] = int(c.get("bedrock_tokens_input_total", 0) or 0)
-        c["bedrock_tokens_runtime_output"] = int(c.get("bedrock_tokens_output_total", 0) or 0)
-    c.setdefault("bedrock_tokens_prior_input", 0)
-    c.setdefault("bedrock_tokens_prior_output", 0)
-
-
-def sync_legacy_total_keys(data: dict) -> None:
-    pi = int(data.get("bedrock_tokens_prior_input", 0) or 0)
-    po = int(data.get("bedrock_tokens_prior_output", 0) or 0)
-    ri = int(data.get("bedrock_tokens_runtime_input", 0) or 0)
-    ro = int(data.get("bedrock_tokens_runtime_output", 0) or 0)
-    data["bedrock_tokens_input_total"] = pi + ri
-    data["bedrock_tokens_output_total"] = po + ro
+def _apply_feature_toggle_defaults(c: dict, *, force_all_on: bool = False) -> None:
+    toggles = (
+        "voice_enabled",
+        "voice_read_why",
+        "show_pit_impact",
+        "voice_sim_enabled",
+        "auto_apply_track_pit_loss",
+        "analyze_hotkey_enabled",
+        "auto_pit_alerts",
+    )
+    if force_all_on:
+        for key in toggles:
+            c[key] = True
+        if int(c.get("clear_after_sec", 0) or 0) <= 0:
+            c["clear_after_sec"] = 120
+        return
+    for key in toggles:
+        c.setdefault(key, True)
+    c.setdefault("clear_after_sec", 120)
 
 
 def merge_config_defaults(cfg: dict) -> dict:
     raw = dict(cfg) if isinstance(cfg, dict) else {}
     c = dict(raw)
-    c.setdefault("clear_after_sec", 120)
-    c.setdefault("voice_read_why", False)
-    c.setdefault("voice_sim_enabled", True)
-    c.setdefault("auto_apply_track_pit_loss", True)
     c["analyze_hotkey"] = normalize_hotkey(str(c.get("analyze_hotkey", DEFAULT_HOTKEY)))
-    c.setdefault("analyze_hotkey_enabled", True)
     c.setdefault("race_link_host", "")
     c.setdefault("race_link_port", DEFAULT_RACE_LINK_PORT)
     c.setdefault("lan_display_name", "")
 
-    if "voice_enabled" in raw:
-        c["voice_enabled"] = bool(raw.get("voice_enabled"))
+    if not raw.get(FEATURE_DEFAULTS_KEY):
+        _apply_feature_toggle_defaults(c, force_all_on=True)
+        c[FEATURE_DEFAULTS_KEY] = True
     else:
-        c["voice_enabled"] = os.getenv(FEATURE_VOICE_ENV, "0") == "1"
+        _apply_feature_toggle_defaults(c, force_all_on=False)
 
-    if "show_pit_impact" in raw:
-        c["show_pit_impact"] = bool(raw.get("show_pit_impact"))
-    else:
-        c["show_pit_impact"] = os.getenv(FEATURE_REJOIN_ENV, "0") == "1"
-
-    try:
-        timeout = int(c.get("request_timeout_sec", DEFAULT_REQUEST_TIMEOUT_SEC))
-    except (TypeError, ValueError):
-        timeout = DEFAULT_REQUEST_TIMEOUT_SEC
-    c["request_timeout_sec"] = max(REQUEST_TIMEOUT_MIN_SEC, min(REQUEST_TIMEOUT_MAX_SEC, timeout))
-
-    _migrate_token_counts(c)
     return c
 
 
@@ -79,7 +62,6 @@ def load_config() -> dict:
 
 def write_config(data: dict) -> None:
     merged = merge_config_defaults(data)
-    sync_legacy_total_keys(merged)
     tmp = CONFIG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(merged, f)
@@ -94,22 +76,17 @@ def ensure_default_config_file() -> None:
             {
                 "clear_after_sec": 120,
                 "auto_apply_track_pit_loss": True,
-                "voice_enabled": False,
+                "voice_enabled": True,
                 "voice_sim_enabled": True,
-                "voice_read_why": False,
-                "show_pit_impact": False,
-                "request_timeout_sec": DEFAULT_REQUEST_TIMEOUT_SEC,
+                "voice_read_why": True,
+                "show_pit_impact": True,
                 "analyze_hotkey": DEFAULT_HOTKEY,
                 "analyze_hotkey_enabled": True,
                 "race_link_host": "",
                 "race_link_port": DEFAULT_RACE_LINK_PORT,
                 "lan_display_name": "",
-                "bedrock_tokens_prior_input": 0,
-                "bedrock_tokens_prior_output": 0,
-                "bedrock_tokens_runtime_input": 0,
-                "bedrock_tokens_runtime_output": 0,
-                "bedrock_tokens_input_total": 0,
-                "bedrock_tokens_output_total": 0,
+                "auto_pit_alerts": True,
+                FEATURE_DEFAULTS_KEY: True,
             }
         )
     except Exception:

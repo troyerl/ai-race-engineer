@@ -65,6 +65,20 @@ class RemoteTelemetrySource:
             return "live"
         return self._mode if self._mode in ("live", "strategy") else "live"
 
+    def get_monitor_state(self) -> tuple[int | None, bool]:
+        if not self._fresh() or not isinstance(self._packet, dict):
+            return None, False
+        m = self._packet.get("m") if isinstance(self._packet.get("m"), dict) else {}
+        s = self._packet.get("s") if isinstance(self._packet.get("s"), dict) else {}
+        lap = m.get("l")
+        try:
+            lap_i = int(lap) if lap is not None else None
+        except (TypeError, ValueError):
+            lap_i = None
+        flb = s.get("flb") if isinstance(s.get("flb"), dict) else {}
+        is_caution = bool(flb.get("yel") or flb.get("cau"))
+        return lap_i, is_caution
+
     def update_field_history(self) -> None:
         pass
 

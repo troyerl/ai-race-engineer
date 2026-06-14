@@ -22,15 +22,14 @@ from PySide6.QtWidgets import (
 )
 
 from app_config import (
-    DEFAULT_REQUEST_TIMEOUT_SEC,
-    REQUEST_TIMEOUT_MAX_SEC,
-    REQUEST_TIMEOUT_MIN_SEC,
     ensure_default_config_file,
     load_config,
     merge_config_defaults,
     write_config,
 )
-from bedrock_worker import BedrockWorker
+from race_constants import ALERT_LAP_HORIZON, get_default_pit_loss_seconds, resolve_track_length_miles
+from strategy_engine import run_strategy, should_auto_alert
+from strategy_worker import StrategyWorker
 from hotkey import (
     DEFAULT_HOTKEY,
     HOTKEY_CHOICES,
@@ -51,29 +50,10 @@ from telemetry import TelemetryTracker
 TELEMETRY_POLL_MS = 250
 CONNECTION_POLL_MS = 1000
 STREAM_UI_THROTTLE_MS = 80
-
-# Rough $ estimate for the usage counter (edit if your model/region pricing differs).
-BEDROCK_USD_PER_MILLION_INPUT = 3.0
-BEDROCK_USD_PER_MILLION_OUTPUT = 15.0
-
+REQUEST_WATCHDOG_MS = 30_000
 BTN_LIVE = "ANALYZE FIELD & ADVISE"
 BTN_STRATEGY = "GET RACE STRATEGY"
 BTN_DISCONNECTED = "ANALYZE FIELD & ADVISE"
-
-
-def _bedrock_estimated_charge_usd(input_tokens: int, output_tokens: int) -> float:
-    """User-facing estimate: $1 / 1M input, $5 / 1M output."""
-    return (max(0, int(input_tokens)) / 1_000_000.0) * BEDROCK_USD_PER_MILLION_INPUT + (
-        max(0, int(output_tokens)) / 1_000_000.0
-    ) * BEDROCK_USD_PER_MILLION_OUTPUT
-
-
-def _format_charge_usd(amount: float) -> str:
-    if amount <= 0:
-        return "$0.00"
-    if amount < 0.01:
-        return f"${amount:.4f}"
-    return f"${amount:.2f}"
 
 
 def _first_nonempty_line(text: str) -> str:
@@ -144,6 +124,9 @@ class AIRaceEngineer(QWidget):
 
         self._pit_user_modified = False
         self._last_sdk_connected = None
+        self._auto_last_lap: int | None = None
+        self._auto_last_caution = False
+        self._auto_last_call_line = ""
         self._link_host_boot = (link_host or "").strip() or str(self._config.get("race_link_host", "")).strip()
         self._link_port_boot = int(link_port if link_port is not None else self._config.get("race_link_port", DEFAULT_RACE_LINK_PORT))
         if self._role == "receiver":
@@ -427,23 +410,11 @@ class AIRaceEngineer(QWidget):
         top_row.setContentsMargins(0, 0, 0, 0)
         self.conn_badge = QLabel("Telemetry: …" if self._is_receiver else "iRacing: …")
         self.conn_badge.setObjectName("statusPill" if self._is_receiver else "connBadge")
-        self.ai_badge = QLabel("AI · Idle")
+        self.ai_badge = QLabel("Engine · Idle")
         self.ai_badge.setObjectName("statusPill" if self._is_receiver else "connBadge")
         top_row.addWidget(self.conn_badge)
         top_row.addWidget(self.ai_badge)
         top_row.addStretch(1)
-
-        self.token_label = QLabel("")
-        self.token_label.setObjectName("statusMeta" if self._is_receiver else "subLabel")
-        self.token_label.setWordWrap(not self._is_receiver)
-        if self._is_receiver:
-            self.token_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.token_label.setToolTip(
-            "Input and output = prior (Settings) + counted since install. "
-            f"Cost estimate: ${BEDROCK_USD_PER_MILLION_INPUT:g} per 1M input, "
-            f"${BEDROCK_USD_PER_MILLION_OUTPUT:g} per 1M output (not official AWS billing)."
-        )
-        top_row.addWidget(self.token_label)
 
         self._header_widget: QWidget | None = None
         self._advice_card: QWidget | None = None
@@ -493,7 +464,7 @@ class AIRaceEngineer(QWidget):
         self.rejoin_label.setObjectName("cardHint" if self._is_receiver else "subLabel")
         self.rejoin_label.setWordWrap(True)
         self.rejoin_label.setVisible(False)
-        if not bool(self._config.get("show_pit_impact", False)):
+        if not bool(self._config.get("show_pit_impact", True)):
             self.rejoin_label.hide()
 
         self.btn = QPushButton(BTN_DISCONNECTED)
@@ -616,28 +587,11 @@ class AIRaceEngineer(QWidget):
 
         clear_hint = self._setting_desc("Off keeps the last call on screen until you clear or analyze again.")
 
-        timeout_row = QHBoxLayout()
-        timeout_row.setContentsMargins(0, 0, 0, 0)
-        timeout_label = QLabel("Request timeout")
-        timeout_label.setObjectName("subLabel")
-        self.request_timeout_spin = QSpinBox()
-        self.request_timeout_spin.setObjectName("pitSpin")
-        self.request_timeout_spin.setMinimum(REQUEST_TIMEOUT_MIN_SEC)
-        self.request_timeout_spin.setMaximum(REQUEST_TIMEOUT_MAX_SEC)
-        self.request_timeout_spin.setSuffix(" s")
-        self.request_timeout_spin.setValue(int(self._config.get("request_timeout_sec", DEFAULT_REQUEST_TIMEOUT_SEC)))
-        self.request_timeout_spin.setToolTip("Re-enables Analyze if Bedrock does not respond in time.")
-        timeout_row.addWidget(timeout_label)
-        timeout_row.addWidget(self.request_timeout_spin)
-        timeout_row.addStretch(1)
-
-        timeout_hint = self._setting_desc("Unlocks Analyze if the AI hangs or never finishes.")
-
         rejoin_row = QHBoxLayout()
         rejoin_row.setContentsMargins(0, 0, 0, 0)
         rejoin_label_setting = QLabel("Show pit-impact line")
         rejoin_label_setting.setObjectName("subLabel")
-        self.show_pit_impact_toggle = self._pill_toggle(bool(self._config.get("show_pit_impact", False)))
+        self.show_pit_impact_toggle = self._pill_toggle(bool(self._config.get("show_pit_impact", True)))
         self.show_pit_impact_toggle.setToolTip(
             "After a PIT call, shows estimated positions lost based on pit-road loss."
         )
@@ -649,11 +603,26 @@ class AIRaceEngineer(QWidget):
             "Under yellow, shows on-track position vs lead-lap loss and restart rows."
         )
 
+        auto_alert_row = QHBoxLayout()
+        auto_alert_row.setContentsMargins(0, 0, 0, 0)
+        auto_alert_label = QLabel("Auto pit alerts")
+        auto_alert_label.setObjectName("subLabel")
+        self.auto_pit_alerts_toggle = self._pill_toggle(bool(self._config.get("auto_pit_alerts", True)))
+        self.auto_pit_alerts_toggle.setToolTip(
+            f"Alert every lap and under caution when a pit is due within {ALERT_LAP_HORIZON} laps."
+        )
+        auto_alert_row.addWidget(auto_alert_label)
+        auto_alert_row.addStretch(1)
+        auto_alert_row.addWidget(self.auto_pit_alerts_toggle)
+        auto_pit_alert_desc = self._setting_desc(
+            f"Shows the call and sends voice to the sim PC when a stop is due within {ALERT_LAP_HORIZON} laps."
+        )
+
         voice_enable_row = QHBoxLayout()
         voice_enable_row.setContentsMargins(0, 0, 0, 0)
         voice_enable_label = QLabel("Voice enabled")
         voice_enable_label.setObjectName("subLabel")
-        self.voice_enabled_toggle = self._pill_toggle(bool(self._config.get("voice_enabled", False)))
+        self.voice_enabled_toggle = self._pill_toggle(bool(self._config.get("voice_enabled", True)))
         self.voice_enabled_toggle.setToolTip("Read engineer calls aloud on this PC (single-PC / local mode).")
         voice_enable_row.addWidget(voice_enable_label)
         voice_enable_row.addStretch(1)
@@ -676,7 +645,7 @@ class AIRaceEngineer(QWidget):
         voice_row.setContentsMargins(0, 0, 0, 0)
         voice_label = QLabel("Speak WHY after call")
         voice_label.setObjectName("subLabel")
-        self.voice_why_toggle = self._pill_toggle(bool(self._config.get("voice_read_why", False)))
+        self.voice_why_toggle = self._pill_toggle(bool(self._config.get("voice_read_why", True)))
         self.voice_why_toggle.setToolTip("After the action line, reads the WHY line aloud.")
         voice_row.addWidget(voice_label)
         voice_row.addStretch(1)
@@ -690,44 +659,6 @@ class AIRaceEngineer(QWidget):
 
         auto_pit_desc = self._setting_desc("Sets pit-road loss from track length when telemetry connects.")
         pit_defaults_desc = self._setting_desc("Immediately applies the track-length pit-loss estimate.")
-
-        prior_in_desc = self._setting_desc("Input tokens you used on Bedrock before this app.")
-        prior_out_desc = self._setting_desc("Output tokens you used on Bedrock before this app.")
-
-        prior_in_row = QHBoxLayout()
-        prior_in_row.setContentsMargins(0, 0, 0, 0)
-        prior_in_label = QLabel("Prior usage · in")
-        prior_in_label.setObjectName("subLabel")
-        self.prior_input_spin = QSpinBox()
-        self.prior_input_spin.setObjectName("pitSpin")
-        self.prior_input_spin.setMinimum(0)
-        self.prior_input_spin.setMaximum(2_147_483_647)
-        self.prior_input_spin.setSingleStep(10_000)
-        self.prior_input_spin.setValue(int(self._config.get("bedrock_tokens_prior_input", 0)))
-        prior_in_row.addWidget(prior_in_label)
-        prior_in_row.addWidget(self.prior_input_spin)
-        prior_in_row.addStretch(1)
-
-        prior_out_row = QHBoxLayout()
-        prior_out_row.setContentsMargins(0, 0, 0, 0)
-        prior_out_label = QLabel("Prior usage · out")
-        prior_out_label.setObjectName("subLabel")
-        self.prior_output_spin = QSpinBox()
-        self.prior_output_spin.setObjectName("pitSpin")
-        self.prior_output_spin.setMinimum(0)
-        self.prior_output_spin.setMaximum(2_147_483_647)
-        self.prior_output_spin.setSingleStep(10_000)
-        self.prior_output_spin.setValue(int(self._config.get("bedrock_tokens_prior_output", 0)))
-        prior_out_row.addWidget(prior_out_label)
-        prior_out_row.addWidget(self.prior_output_spin)
-        prior_out_row.addStretch(1)
-
-        prior_hint = QLabel(
-            f"Adds Bedrock tokens you used before this app. Cost line: ${BEDROCK_USD_PER_MILLION_INPUT:g}/1M in, "
-            f"${BEDROCK_USD_PER_MILLION_OUTPUT:g}/1M out."
-        )
-        prior_hint.setObjectName("settingsHint")
-        prior_hint.setWordWrap(True)
 
         hotkey_enable_desc = self._setting_desc("Turn off to use only the Analyze button.")
         hotkey_combo_desc = self._setting_desc("Key that triggers Analyze (default: Spacebar).")
@@ -766,13 +697,11 @@ class AIRaceEngineer(QWidget):
         self._save_config_timer.setSingleShot(True)
         self._save_config_timer.timeout.connect(self._save_config)
         self.clear_after_spin.valueChanged.connect(self._schedule_save_config)
-        self.prior_input_spin.valueChanged.connect(self._schedule_save_config)
-        self.prior_output_spin.valueChanged.connect(self._schedule_save_config)
-        self.request_timeout_spin.valueChanged.connect(self._schedule_save_config)
         self.voice_enabled_toggle.toggled.connect(self._on_voice_settings_changed)
         self.voice_sim_toggle.toggled.connect(self._on_voice_settings_changed)
         self.voice_why_toggle.toggled.connect(self._on_voice_settings_changed)
         self.show_pit_impact_toggle.toggled.connect(self._on_show_pit_impact_toggled)
+        self.auto_pit_alerts_toggle.toggled.connect(self._schedule_save_config)
         self.auto_track_pit_toggle.toggled.connect(lambda _v: self._schedule_save_config(0))
         self.auto_clear_toggle.toggled.connect(self._on_auto_clear_toggled)
         self.hotkey_enabled_toggle.toggled.connect(self._on_hotkey_settings_changed)
@@ -792,21 +721,13 @@ class AIRaceEngineer(QWidget):
             sidebar_root.setContentsMargins(12, 10, 12, 12)
             sidebar_root.setSpacing(10)
 
-            usage_sec, usage_body = make_collapsible_section("USAGE", expanded=True)
-            usage_body.addLayout(prior_in_row)
-            usage_body.addWidget(prior_in_desc)
-            usage_body.addLayout(prior_out_row)
-            usage_body.addWidget(prior_out_desc)
-            usage_body.addWidget(prior_hint)
-            sidebar_root.addWidget(usage_sec)
-
             advice_sec, advice_body = make_collapsible_section("ADVICE", expanded=True)
             advice_body.addLayout(auto_clear_row)
             advice_body.addWidget(clear_hint)
-            advice_body.addLayout(timeout_row)
-            advice_body.addWidget(timeout_hint)
             advice_body.addLayout(rejoin_row)
             advice_body.addWidget(rejoin_hint)
+            advice_body.addLayout(auto_alert_row)
+            advice_body.addWidget(auto_pit_alert_desc)
             sidebar_root.addWidget(advice_sec)
 
             pit_sec, pit_body = make_collapsible_section("PIT", expanded=False)
@@ -845,22 +766,16 @@ class AIRaceEngineer(QWidget):
             settings_layout.addWidget(self._settings_heading("ADVICE"))
             settings_layout.addLayout(auto_clear_row)
             settings_layout.addWidget(clear_hint)
-            settings_layout.addLayout(timeout_row)
-            settings_layout.addWidget(timeout_hint)
             settings_layout.addLayout(rejoin_row)
             settings_layout.addWidget(rejoin_hint)
+            settings_layout.addLayout(auto_alert_row)
+            settings_layout.addWidget(auto_pit_alert_desc)
             settings_layout.addWidget(self._settings_heading("VOICE"))
             settings_layout.addLayout(voice_enable_row)
             settings_layout.addWidget(self._setting_desc("Reads engineer calls aloud on this PC."))
             settings_layout.addLayout(voice_row)
             settings_layout.addWidget(voice_why_desc)
             settings_layout.addWidget(voice_hint)
-            settings_layout.addWidget(self._settings_heading("USAGE · Prior tokens"))
-            settings_layout.addLayout(prior_in_row)
-            settings_layout.addWidget(prior_in_desc)
-            settings_layout.addLayout(prior_out_row)
-            settings_layout.addWidget(prior_out_desc)
-            settings_layout.addWidget(prior_hint)
             settings_layout.addWidget(self._settings_heading("HOTKEY"))
             settings_layout.addLayout(hotkey_enable_row)
             settings_layout.addWidget(hotkey_enable_desc)
@@ -932,7 +847,6 @@ class AIRaceEngineer(QWidget):
             status_layout.addWidget(self.conn_badge)
             status_layout.addWidget(self.ai_badge)
             status_layout.addStretch(1)
-            status_layout.addWidget(self.token_label)
             header_layout.addWidget(status_wrap)
             self._header_widget = header
             self.layout.addWidget(header)
@@ -980,10 +894,9 @@ class AIRaceEngineer(QWidget):
         self._local_hotkey.activated.connect(self._hotkey_trigger_analyze)
         self._apply_analyze_hotkey()
 
-        self.ai_worker = BedrockWorker()
+        self.ai_worker = StrategyWorker()
         self.ai_worker.partial.connect(self.display_partial)
         self.ai_worker.finished.connect(self.display_advice)
-        self.ai_worker.usage_report.connect(self._on_bedrock_usage_report)
 
         self._next_request_id = 0
         self._active_request_id = 0
@@ -1004,7 +917,7 @@ class AIRaceEngineer(QWidget):
         self._idle_clear_timer.timeout.connect(self._clear_if_idle)
 
         self.telemetry_timer = QTimer(self)
-        self.telemetry_timer.timeout.connect(self.telemetry.update_field_history)
+        self.telemetry_timer.timeout.connect(self._on_telemetry_poll)
         # 250ms is typically indistinguishable in-race, but cuts polling overhead.
         self.telemetry_timer.start(TELEMETRY_POLL_MS)
 
@@ -1015,7 +928,6 @@ class AIRaceEngineer(QWidget):
         self._update_connection_badge()
         self._update_action_button_text()
         self._set_ai_status("Idle")
-        self._refresh_bedrock_usage_label()
         if self._role == "receiver" and self._receiver_link is not None:
             self._connect_receiver_link()
 
@@ -1056,25 +968,6 @@ class AIRaceEngineer(QWidget):
             self.clear_after_spin.blockSignals(False)
         self._schedule_save_config(0)
 
-    def _refresh_bedrock_usage_label(self):
-        pi = int(self.prior_input_spin.value())
-        po = int(self.prior_output_spin.value())
-        bi = pi + int(self._config.get("bedrock_tokens_runtime_input", 0))
-        bo = po + int(self._config.get("bedrock_tokens_runtime_output", 0))
-        charge = _bedrock_estimated_charge_usd(bi, bo)
-        self.token_label.setText(
-            f"est. {_format_charge_usd(charge)} · {bi:,} in · {bo:,} out"
-            if self._is_receiver
-            else f"Bedrock: {bi:,} in · {bo:,} out · est. {_format_charge_usd(charge)} total"
-        )
-
-    def _on_bedrock_usage_report(self, inp: int, outp: int):
-        inp = max(0, int(inp))
-        outp = max(0, int(outp))
-        self._config["bedrock_tokens_runtime_input"] = int(self._config.get("bedrock_tokens_runtime_input", 0)) + inp
-        self._config["bedrock_tokens_runtime_output"] = int(self._config.get("bedrock_tokens_runtime_output", 0)) + outp
-        self._save_config()
-
     def _on_voice_settings_changed(self, *_args):
         self._schedule_save_config(0)
 
@@ -1086,9 +979,6 @@ class AIRaceEngineer(QWidget):
             self.rejoin_label.setVisible(False)
         self._schedule_save_config(0)
 
-    def _request_timeout_ms(self) -> int:
-        return int(self.request_timeout_spin.value()) * 1000
-
     def _save_config(self):
         try:
             data = dict(self._config)
@@ -1096,13 +986,11 @@ class AIRaceEngineer(QWidget):
                 int(self.clear_after_spin.value()) if self.auto_clear_toggle.isChecked() else 0
             )
             data["auto_apply_track_pit_loss"] = bool(self.auto_track_pit_toggle.isChecked())
-            data["bedrock_tokens_prior_input"] = int(self.prior_input_spin.value())
-            data["bedrock_tokens_prior_output"] = int(self.prior_output_spin.value())
             data["voice_enabled"] = bool(self.voice_enabled_toggle.isChecked())
             data["voice_sim_enabled"] = bool(self.voice_sim_toggle.isChecked())
             data["voice_read_why"] = bool(self.voice_why_toggle.isChecked())
             data["show_pit_impact"] = bool(self.show_pit_impact_toggle.isChecked())
-            data["request_timeout_sec"] = int(self.request_timeout_spin.value())
+            data["auto_pit_alerts"] = bool(self.auto_pit_alerts_toggle.isChecked())
             data["analyze_hotkey"] = self._current_hotkey()
             data["analyze_hotkey_enabled"] = bool(self.hotkey_enabled_toggle.isChecked())
             if self._role == "receiver":
@@ -1110,7 +998,6 @@ class AIRaceEngineer(QWidget):
                 data["race_link_port"] = int(getattr(self, "_link_port", DEFAULT_RACE_LINK_PORT))
             write_config(data)
             self._config = load_config()
-            self._refresh_bedrock_usage_label()
         except Exception:
             pass
 
@@ -1198,9 +1085,16 @@ class AIRaceEngineer(QWidget):
         connected = self.telemetry.is_connected()
         if connected and (self._last_sdk_connected is None or self._last_sdk_connected is False):
             self._maybe_set_default_pit_loss()
+        if not connected and self._last_sdk_connected:
+            self._reset_auto_monitor()
         self._last_sdk_connected = connected
         self._update_connection_badge()
         self._update_action_button_text()
+        self._check_auto_strategy()
+
+    def _on_telemetry_poll(self) -> None:
+        self.telemetry.update_field_history()
+        self._check_auto_strategy()
 
     def _style_status_pill(self, label: QLabel, tone: str) -> None:
         if not self._is_receiver:
@@ -1275,6 +1169,82 @@ class AIRaceEngineer(QWidget):
         else:
             self.hotkey_hint.setText("Hotkey off — use the Analyze button only.")
 
+    def _reset_auto_monitor(self) -> None:
+        self._auto_last_lap = None
+        self._auto_last_caution = False
+        self._auto_last_call_line = ""
+
+    def _check_auto_strategy(self) -> None:
+        if not bool(self.auto_pit_alerts_toggle.isChecked()):
+            return
+        if self._active_request_id:
+            return
+        if not self.telemetry.ensure_connected():
+            return
+        if self.telemetry.ui_mode() == "strategy":
+            return
+
+        get_state = getattr(self.telemetry, "get_monitor_state", None)
+        if not callable(get_state):
+            return
+        lap, is_caution = get_state()
+        if lap is None:
+            return
+
+        lap_changed = self._auto_last_lap is None or lap != self._auto_last_lap
+        caution_changed = is_caution != self._auto_last_caution
+        if not lap_changed and not caution_changed:
+            return
+
+        self._auto_last_lap = lap
+        self._auto_last_caution = is_caution
+
+        try:
+            packet_json = self.telemetry.build_packet(
+                tire_sets_remaining=int(self.tire_spin.value()),
+                pit_loss_sec=int(self.pit_spin.value()),
+            )
+            telemetry = json.loads(packet_json)
+        except Exception:
+            return
+        if not isinstance(telemetry, dict):
+            return
+
+        advice = run_strategy(telemetry, mode="live")
+        if not should_auto_alert(telemetry, advice):
+            return
+
+        call_line = advice.split("\n", 1)[0].strip()
+        if call_line == self._auto_last_call_line and lap_changed and not caution_changed:
+            return
+
+        self._auto_last_call_line = call_line
+        self._deliver_advice(advice, auto=True)
+
+    def _deliver_advice(self, text: str, *, auto: bool = False) -> None:
+        self._idle_clear_timer.stop()
+        self._set_advice_text(text)
+        self._update_action_button_text()
+        self._set_ai_status("Auto" if auto else "Done")
+        clear_ms = (
+            int(self.clear_after_spin.value()) * 1000 if self.auto_clear_toggle.isChecked() else 0
+        )
+        if clear_ms > 0:
+            self._idle_clear_timer.start(clear_ms)
+        if self.show_pit_impact_toggle.isChecked():
+            self._update_pit_impact_from_advice(str(text))
+        self._relay_advice_to_broadcaster(str(text), partial=False)
+        if self._role == "receiver" and hasattr(self.telemetry, "record_advice"):
+            self.telemetry.record_advice(str(text))
+        if self._should_speak_locally() and not str(text).startswith(("AI Error", "Error:")):
+            include_why = bool(self.voice_why_toggle.isChecked())
+            threading.Thread(
+                target=speak_engineer_advice,
+                args=(str(text),),
+                kwargs={"include_why": include_why},
+                daemon=True,
+            ).start()
+
     def trigger_ai_request(self):
         self._idle_clear_timer.stop()
         self._partial_flush_timer.stop()
@@ -1291,12 +1261,12 @@ class AIRaceEngineer(QWidget):
 
         mode = self.telemetry.ui_mode()
         self._set_advice_text(
-            "Sketching race strategy (fuel & tires)…"
+            "Building pre-race plan…"
             if mode == "strategy"
-            else "Reading the field & corners…"
+            else "Running strategy engine…"
         )
         self.btn.setEnabled(False)
-        self._request_watchdog.start(self._request_timeout_ms())
+        self._request_watchdog.start(REQUEST_WATCHDOG_MS)
         self._set_ai_status("Requesting")
 
         self._next_request_id += 1
@@ -1316,6 +1286,7 @@ class AIRaceEngineer(QWidget):
         self._partial_buffer = None
         cancelled_id = self.ai_worker.cancel_active()
         self._active_request_id = 0
+        self._auto_last_call_line = ""
         self._set_advice_text(_standby_advice_text(self._is_receiver))
         self._update_action_button_text()
         if cancelled_id:
@@ -1334,7 +1305,7 @@ class AIRaceEngineer(QWidget):
 
     def _on_request_timeout(self):
         if self._active_request_id:
-            print(f"[WARN] AI request timed out (request_id={self._active_request_id})")
+            print(f"[WARN] Strategy request timed out (request_id={self._active_request_id})")
             # Vital: cooperative-cancel the worker stream. Without this, boto3 may keep
             # iterating forever and the UI stays stuck even though we re-enabled Analyze.
             self.ai_worker.cancel_active()
@@ -1349,29 +1320,18 @@ class AIRaceEngineer(QWidget):
         self._request_watchdog.stop()
         self._partial_flush_timer.stop()
         self._partial_buffer = None
-        self._set_advice_text(text)
-        self._update_action_button_text()
-        # Mark request complete and schedule auto-clear if no further interaction.
         self._active_request_id = 0
-        clear_ms = (
-            int(self.clear_after_spin.value()) * 1000 if self.auto_clear_toggle.isChecked() else 0
-        )
-        if clear_ms > 0:
-            self._idle_clear_timer.start(clear_ms)
-        self._set_ai_status("Error" if str(text).startswith("AI Error") else "Done")
-        if self.show_pit_impact_toggle.isChecked():
-            self._update_pit_impact_from_advice(str(text))
-        self._relay_advice_to_broadcaster(str(text), partial=False)
-        if self._role == "receiver" and hasattr(self.telemetry, "record_advice"):
-            self.telemetry.record_advice(str(text))
-        if self._should_speak_locally() and not str(text).startswith("AI Error"):
-            include_why = bool(self.voice_why_toggle.isChecked())
-            threading.Thread(
-                target=speak_engineer_advice,
-                args=(str(text),),
-                kwargs={"include_why": include_why},
-                daemon=True,
-            ).start()
+        if str(text).startswith(("AI Error", "Error:")):
+            self._set_advice_text(text)
+            self._update_action_button_text()
+            self._set_ai_status("Error")
+            self.btn.setEnabled(True)
+            return
+        call_line = str(text).split("\n", 1)[0].strip()
+        if call_line:
+            self._auto_last_call_line = call_line
+        self._deliver_advice(str(text), auto=False)
+        self.btn.setEnabled(True)
 
     def _flush_partial(self):
         if self._active_request_id == 0 or self._partial_buffer is None:
@@ -1424,11 +1384,14 @@ class AIRaceEngineer(QWidget):
             self.conn_badge.setStyleSheet(
                 "QLabel#connBadge { border-color: rgba(231, 76, 60, 160); }"
             )
+            if self._last_sdk_connected:
+                self._reset_auto_monitor()
 
         # On initial connect or reconnect, set a sensible default pit-loss
         # (but only if the user hasn't overridden it).
         if connected and (self._last_sdk_connected is None or self._last_sdk_connected is False):
             self._maybe_set_default_pit_loss()
+            self._reset_auto_monitor()
         self._last_sdk_connected = connected
         self._update_action_button_text()
 
@@ -1467,30 +1430,9 @@ class AIRaceEngineer(QWidget):
         if not self.auto_track_pit_toggle.isChecked():
             return
 
-        name = (self.telemetry.track_name() or "").lower()
-        length_mi = self.telemetry.track_length_miles()
-
-        # Classify track type.
-        track_type = None
-        if "daytona" in name or "talladega" in name:
-            track_type = "super"
-        elif isinstance(length_mi, (int, float)):
-            if length_mi >= 2.3:
-                track_type = "super"
-            elif length_mi <= 1.2:
-                track_type = "short"
-            else:
-                track_type = "intermediate"
-        else:
-            track_type = "intermediate"
-
-        # Defaults based on your ranges (choose midpoints).
-        if track_type == "short":
-            default_sec = 42  # ~40–45
-        elif track_type == "super":
-            default_sec = 58  # "higher than 1.5mi"; conservative
-        else:
-            default_sec = 46  # ~45–48
+        name = self.telemetry.track_name() or ""
+        length_mi = resolve_track_length_miles(self.telemetry.track_length_miles())
+        default_sec = int(get_default_pit_loss_seconds(name, length_mi))
 
         # Set without marking as user-modified.
         self.pit_spin.blockSignals(True)
@@ -1498,13 +1440,15 @@ class AIRaceEngineer(QWidget):
         self.pit_spin.blockSignals(False)
 
     def _set_ai_status(self, status: str):
-        self.ai_badge.setText(f"AI · {status}")
+        self.ai_badge.setText(f"Engine · {status}")
         status_l = (status or "").lower()
         if self._is_receiver:
             if status_l in ("idle", "done"):
                 self._style_status_pill(self.ai_badge, "ok")
             elif status_l in ("requesting", "streaming"):
                 self._style_status_pill(self.ai_badge, "info")
+            elif status_l == "auto":
+                self._style_status_pill(self.ai_badge, "warn")
             elif status_l in ("timed out", "timeout"):
                 self._style_status_pill(self.ai_badge, "warn")
             elif status_l in ("cancelled", "canceled"):
@@ -1514,6 +1458,8 @@ class AIRaceEngineer(QWidget):
             return
         if status_l in ("idle", "done"):
             color = "rgba(46, 204, 113, 140)"
+        elif status_l == "auto":
+            color = "rgba(241, 196, 15, 160)"
         elif status_l in ("requesting", "streaming"):
             color = "rgba(52, 152, 219, 160)"
         elif status_l in ("timed out", "timeout"):

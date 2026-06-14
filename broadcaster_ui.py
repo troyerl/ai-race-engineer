@@ -248,7 +248,7 @@ class BroadcasterWindow(QWidget):
         if partial or not speak:
             return
         body = (text or "").strip()
-        if not body or body.startswith("AI Error"):
+        if not body or body.startswith(("AI Error", "Error:")):
             self.voice_badge.setText("Voice: engineer PC reported an error")
             return
         if body == self._last_spoken_advice:

@@ -1,33 +1,33 @@
 # ai-race-engineer
 
-A small always-on-top iRacing overlay that sends a compact “strategy snapshot” to an LLM on AWS Bedrock and shows **streaming** race-engineer advice (updates live as tokens arrive).
+A small always-on-top iRacing overlay that builds a compact strategy snapshot from live telemetry and runs a **local deterministic race-engineer engine** (no cloud AI).
 
 ## What it does
 
 - **Collects recent pace**: keeps the last ~5 lap times for you + a small slice of the field.
 - **Builds a compact JSON packet**: your position, fuel, laps remaining, flags, plus nearby/top competitors’ recent lap times.
-- **Calls Bedrock with streaming enabled**: the overlay shows advice as it arrives (no waiting for the full response).
+- **Runs a local strategy engine**: instant pit/stay-out calls plus a **green-flag rest-of-race forecast** (projected stop laps and service).
+- **Pre-race green-flag plan**: in the garage, **GET RACE STRATEGY** builds fuel/tire stint length, stop count, and lap-by-lap pit schedule from SessionInfo YAML + your pace/fuel baselines.
+- **Auto pit alerts**: every lap and under caution, shows and speaks pit calls when a stop is due within 5 laps (toggle in ADVICE preferences).
 - **Prevents “stuck forever” UI**:
-  - Bedrock client has connect/read timeouts.
-  - A 30s UI watchdog re-enables the Analyze button if a request stalls.
+  - Request timeout watchdog re-enables the Analyze button if a request stalls.
   - Clear/Cancel immediately resets the UI and stops applying late results.
 
 ## Repository layout
 
 - `main.py`: app entrypoint. Starts the Qt application.
 - `ui.py`: the overlay UI (buttons, inputs, timeout watchdog) + request-id gating so late results can’t overwrite the screen.
+- `strategy_engine.py`: deterministic pit/strategy decision rules.
+- `strategy_worker.py`: runs the engine off the UI thread (same signals as the old AI worker).
 - `telemetry.py`: iRacing telemetry tracking + bounded in-memory lap history + packet builder.
-- `bedrock_worker.py`: background Bedrock client with streaming + cooperative cancel.
 
 ## Requirements
 
 - Python 3.10+ recommended
 - iRacing running (and the iRacing SDK accessible to Python via `pyirsdk` — imported as `irsdk` in code)
-- AWS Bedrock access to the configured model
 
 Python packages used:
 - `PySide6`
-- `boto3` (and `botocore`)
 - `pyirsdk` (PyPI name; `import irsdk` in code)
 - Optional: `python-dotenv` (loads `.env` on startup)
 - Optional: `pynput` (global hotkey while iRacing has focus; macOS needs Accessibility)
@@ -41,7 +41,7 @@ pip install -r requirements.txt
 Or manually:
 
 ```bash
-pip install PySide6 boto3 pyirsdk python-dotenv pynput
+pip install PySide6 pyirsdk python-dotenv pynput
 ```
 
 Or with a virtual environment:
@@ -54,44 +54,25 @@ pip install -r requirements.txt
 
 ## Configuration
 
-### Environment variables
+Settings are saved to `~/.ai_race_engineer.json` (hotkey, voice, pit loss, etc.).
 
-- `IRACING_BEDROCK_TOKEN`: required. Used as `AWS_BEARER_TOKEN_BEDROCK` for Bedrock authentication.
-
-You can set it via your shell, or by creating a `.env` file locally (not committed).
-
-See `.env-example`.
+Optional: create a `.env` file if you use `python-dotenv` for other local secrets (not required for the strategy engine).
 
 ## Local testing (single PC)
 
-Use this path when you want to try the app on **one machine** with iRacing and the AI overlay together — no LAN, no second PC.
+Use this path when you want to try the app on **one machine** with iRacing and the engineer overlay together — no LAN, no second PC.
 
 ### 1. Prerequisites
 
 - Python 3.10+
 - iRacing installed and able to enter a session (test drive, practice, or race)
-- AWS Bedrock access to the configured model (`us.anthropic.claude-sonnet-4-6-v1:0` by default)
 - Dependencies installed (see **Requirements** above)
 
-### 2. Set your Bedrock token
-
-Copy the example env file and add your token:
-
-```bash
-cp .env-example .env
-```
-
-Edit `.env`:
-
-```bash
-IRACING_BEDROCK_TOKEN=your_bedrock_bearer_token_here
-```
-
-### 3. Start iRacing first
+### 2. Start iRacing first
 
 Launch iRacing and load into a session (garage, test drive, or on track). The SDK only provides telemetry once the sim is running.
 
-### 4. Run local mode
+### 3. Run local mode
 
 Skip the startup role picker and open the single-PC overlay:
 
@@ -101,12 +82,12 @@ python3 main.py --role local
 
 You should see the overlay window. The status badge should change from **iRacing: Offline** to **iRacing: Online** once telemetry connects.
 
-### 5. Quick functional test
+### 4. Quick functional test
 
 1. Drive a few laps so the app has lap times and fuel data.
 2. Set **Pit loss (sec)** and **New tire sets left** if needed (or enable auto pit-loss in preferences).
 3. Click **ANALYZE FIELD & ADVISE** (or press **Spacebar** when the overlay is focused).
-4. Confirm advice streams in live — you should see text appear incrementally, then a final pit/stay-out call.
+4. Confirm the engineer call appears (action, timing, service, and WHY line).
 5. Click **CLEAR / CANCEL** to reset and try again.
 
 Optional checks:
@@ -115,17 +96,16 @@ Optional checks:
 - **Show pit impact**: after a PIT call, a caution-aware pit-road impact line appears under the advice.
 - **Hotkey**: Space works in-app always; with `pynput` installed, Space can work globally (on macOS, grant **Accessibility** to your terminal or Python in System Settings → Privacy & Security).
 
-### 6. Config file
+### 5. Config file
 
-Settings are saved to `~/.ai_race_engineer.json` (hotkey, voice, pit loss, token usage counters, etc.). Delete that file to reset preferences.
+Settings are saved to `~/.ai_race_engineer.json`. Delete that file to reset preferences.
 
 ### Local troubleshooting
 
 | Symptom | What to try |
 |---------|-------------|
 | **iRacing: Offline** | Start iRacing before the overlay; restart the overlay after joining a session. |
-| **Error: IRACING_BEDROCK_TOKEN not found** | Add the token to `.env` or export it in your shell. |
-| **Analyze does nothing / times out** | Check Bedrock credentials and model access; watch the terminal for errors. |
+| **Analyze does nothing / times out** | Watch the terminal for errors; try **CLEAR / CANCEL** and analyze again. |
 | **No global hotkey on Mac** | Install `pynput` and enable Accessibility for the app running Python. |
 | **trace trap on Mac at startup** | Usually a `pynput`/Accessibility issue — the in-app Space shortcut still works. |
 
@@ -203,13 +183,13 @@ py -m PyInstaller --noconfirm --clean ai_race_engineer.spec
 | `ModuleNotFoundError` during PyInstaller analysis | Run `pip install -r requirements.txt` first |
 | `'py' is not recognized` | Use `python` instead, or install the [Python launcher](https://docs.python.org/3/using/windows.html#python-launcher-for-windows) |
 | `icon.png not found` | Run the build from the project root (same folder as `main.py`) |
-| Build succeeds but exe crashes on start | Rebuild with `build_windows.bat` (uses `ai_race_engineer.spec` with PySide6/boto3 bundled) |
+| Build succeeds but exe crashes on start | Rebuild with `build_windows.bat` (uses `ai_race_engineer.spec` with PySide6 bundled) |
 
 **Mac/Linux:** PyInstaller builds are OS-specific. You can build a Mac `.app` for the receiver UI, but the Windows `.exe` must be built on Windows.
 
 ### UI controls
 
-- **ANALYZE FIELD & ADVISE**: sends the current snapshot to Bedrock and disables itself until:
+- **ANALYZE FIELD & ADVISE**: sends the current snapshot to the local strategy engine and disables itself until:
   - a response arrives, or
   - you click **CLEAR / CANCEL**, or
   - the 30s watchdog times out.
@@ -257,8 +237,9 @@ Notes:
 - **Analyze hangs**:
   - It should no longer hang indefinitely. You’ll either get a response, or the watchdog will re-enable Analyze after ~30s.
   - You can always hit **CLEAR / CANCEL** to reset immediately.
-- **No text appears while streaming**:
-  - Bedrock streaming event shapes can vary by model/version. If you see this, grab the console output from a single click and we can adjust the streaming delta parsing in `bedrock_worker.py`.
+- **No text appears after Analyze**:
+  - Check the terminal for errors from `strategy_engine.py`.
+  - Try **CLEAR / CANCEL** and analyze again with iRacing connected.
 
 ## Git hygiene
 
