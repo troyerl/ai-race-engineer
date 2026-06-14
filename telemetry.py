@@ -32,6 +32,7 @@ from race_constants import (
     triangular_payback_lap,
     wrap_lap_distance_delta,
 )
+from pre_race_strategy import find_race_session, race_lap_total_from_session
 
 # AI-facing packet uses US customary fuel units (internal math stays liters + kg/h).
 _KG_TO_LB = 2.204622621847693185
@@ -402,10 +403,22 @@ class TelemetryTracker:
         # Lightweight check used by the UI status indicator.
         return bool(self.ir.is_connected)
 
-    def read_tire_sets_remaining(self) -> int | None:
-        """Remaining full tire sets from SDK (None = unlimited or unavailable)."""
+    def read_tire_set_limit(self) -> int | None:
+        """Race-weekend dry tire set allocation (PlayerCarDryTireSetLimit)."""
         if not self.is_connected():
             return None
+        return parse_tire_sets_available(self._ir_get("PlayerCarDryTireSetLimit", None))
+
+    def read_tire_sets_remaining(self) -> int | None:
+        """Remaining tire sets — uses race allocation in practice/qualifying."""
+        if not self.is_connected():
+            return None
+        limit = self.read_tire_set_limit()
+        session_type = str(self._ir_get("SessionType", "") or "").strip().lower()
+        session_name = str(self._ir_get("SessionName", "") or "").strip().upper()
+        in_race = session_type == "race" or session_name == "RACE"
+        if not in_race and limit is not None:
+            return limit
         return parse_tire_sets_available(self._ir_get("TireSetsAvailable", None))
 
     def ui_mode(self) -> str:
@@ -1236,7 +1249,7 @@ class TelemetryTracker:
         if not is_on_track and int(you_pace.get("n", 0) or 0) < 1 and fuel_calc_quality != "hi":
             fuel_est_ok = False
 
-        lap_data_ok = laps_remain is not None or laps_total is not None
+        lap_data_ok = laps_remain is not None or laps_total is not None or race_laps_total is not None
 
         session_time_remain = self._ir_get("SessionTimeRemain", None)
         if isinstance(session_time_remain, (int, float)) and float(session_time_remain) >= 86400.0:
@@ -1335,6 +1348,11 @@ class TelemetryTracker:
 
         mode = self.ui_mode()
 
+        session_yaml = self.get_session_yaml_dict()
+        race_session = find_race_session(session_yaml or {})
+        race_laps_total = race_lap_total_from_session(race_session)
+        tire_set_limit = self.read_tire_set_limit()
+
         # Compact schema to reduce tokens (short keys, no nulls, rounded floats).
         fc_us_gal = None
         try:
@@ -1352,6 +1370,7 @@ class TelemetryTracker:
                 "tr": session_time_remain,
                 "te": session_time_elapsed,
                 "lt": laps_total,
+                "race_lt": race_laps_total,
                 "ot": is_on_track,
                 "ig": self._ir_get("IsInGarage", None),
                 "at": air_temp_f,
@@ -1409,6 +1428,7 @@ class TelemetryTracker:
             "r": {  # race_info
                 "pl": int(pit_loss_sec),
                 "ts": int(tire_sets_remaining),
+                "tsl": tire_set_limit,
                 "fc": fc_us_gal,
                 "ftl": ftl,
             },
@@ -1420,7 +1440,6 @@ class TelemetryTracker:
         if twl:
             packet["twl"] = twl
 
-        session_yaml = self.get_session_yaml_dict()
         if session_yaml:
             packet["sy"] = session_yaml
 

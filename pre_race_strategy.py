@@ -7,9 +7,10 @@ fuel, and pit stop strategy layout.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from race_constants import TIRE_COST_THRESHOLD_BUMP, first_lap_triangular_cost_exceeds
+from race_constants import IRSDK_TIRE_SETS_UNLIMITED, TIRE_COST_THRESHOLD_BUMP, first_lap_triangular_cost_exceeds
 
 _IRACING_LAPS_UNKNOWN_MIN = 32000
 
@@ -48,6 +49,17 @@ PRE_RACE_SCHEMA: dict[str, Any] = {
 def _sanitize_lap_count(v: Any) -> int | None:
     if v is None:
         return None
+    if isinstance(v, str):
+        raw = v.strip().lower()
+        if raw in ("", "unlimited", "none", "n/a"):
+            return None
+        if raw.isdigit():
+            v = int(raw)
+        else:
+            m = re.search(r"\d+", raw)
+            if not m:
+                return None
+            v = int(m.group(0))
     try:
         i = int(v)
     except (TypeError, ValueError):
@@ -55,6 +67,100 @@ def _sanitize_lap_count(v: Any) -> int | None:
     if i < 0 or i >= _IRACING_LAPS_UNKNOWN_MIN:
         return None
     return i
+
+
+def _parse_tire_set_count(v: Any) -> int | None:
+    try:
+        if v is None:
+            return None
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    if n < 0 or n >= IRSDK_TIRE_SETS_UNLIMITED:
+        return None
+    return n
+
+
+def _is_race_session_entry(session: dict[str, Any]) -> bool:
+    """Match iRacing race sessions (SessionName is often uppercase RACE)."""
+    st = str(session.get("SessionType") or "").strip().lower()
+    sn = str(session.get("SessionName") or "").strip().upper()
+    if st == "race":
+        return True
+    if sn in ("RACE", "MAIN RACE", "FEATURE RACE", "HEAT RACE", "CONSOLATION RACE"):
+        return True
+    if "RACE" in sn and "PRACTICE" not in sn and "QUAL" not in sn:
+        return True
+    return False
+
+
+def find_race_session(session_yaml: dict[str, Any]) -> dict[str, Any]:
+    """Return the main race session from SessionInfo, even when currently in P/Q."""
+    sessions_root = session_yaml.get("SessionInfo", {})
+    if not isinstance(sessions_root, dict):
+        return {}
+    entries = sessions_root.get("Sessions", []) or []
+    candidates: list[dict[str, Any]] = []
+    for entry in entries:
+        if isinstance(entry, dict) and _is_race_session_entry(entry):
+            candidates.append(entry)
+    if not candidates:
+        return {}
+    for entry in reversed(candidates):
+        if not bool(entry.get("SessionSkipped")):
+            return entry
+    return candidates[-1]
+
+
+def race_lap_total_from_session(race_session: dict[str, Any]) -> int | None:
+    if not race_session:
+        return None
+    return _sanitize_lap_count(race_session.get("SessionLaps"))
+
+
+def race_lap_total_from_yaml(session_yaml: dict[str, Any]) -> int | None:
+    return race_lap_total_from_session(find_race_session(session_yaml))
+
+
+def _is_race_current_session(session_type: str | None) -> bool:
+    ty = str(session_type or "").strip().lower()
+    return ty == "race" or ty.endswith(" race")
+
+
+def race_tire_set_limit(session_yaml: dict[str, Any], telemetry: dict[str, Any]) -> int:
+    """Race-weekend tire allocation (not practice-session remaining sets)."""
+    r = telemetry.get("r") if isinstance(telemetry.get("r"), dict) else {}
+    s = telemetry.get("s") if isinstance(telemetry.get("s"), dict) else {}
+
+    for key in ("tsl", "ts_limit"):
+        limit = _parse_tire_set_count(r.get(key))
+        if limit is not None:
+            return max(1, limit)
+
+    weekend = session_yaml.get("WeekendInfo")
+    if isinstance(weekend, dict):
+        opts = weekend.get("WeekendOptions")
+        if isinstance(opts, dict):
+            for key in ("TireSets", "MaxTireSets", "NumTireSets"):
+                limit = _parse_tire_set_count(opts.get(key))
+                if limit is not None:
+                    return max(1, limit)
+
+    race_session = find_race_session(session_yaml)
+    for key in ("TireSets", "MaxTireSets", "TireSetCount"):
+        limit = _parse_tire_set_count(race_session.get(key))
+        if limit is not None:
+            return max(1, limit)
+
+    if _is_race_current_session(s.get("ty")):
+        remaining = _parse_tire_set_count(r.get("ts"))
+        if remaining is not None:
+            return max(1, remaining)
+
+    try:
+        return max(1, int(r.get("ts", 2) or 2))
+    except (TypeError, ValueError):
+        return 2
 
 
 def _parse_session_time_seconds(time_str: Any) -> float:
@@ -81,27 +187,18 @@ def generate_pre_race_green_plan(
     """
     Calculates a definitive pit stop strategy assuming standard uninterrupted green flag conditions.
     """
-    race_session: dict[str, Any] = {}
-    sessions = session_yaml.get("SessionInfo", {})
-    if isinstance(sessions, dict):
-        for s in sessions.get("Sessions", []) or []:
-            if not isinstance(s, dict):
-                continue
-            st = str(s.get("SessionType", "") or "")
-            sn = str(s.get("SessionName", "") or "")
-            if st == "Race" or "Race" in sn:
-                race_session = s
-                break
+    race_session = find_race_session(session_yaml)
 
-    total_laps = _sanitize_lap_count(race_session.get("SessionLaps"))
+    total_laps = race_lap_total_from_session(race_session)
     avg_lap = max(30.0, float(baseline.get("avg_lap_time_s", 90.0)))
-    if total_laps is None:
+    if total_laps is None and race_session:
         time_str = race_session.get("SessionTime", "0")
-        total_seconds = _parse_session_time_seconds(time_str)
-        s_tr = race_session.get("SessionTimeRemain")
-        if isinstance(s_tr, (int, float)) and float(s_tr) > 0:
-            total_seconds = float(s_tr)
-        total_laps = max(1, int(total_seconds / avg_lap))
+        if str(time_str or "").strip().lower() not in ("", "0", "unlimited"):
+            total_seconds = _parse_session_time_seconds(time_str)
+            total_laps = max(1, int(total_seconds / avg_lap))
+
+    if total_laps is None:
+        total_laps = max(1, int(3600.0 / avg_lap))
 
     fuel_burn = max(0.01, float(baseline.get("fuel_burn_per_lap_gal", 0.12)))
     max_capacity = float(baseline.get("fuel_tank_capacity_gal", 20.0)) * (
@@ -214,15 +311,16 @@ def baseline_from_telemetry(telemetry: dict[str, Any]) -> dict[str, Any]:
 
 
 def rules_from_telemetry(telemetry: dict[str, Any]) -> dict[str, Any]:
-    r = telemetry.get("r") if isinstance(telemetry.get("r"), dict) else {}
+    sy = telemetry.get("sy") if isinstance(telemetry.get("sy"), dict) else {}
+    session_yaml = sy if sy.get("SessionInfo") else {}
     return {
         "fuel_tank_capacity_pct": 100.0,
-        "max_tire_sets": max(1, int(r.get("ts", 2) or 2)),
+        "max_tire_sets": race_tire_set_limit(session_yaml, telemetry),
     }
 
 
 def session_yaml_from_telemetry(telemetry: dict[str, Any], *, track_name: str | None = None) -> dict[str, Any]:
-    """Use embedded SessionInfo YAML or synthesize from compact session keys."""
+    """Use embedded SessionInfo YAML or synthesize race session from packet hints."""
     sy = telemetry.get("sy")
     if isinstance(sy, dict) and sy.get("SessionInfo"):
         return sy
@@ -233,10 +331,12 @@ def session_yaml_from_telemetry(telemetry: dict[str, Any], *, track_name: str | 
         wi["TrackName"] = track_name
 
     race_sess: dict[str, Any] = {"SessionType": "Race", "SessionName": "RACE"}
-    lt = _sanitize_lap_count(s.get("lt"))
+    lt = _sanitize_lap_count(s.get("race_lt"))
+    if lt is None and _is_race_current_session(s.get("ty")):
+        lt = _sanitize_lap_count(s.get("lt"))
     if lt is not None:
         race_sess["SessionLaps"] = lt
-    tr = s.get("tr")
+    tr = s.get("race_tr") or s.get("tr")
     if isinstance(tr, (int, float)) and float(tr) > 0:
         race_sess["SessionTime"] = f"{int(tr)} sec"
 
@@ -263,7 +363,7 @@ def format_pre_race_plan(plan: dict[str, Any]) -> str:
         f"FUEL: ~{plan.get('max_laps_per_fuel_tank', '?')} laps/tank · {stint}-lap green-flag stints\n"
         f"TIRES: ~{plan.get('max_laps_per_tire_set', '?')} laps/set · {plan.get('total_stops_required', 0)} planned stop(s)\n"
         f"STOPS: {stops_line}\n"
-        f"NOTE: ~{total} laps at {track}; plan assumes green-flag run — adjust for cautions\n"
+        f"NOTE: ~{total} race laps at {track}; plan assumes green-flag run — adjust for cautions\n"
         f"TRIGGER: FUEL|TIRES  CONF: M"
     )
 
