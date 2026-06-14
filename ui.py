@@ -1,14 +1,17 @@
 import os
-import subprocess
 import sys
 import threading
 import json
 
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QToolButton,
     QSpinBox,
@@ -17,19 +20,36 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app_config import (
+    DEFAULT_REQUEST_TIMEOUT_SEC,
+    REQUEST_TIMEOUT_MAX_SEC,
+    REQUEST_TIMEOUT_MIN_SEC,
+    ensure_default_config_file,
+    load_config,
+    merge_config_defaults,
+    write_config,
+)
 from bedrock_worker import BedrockWorker
+from hotkey import (
+    DEFAULT_HOTKEY,
+    HOTKEY_CHOICES,
+    AnalyzeHotkey,
+    hotkey_display_label,
+    hotkey_qt_sequence,
+    mac_accessibility_trusted,
+    normalize_hotkey,
+)
+from race_link import DEFAULT_RACE_LINK_PORT, ReceiverClient
+from lan_discovery import LanDeviceDiscovery
+from receiver_theme import RECEIVER_QSS, make_card, make_collapsible_section, make_field_column, make_sidebar_scroll
+from remote_telemetry import RemoteTelemetrySource
+from speech import speak_engineer_advice
 from telemetry import TelemetryTracker
 
 
 TELEMETRY_POLL_MS = 250
 CONNECTION_POLL_MS = 1000
-REQUEST_TIMEOUT_MS = 30000
 STREAM_UI_THROTTLE_MS = 80
-
-FEATURE_REJOIN_ENV = "AIRACE_FEATURE_REJOIN"
-FEATURE_VOICE_ENV = "AIRACE_FEATURE_VOICE"
-
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ai_race_engineer.json")
 
 # Rough $ estimate for the usage counter (edit if your model/region pricing differs).
 BEDROCK_USD_PER_MILLION_INPUT = 3.0
@@ -38,34 +58,6 @@ BEDROCK_USD_PER_MILLION_OUTPUT = 15.0
 BTN_LIVE = "ANALYZE FIELD & ADVISE"
 BTN_STRATEGY = "GET RACE STRATEGY"
 BTN_DISCONNECTED = "ANALYZE FIELD & ADVISE"
-
-
-def _migrate_token_counts(c: dict) -> None:
-    """Legacy configs only had combined totals; split into prior (you set) + runtime (this app)."""
-    if "bedrock_tokens_runtime_input" not in c:
-        c["bedrock_tokens_runtime_input"] = int(c.get("bedrock_tokens_input_total", 0) or 0)
-        c["bedrock_tokens_runtime_output"] = int(c.get("bedrock_tokens_output_total", 0) or 0)
-    c.setdefault("bedrock_tokens_prior_input", 0)
-    c.setdefault("bedrock_tokens_prior_output", 0)
-
-
-def _sync_legacy_total_keys(data: dict) -> None:
-    """Keep bedrock_tokens_*_total as prior+runtime so older tooling still reads one number."""
-    pi = int(data.get("bedrock_tokens_prior_input", 0) or 0)
-    po = int(data.get("bedrock_tokens_prior_output", 0) or 0)
-    ri = int(data.get("bedrock_tokens_runtime_input", 0) or 0)
-    ro = int(data.get("bedrock_tokens_runtime_output", 0) or 0)
-    data["bedrock_tokens_input_total"] = pi + ri
-    data["bedrock_tokens_output_total"] = po + ro
-
-
-def _merge_config_defaults(cfg: dict) -> dict:
-    c = dict(cfg) if isinstance(cfg, dict) else {}
-    c.setdefault("clear_after_sec", 120)
-    c.setdefault("voice_read_why", False)
-    c.setdefault("auto_apply_track_pit_loss", True)
-    _migrate_token_counts(c)
-    return c
 
 
 def _bedrock_estimated_charge_usd(input_tokens: int, output_tokens: int) -> float:
@@ -92,11 +84,24 @@ def _first_nonempty_line(text: str) -> str:
     return ""
 
 
+def _standby_advice_text(is_receiver: bool) -> str:
+    if is_receiver:
+        return "Connect to a sim PC above, then press Analyze."
+    return "Engineer standby — press Analyze or your hotkey when ready."
+
+
 class AIRaceEngineer(QWidget):
     @staticmethod
     def _settings_heading(text: str) -> QLabel:
         lab = QLabel(text)
         lab.setObjectName("settingsSectionTitle")
+        return lab
+
+    @staticmethod
+    def _setting_desc(text: str) -> QLabel:
+        lab = QLabel(text)
+        lab.setObjectName("settingDesc")
+        lab.setWordWrap(True)
         return lab
 
     def _pill_toggle(self, checked: bool) -> QToolButton:
@@ -114,32 +119,65 @@ class AIRaceEngineer(QWidget):
         b.toggled.connect(_label)
         return b
 
-    def __init__(self):
+    def __init__(self, role: str = "local", link_host: str | None = None, link_port: int | None = None):
         super().__init__()
-        self.telemetry = TelemetryTracker()
-        self._feature_rejoin = os.getenv(FEATURE_REJOIN_ENV, "0") == "1"
-        self._feature_voice = os.getenv(FEATURE_VOICE_ENV, "0") == "1"
+        self._role = (role or "local").lower()
+        if self._role not in ("local", "receiver"):
+            self._role = "local"
+        self._receiver_link: ReceiverClient | None = None
+
+        self._ensure_default_config_file()
+        _loaded_cfg = self._load_config()
+        self._config = merge_config_defaults(_loaded_cfg)
+        self._hotkey_migrated = normalize_hotkey(
+            str(_loaded_cfg.get("analyze_hotkey", DEFAULT_HOTKEY))
+        ) != str(self._config.get("analyze_hotkey", DEFAULT_HOTKEY))
+
+        if self._role == "receiver":
+            self.telemetry = RemoteTelemetrySource()
+            self._receiver_link = ReceiverClient(self)
+            self._receiver_link.snapshot.connect(self._on_remote_snapshot)
+            self._receiver_link.link_changed.connect(self._on_receiver_link_changed)
+        else:
+            self.telemetry = TelemetryTracker()
+
         self._pit_user_modified = False
         self._last_sdk_connected = None
-        self._ensure_default_config_file()
-        self._config = _merge_config_defaults(self._load_config())
+        self._link_host_boot = (link_host or "").strip() or str(self._config.get("race_link_host", "")).strip()
+        self._link_port_boot = int(link_port if link_port is not None else self._config.get("race_link_port", DEFAULT_RACE_LINK_PORT))
+        if self._role == "receiver":
+            self._link_host = self._link_host_boot
+            self._link_port = self._link_port_boot
 
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        self._is_receiver = self._role == "receiver"
 
-        self.setMinimumWidth(520)
-        self.setMaximumWidth(720)
-        _scr = QGuiApplication.primaryScreen()
-        if _scr is not None:
-            _ah = _scr.availableGeometry().height()
-            self.setMaximumHeight(max(620, int(_ah * 0.92)))
+        if self._is_receiver:
+            self.setWindowTitle("AI Race Engineer — Engineer PC")
+            self.setWindowFlags(Qt.Window)
+            self.setMinimumSize(960, 760)
+            self.resize(1040, 900)
+        else:
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+            self.setMinimumWidth(520)
+            self.setMaximumWidth(720)
+            _scr = QGuiApplication.primaryScreen()
+            if _scr is not None:
+                _ah = _scr.availableGeometry().height()
+                self.setMaximumHeight(max(620, int(_ah * 0.92)))
 
         self.layout = QVBoxLayout()
-        self.layout.setContentsMargins(12, 12, 12, 12)
-        self.layout.setSpacing(10)
+        self.layout.setContentsMargins(16 if self._is_receiver else 12, 16 if self._is_receiver else 12, 16 if self._is_receiver else 12, 16 if self._is_receiver else 12)
+        self.layout.setSpacing(12 if self._is_receiver else 10)
 
+        self.setObjectName("rootOverlay")
         self.setStyleSheet(
             """
+            QWidget#rootOverlay {
+                background-color: rgb(12, 14, 20);
+                color: #E8EEF2;
+                border: 1px solid rgb(42, 46, 58);
+                border-radius: 14px;
+            }
             QWidget {
                 font-size: 13px;
             }
@@ -148,98 +186,122 @@ class AIRaceEngineer(QWidget):
                 font-size: 17px;
                 font-weight: 700;
                 line-height: 142%;
-                background: rgba(8, 10, 14, 215);
-                border: 1px solid rgba(255, 255, 255, 22);
+                background: rgb(18, 20, 28);
+                border: 1px solid rgb(50, 54, 66);
                 padding: 12px 12px;
                 border-radius: 12px;
             }
+            QWidget#advicePanel {
+                background-color: rgb(18, 20, 28);
+                border: 1px solid rgb(50, 54, 66);
+                border-radius: 12px;
+            }
+            QLabel#adviceHeader {
+                color: rgba(180, 220, 190, 255);
+                font-size: 11px;
+                font-weight: 800;
+                background: transparent;
+                border: none;
+                padding: 0;
+                letter-spacing: 0.06em;
+            }
+            QLabel#adviceText {
+                color: #E8F5E9;
+                font-size: 17px;
+                font-weight: 700;
+                line-height: 142%;
+                background: transparent;
+                border: none;
+                padding: 0;
+            }
             QLabel#subLabel {
-                color: rgba(255,255,255,245);
+                color: #E8EEF2;
                 font-size: 12px;
                 font-weight: 700;
-                background: rgba(20, 22, 28, 235);
-                border: 1px solid rgba(255,255,255,30);
+                background: rgb(24, 26, 34);
+                border: 1px solid rgb(50, 54, 66);
                 padding: 4px 8px;
                 border-radius: 10px;
             }
             QLabel#connBadge {
-                color: rgba(255,255,255,245);
+                color: #E8EEF2;
                 font-size: 12px;
                 font-weight: 800;
-                background: rgba(20, 22, 28, 235);
-                border: 1px solid rgba(255,255,255,30);
+                background: rgb(24, 26, 34);
+                border: 1px solid rgb(50, 54, 66);
                 padding: 4px 8px;
                 border-radius: 10px;
             }
             QPushButton#analyzeBtn {
-                background-color: rgba(31, 138, 76, 235);
+                background-color: rgb(31, 138, 76);
                 color: white;
                 font-weight: 700;
                 border-radius: 12px;
                 padding: 12px;
-                border: 1px solid rgba(255,255,255,40);
+                border: 1px solid rgb(25, 110, 60);
             }
-            QPushButton#analyzeBtn:hover { background-color: rgba(35, 154, 85, 245); }
-            QPushButton#analyzeBtn:pressed { background-color: rgba(25, 122, 67, 245); }
+            QPushButton#analyzeBtn:hover { background-color: rgb(35, 154, 85); }
+            QPushButton#analyzeBtn:pressed { background-color: rgb(25, 122, 67); }
             QPushButton#analyzeBtn:disabled {
-                background-color: rgba(31, 138, 76, 90);
-                color: rgba(255,255,255,160);
+                background-color: rgb(28, 62, 44);
+                color: rgb(180, 190, 185);
             }
             QPushButton#clearBtn {
-                background-color: rgba(20, 22, 28, 235);
-                color: rgba(255,255,255,245);
+                background-color: rgb(24, 26, 34);
+                color: #E8EEF2;
                 font-weight: 700;
                 border-radius: 12px;
                 padding: 10px;
-                border: 1px solid rgba(255,255,255,40);
+                border: 1px solid rgb(50, 54, 66);
             }
-            QPushButton#clearBtn:hover { background-color: rgba(28, 30, 38, 245); }
-            QPushButton#clearBtn:pressed { background-color: rgba(16, 18, 24, 245); }
+            QPushButton#clearBtn:hover { background-color: rgb(32, 34, 42); }
+            QPushButton#clearBtn:pressed { background-color: rgb(18, 20, 28); }
             QToolButton#settingsBtn {
-                background-color: rgba(20, 22, 28, 235);
-                color: rgba(255,255,255,245);
+                background-color: rgb(24, 26, 34);
+                color: #E8EEF2;
                 font-weight: 900;
                 border-radius: 12px;
                 padding: 10px 12px;
-                border: 1px solid rgba(255,255,255,80);
+                border: 1px solid rgb(58, 62, 74);
                 text-align: left;
             }
-            QToolButton#settingsBtn:hover { background-color: rgba(28, 30, 38, 245); }
-            QToolButton#settingsBtn:pressed { background-color: rgba(16, 18, 24, 245); }
+            QToolButton#settingsBtn:hover { background-color: rgb(32, 34, 42); }
+            QToolButton#settingsBtn:pressed { background-color: rgb(18, 20, 28); }
             QPushButton#closeBtn {
-                background-color: rgba(231, 76, 60, 235);
-                color: rgba(255,255,255,240);
+                background-color: rgb(192, 57, 43);
+                color: white;
                 font-weight: 800;
                 border-radius: 12px;
                 padding: 10px;
-                border: 1px solid rgba(255,255,255,40);
+                border: 1px solid rgb(140, 40, 30);
             }
-            QPushButton#closeBtn:hover { background-color: rgba(231, 76, 60, 245); }
-            QPushButton#closeBtn:pressed { background-color: rgba(200, 55, 45, 245); }
-            QSpinBox#tireSpin, QSpinBox#pitSpin {
-                background-color: rgba(8, 10, 14, 215);
+            QPushButton#closeBtn:hover { background-color: rgb(210, 65, 50); }
+            QPushButton#closeBtn:pressed { background-color: rgb(165, 48, 36); }
+            QSpinBox#tireSpin, QSpinBox#pitSpin, QComboBox#pitSpin, QLineEdit#pitSpin {
+                background-color: rgb(18, 20, 28);
                 color: white;
                 border-radius: 10px;
                 padding: 8px 12px;
-                border: 1px solid rgba(255,255,255,40);
+                border: 1px solid rgb(50, 54, 66);
                 min-width: 110px;
                 font-weight: 700;
                 font-size: 14px;
             }
             QSpinBox#tireSpin::up-button, QSpinBox#tireSpin::down-button,
-            QSpinBox#pitSpin::up-button, QSpinBox#pitSpin::down-button {
+            QSpinBox#pitSpin::up-button, QSpinBox#pitSpin::down-button,
+            QComboBox#pitSpin::drop-down {
                 width: 34px;
                 border-radius: 10px;
-                background: rgba(255,255,255,55);
-                border: 1px solid rgba(255,255,255,80);
+                background: rgb(42, 46, 58);
+                border: 1px solid rgb(58, 62, 74);
             }
             QSpinBox#tireSpin::up-button:hover, QSpinBox#tireSpin::down-button:hover,
             QSpinBox#pitSpin::up-button:hover, QSpinBox#pitSpin::down-button:hover {
-                background: rgba(255,255,255,75);
+                background: rgb(52, 56, 68);
             }
             QSpinBox#tireSpin::up-button:pressed, QSpinBox#tireSpin::down-button:pressed,
             QSpinBox#pitSpin::up-button:pressed, QSpinBox#pitSpin::down-button:pressed {
-                background: rgba(255,255,255,45);
+                background: rgb(36, 40, 50);
             }
             QSpinBox#tireSpin::up-arrow, QSpinBox#pitSpin::up-arrow {
                 width: 18px;
@@ -252,9 +314,13 @@ class AIRaceEngineer(QWidget):
                 image: url("assets/spin_down.svg");
             }
             QWidget#settingsPanel {
-                background-color: rgb(22, 24, 32);
-                border: 1px solid rgba(255, 255, 255, 70);
+                background-color: rgb(18, 20, 28);
+                border: 1px solid rgb(50, 54, 66);
                 border-radius: 12px;
+            }
+            QWidget#mainColumn {
+                background: transparent;
+                border: none;
             }
             QLabel#settingsSectionTitle {
                 color: rgba(190, 200, 215, 255);
@@ -274,82 +340,218 @@ class AIRaceEngineer(QWidget):
                 padding: 0 0 4px 0;
             }
             QToolButton#toggleChip {
-                background-color: rgba(55, 58, 70, 255);
-                color: rgba(255, 255, 255, 245);
+                background-color: rgb(55, 58, 70);
+                color: #E8EEF2;
                 font-weight: 800;
                 font-size: 12px;
                 border-radius: 14px;
                 padding: 6px 14px;
-                border: 1px solid rgba(255, 255, 255, 45);
+                border: 1px solid rgb(68, 72, 84);
                 min-width: 52px;
                 max-width: 52px;
             }
             QToolButton#toggleChip:hover {
-                background-color: rgba(65, 68, 82, 255);
+                background-color: rgb(65, 68, 82);
             }
             QToolButton#toggleChip:checked {
-                background-color: rgba(31, 138, 76, 255);
-                border: 1px solid rgba(180, 255, 200, 70);
+                background-color: rgb(31, 138, 76);
+                border: 1px solid rgb(45, 160, 95);
             }
             QToolButton#toggleChip:checked:hover {
-                background-color: rgba(35, 154, 85, 255);
+                background-color: rgb(35, 154, 85);
             }
             QToolButton#toggleChip:disabled {
-                color: rgba(255, 255, 255, 120);
-                background-color: rgba(40, 42, 50, 200);
+                color: rgb(140, 145, 155);
+                background-color: rgb(36, 38, 46);
+            }
+            QWidget#lanPanel {
+                background-color: rgb(18, 20, 28);
+                border: 1px solid rgb(50, 54, 66);
+                border-radius: 12px;
+            }
+            QLabel#lanPanelTitle {
+                color: rgba(190, 200, 215, 255);
+                font-size: 11px;
+                font-weight: 800;
+                background: transparent;
+                border: none;
+                padding: 0;
+                letter-spacing: 0.04em;
+            }
+            QListWidget#lanDeviceList {
+                background-color: rgb(14, 16, 22);
+                color: #E8EEF2;
+                border: 1px solid rgb(42, 46, 58);
+                border-radius: 10px;
+                padding: 4px;
+                outline: none;
+            }
+            QListWidget#lanDeviceList::item {
+                padding: 10px 8px;
+                border-radius: 8px;
+            }
+            QListWidget#lanDeviceList::item:selected {
+                background-color: rgb(31, 138, 76);
+                color: white;
+            }
+            QListWidget#lanDeviceList::item:hover {
+                background-color: rgb(32, 34, 42);
             }
             """
         )
+        if self._is_receiver:
+            self.setStyleSheet(self.styleSheet() + RECEIVER_QSS)
 
-        self.label = QLabel("Engineer Standby")
-        self.label.setObjectName("statusLabel")
-        self.label.setAlignment(Qt.AlignCenter)
-        self.label.setWordWrap(True)
-        self.label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self._lan_panel: QWidget | None = None
+        self._lan_discovery: LanDeviceDiscovery | None = None
+
+        self.advice_panel = QWidget()
+        self.advice_panel.setObjectName("advicePanel")
+        advice_layout = QVBoxLayout(self.advice_panel)
+        advice_layout.setContentsMargins(14, 12, 14, 14)
+        advice_layout.setSpacing(8)
+        self.advice_header = QLabel("Engineer call" if self._is_receiver else "RACE ENGINEER")
+        self.advice_header.setObjectName("adviceHeader")
+        self.advice_label = QLabel(_standby_advice_text(self._is_receiver))
+        self.advice_label.setObjectName("adviceStandby" if self._is_receiver else "adviceText")
+        self.advice_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.advice_label.setWordWrap(True)
+        self.advice_label.setMinimumHeight(200 if self._is_receiver else 96)
+        self.advice_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        if not self._is_receiver:
+            advice_layout.addWidget(self.advice_header)
+            advice_layout.addWidget(self.advice_label)
 
         top_row = QHBoxLayout()
         top_row.setContentsMargins(0, 0, 0, 0)
-        self.conn_badge = QLabel("iRacing: …")
-        self.conn_badge.setObjectName("connBadge")
+        self.conn_badge = QLabel("Telemetry: …" if self._is_receiver else "iRacing: …")
+        self.conn_badge.setObjectName("statusPill" if self._is_receiver else "connBadge")
+        self.ai_badge = QLabel("AI · Idle")
+        self.ai_badge.setObjectName("statusPill" if self._is_receiver else "connBadge")
         top_row.addWidget(self.conn_badge)
-        self.ai_badge = QLabel("AI: Idle")
-        self.ai_badge.setObjectName("connBadge")
         top_row.addWidget(self.ai_badge)
         top_row.addStretch(1)
 
         self.token_label = QLabel("")
-        self.token_label.setObjectName("subLabel")
-        self.token_label.setWordWrap(True)
+        self.token_label.setObjectName("statusMeta" if self._is_receiver else "subLabel")
+        self.token_label.setWordWrap(not self._is_receiver)
+        if self._is_receiver:
+            self.token_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.token_label.setToolTip(
             "Input and output = prior (Settings) + counted since install. "
             f"Cost estimate: ${BEDROCK_USD_PER_MILLION_INPUT:g} per 1M input, "
             f"${BEDROCK_USD_PER_MILLION_OUTPUT:g} per 1M output (not official AWS billing)."
         )
+        top_row.addWidget(self.token_label)
 
-        self.rejoin_label = None
-        if self._feature_rejoin:
-            self.rejoin_label = QLabel("Pit-road impact: …")
-            self.rejoin_label.setObjectName("subLabel")
-            # Hidden until the AI actually recommends a PIT.
-            self.rejoin_label.setVisible(False)
+        self._header_widget: QWidget | None = None
+        self._advice_card: QWidget | None = None
+        self._action_bar: QWidget | None = None
+
+        if self._role == "receiver":
+            self.lan_panel, lan_inner = make_card(
+                "STEP 1",
+                "Connect to sim PC",
+                "Pick the machine running iRacing in broadcaster mode. Advice is read aloud there.",
+            )
+            self.lan_panel.setObjectName("card")
+            lan_toolbar = QHBoxLayout()
+            lan_toolbar.setContentsMargins(0, 0, 0, 0)
+            lan_toolbar.addStretch(1)
+            self.lan_refresh_btn = QPushButton("Refresh")
+            self.lan_refresh_btn.setObjectName("ghostBtn")
+            self.lan_refresh_btn.setCursor(Qt.PointingHandCursor)
+            self.lan_refresh_btn.clicked.connect(self._refresh_lan_device_list)
+            lan_toolbar.addWidget(self.lan_refresh_btn)
+            self.lan_device_list = QListWidget()
+            self.lan_device_list.setObjectName("lanDeviceList")
+            self.lan_device_list.setMinimumHeight(108)
+            self.lan_device_list.setMaximumHeight(180)
+            self.lan_device_list.itemClicked.connect(self._on_lan_device_clicked)
+            self.lan_status_label = QLabel("")
+            self.lan_status_label.setObjectName("cardHint")
+            lan_inner.addLayout(lan_toolbar)
+            lan_inner.addWidget(self.lan_device_list)
+            lan_inner.addWidget(self.lan_status_label)
+            self._lan_panel = self.lan_panel
+
+            self._advice_card, advice_card_layout = make_card(
+                "STEP 2",
+                "Review engineer call",
+                "Press Analyze when you want a pit/strategy recommendation.",
+            )
+            self._advice_card.setObjectName("card")
+            advice_card_layout.addWidget(self.advice_label, 1)
+
+            self._lan_discovery = LanDeviceDiscovery(self)
+            self._lan_discovery.devices_changed.connect(self._refresh_lan_device_list)
+            self._lan_discovery.start()
+            self._refresh_lan_device_list()
+
+        self.rejoin_label = QLabel("Pit-road impact: …")
+        self.rejoin_label.setObjectName("cardHint" if self._is_receiver else "subLabel")
+        self.rejoin_label.setWordWrap(True)
+        self.rejoin_label.setVisible(False)
+        if not bool(self._config.get("show_pit_impact", False)):
+            self.rejoin_label.hide()
 
         self.btn = QPushButton(BTN_DISCONNECTED)
         self.btn.setObjectName("analyzeBtn")
         self.btn.setCursor(Qt.PointingHandCursor)
+        self.btn.setMinimumHeight(52 if self._is_receiver else 48)
         self.btn.clicked.connect(self.trigger_ai_request)
+
+        self.hotkey_hint = QLabel("")
+        self.hotkey_hint.setObjectName("settingsHint")
+        self.hotkey_hint.setWordWrap(True)
+
+        action_col = QVBoxLayout()
+        action_col.setContentsMargins(0, 0, 0, 0)
+        action_col.setSpacing(4)
+        if not self._is_receiver:
+            action_col.addWidget(self.btn)
+            action_col.addWidget(self.hotkey_hint)
 
         tire_row = QHBoxLayout()
         tire_row.setContentsMargins(0, 0, 0, 0)
-        tire_label = QLabel("Fresh tire sets remaining")
+        tire_label = QLabel("Tire sets left")
         tire_label.setObjectName("subLabel")
         self.tire_spin = QSpinBox()
         self.tire_spin.setObjectName("tireSpin")
         self.tire_spin.setMinimum(0)
         self.tire_spin.setMaximum(99)
         self.tire_spin.setValue(2)
-        tire_row.addWidget(tire_label)
-        tire_row.addWidget(self.tire_spin)
-        tire_row.addStretch(1)
+        pit_label = QLabel("Pit-road loss")
+        pit_label.setObjectName("subLabel")
+        self.pit_spin = QSpinBox()
+        self.pit_spin.setObjectName("pitSpin")
+        self.pit_spin.setMinimum(0)
+        self.pit_spin.setMaximum(300)
+        self.pit_spin.setSuffix(" s")
+        self.pit_spin.setValue(8)
+        self.pit_spin.setToolTip("Seconds lost versus green-flag laps (entry + stop + exit).")
+        self.pit_spin.valueChanged.connect(self._on_pit_spin_changed)
+        if self._is_receiver:
+            strategy_row = None
+            self._action_bar = QWidget()
+            self._action_bar.setObjectName("actionBar")
+            action_bar_layout = QHBoxLayout(self._action_bar)
+            action_bar_layout.setContentsMargins(16, 14, 16, 14)
+            action_bar_layout.setSpacing(16)
+            action_bar_layout.addLayout(make_field_column("Pit-road loss (sec)", self.pit_spin))
+            action_bar_layout.addLayout(make_field_column("Fresh tire sets", self.tire_spin))
+            action_bar_layout.addStretch(1)
+            self.clear_btn = QPushButton("Clear")
+            self.clear_btn.setObjectName("clearBtn")
+            self.clear_btn.setCursor(Qt.PointingHandCursor)
+            self.clear_btn.clicked.connect(self.clear_and_cancel)
+            action_bar_layout.addWidget(self.clear_btn)
+            action_bar_layout.addWidget(self.btn)
+        else:
+            strategy_row = None
+            tire_row.addWidget(tire_label)
+            tire_row.addWidget(self.tire_spin)
+            tire_row.addStretch(1)
 
         settings_toggle_row = QHBoxLayout()
         settings_toggle_row.setContentsMargins(0, 0, 0, 0)
@@ -365,21 +567,12 @@ class AIRaceEngineer(QWidget):
         self.settings_toggle.setMinimumHeight(40)
         settings_toggle_row.addWidget(self.settings_toggle, 1)
 
-        pit_row = QHBoxLayout()
-        pit_row.setContentsMargins(0, 0, 0, 0)
-        pit_label = QLabel("Pit-road loss")
-        pit_label.setObjectName("subLabel")
-        self.pit_spin = QSpinBox()
-        self.pit_spin.setObjectName("pitSpin")
-        self.pit_spin.setMinimum(0)
-        self.pit_spin.setMaximum(300)
-        self.pit_spin.setSuffix(" s")
-        self.pit_spin.setValue(8)
-        self.pit_spin.setToolTip("Seconds lost versus green-flag laps (entry + stop + exit).")
-        self.pit_spin.valueChanged.connect(self._on_pit_spin_changed)
-        pit_row.addWidget(pit_label)
-        pit_row.addWidget(self.pit_spin)
-        pit_row.addStretch(1)
+        if not self._is_receiver:
+            pit_row = QHBoxLayout()
+            pit_row.setContentsMargins(0, 0, 0, 0)
+            pit_row.addWidget(pit_label)
+            pit_row.addWidget(self.pit_spin)
+            pit_row.addStretch(1)
 
         auto_pit_row = QHBoxLayout()
         auto_pit_row.setContentsMargins(0, 0, 0, 0)
@@ -420,26 +613,85 @@ class AIRaceEngineer(QWidget):
         auto_clear_row.addWidget(self.clear_after_spin)
         auto_clear_row.addWidget(self.auto_clear_toggle)
 
-        clear_hint = QLabel("Off = message stays until you clear or request again.")
-        clear_hint.setObjectName("settingsHint")
-        clear_hint.setWordWrap(True)
+        clear_hint = self._setting_desc("Off keeps the last call on screen until you clear or analyze again.")
+
+        timeout_row = QHBoxLayout()
+        timeout_row.setContentsMargins(0, 0, 0, 0)
+        timeout_label = QLabel("Request timeout")
+        timeout_label.setObjectName("subLabel")
+        self.request_timeout_spin = QSpinBox()
+        self.request_timeout_spin.setObjectName("pitSpin")
+        self.request_timeout_spin.setMinimum(REQUEST_TIMEOUT_MIN_SEC)
+        self.request_timeout_spin.setMaximum(REQUEST_TIMEOUT_MAX_SEC)
+        self.request_timeout_spin.setSuffix(" s")
+        self.request_timeout_spin.setValue(int(self._config.get("request_timeout_sec", DEFAULT_REQUEST_TIMEOUT_SEC)))
+        self.request_timeout_spin.setToolTip("Re-enables Analyze if Bedrock does not respond in time.")
+        timeout_row.addWidget(timeout_label)
+        timeout_row.addWidget(self.request_timeout_spin)
+        timeout_row.addStretch(1)
+
+        timeout_hint = self._setting_desc("Unlocks Analyze if the AI hangs or never finishes.")
+
+        rejoin_row = QHBoxLayout()
+        rejoin_row.setContentsMargins(0, 0, 0, 0)
+        rejoin_label_setting = QLabel("Show pit-impact line")
+        rejoin_label_setting.setObjectName("subLabel")
+        self.show_pit_impact_toggle = self._pill_toggle(bool(self._config.get("show_pit_impact", False)))
+        self.show_pit_impact_toggle.setToolTip(
+            "After a PIT call, shows estimated positions lost based on pit-road loss."
+        )
+        rejoin_row.addWidget(rejoin_label_setting)
+        rejoin_row.addStretch(1)
+        rejoin_row.addWidget(self.show_pit_impact_toggle)
+
+        rejoin_hint = self._setting_desc(
+            "Under yellow, shows on-track position vs lead-lap loss and restart rows."
+        )
+
+        voice_enable_row = QHBoxLayout()
+        voice_enable_row.setContentsMargins(0, 0, 0, 0)
+        voice_enable_label = QLabel("Voice enabled")
+        voice_enable_label.setObjectName("subLabel")
+        self.voice_enabled_toggle = self._pill_toggle(bool(self._config.get("voice_enabled", False)))
+        self.voice_enabled_toggle.setToolTip("Read engineer calls aloud on this PC (single-PC / local mode).")
+        voice_enable_row.addWidget(voice_enable_label)
+        voice_enable_row.addStretch(1)
+        voice_enable_row.addWidget(self.voice_enabled_toggle)
+
+        voice_sim_row = QHBoxLayout()
+        voice_sim_row.setContentsMargins(0, 0, 0, 0)
+        voice_sim_label = QLabel("Speak on sim PC")
+        voice_sim_label.setObjectName("subLabel")
+        self.voice_sim_toggle = self._pill_toggle(bool(self._config.get("voice_sim_enabled", True)))
+        self.voice_sim_toggle.setToolTip("Send finished calls to the sim PC for text-to-speech in the headset.")
+        voice_sim_row.addWidget(voice_sim_label)
+        voice_sim_row.addStretch(1)
+        voice_sim_row.addWidget(self.voice_sim_toggle)
+
+        voice_sim_desc = self._setting_desc("Reads the finished engineer call aloud on the sim PC.")
+        voice_why_desc = self._setting_desc("Also reads the WHY explanation line after the pit call.")
 
         voice_row = QHBoxLayout()
         voice_row.setContentsMargins(0, 0, 0, 0)
         voice_label = QLabel("Speak WHY after call")
         voice_label.setObjectName("subLabel")
         self.voice_why_toggle = self._pill_toggle(bool(self._config.get("voice_read_why", False)))
-        self.voice_why_toggle.setToolTip("After the action line, reads the WHY line aloud (if voice is enabled).")
-        if not self._feature_voice:
-            self.voice_why_toggle.setEnabled(False)
-            self.voice_why_toggle.setToolTip("Set AIRACE_FEATURE_VOICE=1 to enable speech.")
+        self.voice_why_toggle.setToolTip("After the action line, reads the WHY line aloud.")
         voice_row.addWidget(voice_label)
         voice_row.addStretch(1)
         voice_row.addWidget(self.voice_why_toggle)
 
-        voice_hint = QLabel("Voice uses macOS `say`, Windows SAPI, or `espeak` on Linux when the feature flag is on.")
-        voice_hint.setObjectName("settingsHint")
-        voice_hint.setWordWrap(True)
+        voice_hint = self._setting_desc(
+            "Sim PC: macOS say, Windows SAPI, or espeak."
+            if self._is_receiver
+            else "Reads calls on this PC using macOS say, Windows SAPI, or espeak."
+        )
+
+        auto_pit_desc = self._setting_desc("Sets pit-road loss from track length when telemetry connects.")
+        pit_defaults_desc = self._setting_desc("Immediately applies the track-length pit-loss estimate.")
+
+        prior_in_desc = self._setting_desc("Input tokens you used on Bedrock before this app.")
+        prior_out_desc = self._setting_desc("Output tokens you used on Bedrock before this app.")
 
         prior_in_row = QHBoxLayout()
         prior_in_row.setContentsMargins(0, 0, 0, 0)
@@ -476,39 +728,155 @@ class AIRaceEngineer(QWidget):
         prior_hint.setObjectName("settingsHint")
         prior_hint.setWordWrap(True)
 
+        hotkey_enable_desc = self._setting_desc("Turn off to use only the Analyze button.")
+        hotkey_combo_desc = self._setting_desc("Key that triggers Analyze (default: Spacebar).")
+
+        hotkey_row = QHBoxLayout()
+        hotkey_row.setContentsMargins(0, 0, 0, 0)
+        hotkey_label = QLabel("Analyze hotkey")
+        hotkey_label.setObjectName("subLabel")
+        self.hotkey_combo = QComboBox()
+        self.hotkey_combo.setObjectName("pitSpin")
+        for k in HOTKEY_CHOICES:
+            self.hotkey_combo.addItem(hotkey_display_label(k), k)
+        _hk = normalize_hotkey(str(self._config.get("analyze_hotkey", DEFAULT_HOTKEY)))
+        idx = self.hotkey_combo.findData(_hk)
+        self.hotkey_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        hotkey_row.addWidget(hotkey_label)
+        hotkey_row.addWidget(self.hotkey_combo)
+        hotkey_row.addStretch(1)
+
+        hotkey_enable_row = QHBoxLayout()
+        hotkey_enable_row.setContentsMargins(0, 0, 0, 0)
+        hotkey_enable_label = QLabel("Hotkey enabled")
+        hotkey_enable_label.setObjectName("subLabel")
+        self.hotkey_enabled_toggle = self._pill_toggle(bool(self._config.get("analyze_hotkey_enabled", True)))
+        hotkey_enable_row.addWidget(hotkey_enable_label)
+        hotkey_enable_row.addStretch(1)
+        hotkey_enable_row.addWidget(self.hotkey_enabled_toggle)
+
+        hotkey_hint_settings = self._setting_desc(
+            "On Mac, grant Accessibility for a global hotkey outside this window."
+            if self._is_receiver
+            else "Bind the same F-key in iRacing for a wheel button. Global on Windows."
+        )
+
         self._save_config_timer = QTimer(self)
         self._save_config_timer.setSingleShot(True)
         self._save_config_timer.timeout.connect(self._save_config)
         self.clear_after_spin.valueChanged.connect(self._schedule_save_config)
         self.prior_input_spin.valueChanged.connect(self._schedule_save_config)
         self.prior_output_spin.valueChanged.connect(self._schedule_save_config)
-        self.voice_why_toggle.toggled.connect(lambda _v: self._schedule_save_config(0))
+        self.request_timeout_spin.valueChanged.connect(self._schedule_save_config)
+        self.voice_enabled_toggle.toggled.connect(self._on_voice_settings_changed)
+        self.voice_sim_toggle.toggled.connect(self._on_voice_settings_changed)
+        self.voice_why_toggle.toggled.connect(self._on_voice_settings_changed)
+        self.show_pit_impact_toggle.toggled.connect(self._on_show_pit_impact_toggled)
         self.auto_track_pit_toggle.toggled.connect(lambda _v: self._schedule_save_config(0))
         self.auto_clear_toggle.toggled.connect(self._on_auto_clear_toggled)
+        self.hotkey_enabled_toggle.toggled.connect(self._on_hotkey_settings_changed)
+        self.hotkey_combo.currentTextChanged.connect(self._on_hotkey_settings_changed)
 
         self.settings_widget = QWidget()
         self.settings_widget.setObjectName("settingsPanel")
         settings_layout = QVBoxLayout()
         settings_layout.setContentsMargins(12, 10, 12, 12)
         settings_layout.setSpacing(8)
-        settings_layout.addWidget(self._settings_heading("RACE · Pit"))
-        settings_layout.addLayout(pit_row)
-        settings_layout.addLayout(auto_pit_row)
-        settings_layout.addWidget(self.pit_defaults_btn)
-        settings_layout.addWidget(self._settings_heading("ADVICE"))
-        settings_layout.addLayout(auto_clear_row)
-        settings_layout.addWidget(clear_hint)
-        settings_layout.addWidget(self._settings_heading("VOICE"))
-        settings_layout.addLayout(voice_row)
-        settings_layout.addWidget(voice_hint)
-        settings_layout.addWidget(self._settings_heading("USAGE · Prior tokens"))
-        settings_layout.addLayout(prior_in_row)
-        settings_layout.addLayout(prior_out_row)
-        settings_layout.addWidget(prior_hint)
-        self.settings_widget.setLayout(settings_layout)
-        self.settings_widget.setVisible(False)
+
+        self._sidebar_scroll = None
+        if self._is_receiver:
+            self.sidebar_inner = QWidget()
+            self.sidebar_inner.setObjectName("settingsPanel")
+            sidebar_root = QVBoxLayout(self.sidebar_inner)
+            sidebar_root.setContentsMargins(12, 10, 12, 12)
+            sidebar_root.setSpacing(10)
+
+            usage_sec, usage_body = make_collapsible_section("USAGE", expanded=True)
+            usage_body.addLayout(prior_in_row)
+            usage_body.addWidget(prior_in_desc)
+            usage_body.addLayout(prior_out_row)
+            usage_body.addWidget(prior_out_desc)
+            usage_body.addWidget(prior_hint)
+            sidebar_root.addWidget(usage_sec)
+
+            advice_sec, advice_body = make_collapsible_section("ADVICE", expanded=True)
+            advice_body.addLayout(auto_clear_row)
+            advice_body.addWidget(clear_hint)
+            advice_body.addLayout(timeout_row)
+            advice_body.addWidget(timeout_hint)
+            advice_body.addLayout(rejoin_row)
+            advice_body.addWidget(rejoin_hint)
+            sidebar_root.addWidget(advice_sec)
+
+            pit_sec, pit_body = make_collapsible_section("PIT", expanded=False)
+            pit_body.addLayout(auto_pit_row)
+            pit_body.addWidget(auto_pit_desc)
+            pit_body.addWidget(self.pit_defaults_btn)
+            pit_body.addWidget(pit_defaults_desc)
+            sidebar_root.addWidget(pit_sec)
+
+            voice_sec, voice_body = make_collapsible_section("VOICE", expanded=True)
+            voice_body.addLayout(voice_sim_row)
+            voice_body.addWidget(voice_sim_desc)
+            voice_body.addLayout(voice_row)
+            voice_body.addWidget(voice_why_desc)
+            voice_body.addWidget(voice_hint)
+            sidebar_root.addWidget(voice_sec)
+
+            hotkey_sec, hotkey_body = make_collapsible_section("HOTKEY", expanded=False)
+            hotkey_body.addLayout(hotkey_enable_row)
+            hotkey_body.addWidget(hotkey_enable_desc)
+            hotkey_body.addLayout(hotkey_row)
+            hotkey_body.addWidget(hotkey_combo_desc)
+            hotkey_body.addWidget(hotkey_hint_settings)
+            sidebar_root.addWidget(hotkey_sec)
+
+            sidebar_root.addStretch(1)
+            self._sidebar_scroll = make_sidebar_scroll(self.sidebar_inner)
+            self._sidebar_scroll.setMinimumWidth(300)
+            self._sidebar_scroll.setMaximumWidth(340)
+            self._sidebar_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        else:
+            settings_layout.addWidget(self._settings_heading("RACE · Pit"))
+            settings_layout.addLayout(pit_row)
+            settings_layout.addLayout(auto_pit_row)
+            settings_layout.addWidget(self.pit_defaults_btn)
+            settings_layout.addWidget(self._settings_heading("ADVICE"))
+            settings_layout.addLayout(auto_clear_row)
+            settings_layout.addWidget(clear_hint)
+            settings_layout.addLayout(timeout_row)
+            settings_layout.addWidget(timeout_hint)
+            settings_layout.addLayout(rejoin_row)
+            settings_layout.addWidget(rejoin_hint)
+            settings_layout.addWidget(self._settings_heading("VOICE"))
+            settings_layout.addLayout(voice_enable_row)
+            settings_layout.addWidget(self._setting_desc("Reads engineer calls aloud on this PC."))
+            settings_layout.addLayout(voice_row)
+            settings_layout.addWidget(voice_why_desc)
+            settings_layout.addWidget(voice_hint)
+            settings_layout.addWidget(self._settings_heading("USAGE · Prior tokens"))
+            settings_layout.addLayout(prior_in_row)
+            settings_layout.addWidget(prior_in_desc)
+            settings_layout.addLayout(prior_out_row)
+            settings_layout.addWidget(prior_out_desc)
+            settings_layout.addWidget(prior_hint)
+            settings_layout.addWidget(self._settings_heading("HOTKEY"))
+            settings_layout.addLayout(hotkey_enable_row)
+            settings_layout.addWidget(hotkey_enable_desc)
+            settings_layout.addLayout(hotkey_row)
+            settings_layout.addWidget(hotkey_combo_desc)
+            settings_layout.addWidget(hotkey_hint_settings)
+            self.settings_widget.setLayout(settings_layout)
+
+        if self._is_receiver:
+            self.settings_widget.setVisible(False)
+            self.settings_toggle.setVisible(False)
+        else:
+            self.settings_widget.setVisible(False)
 
         def _toggle_settings(checked: bool):
+            if self._is_receiver:
+                return
             self.settings_widget.setVisible(checked)
             self.settings_toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
             self.layout.activate()
@@ -516,32 +884,100 @@ class AIRaceEngineer(QWidget):
 
         self.settings_toggle.toggled.connect(_toggle_settings)
 
-        self.clear_btn = QPushButton("CLEAR / CANCEL")
-        self.clear_btn.setObjectName("clearBtn")
-        self.clear_btn.setCursor(Qt.PointingHandCursor)
-        self.clear_btn.clicked.connect(self.clear_and_cancel)
+        if not self._is_receiver:
+            self.clear_btn = QPushButton("CLEAR / CANCEL")
+            self.clear_btn.setObjectName("clearBtn")
+            self.clear_btn.setCursor(Qt.PointingHandCursor)
+            self.clear_btn.clicked.connect(self.clear_and_cancel)
 
-        self.close_btn = QPushButton("CLOSE")
+        self.close_btn = QPushButton("Quit" if self._is_receiver else "CLOSE")
         self.close_btn.setObjectName("closeBtn")
         self.close_btn.setCursor(Qt.PointingHandCursor)
         self.close_btn.clicked.connect(self.close_app)
 
         bottom_row = QHBoxLayout()
         bottom_row.setContentsMargins(0, 0, 0, 0)
-        bottom_row.addWidget(self.clear_btn)
-        bottom_row.addWidget(self.close_btn)
+        if not self._is_receiver:
+            bottom_row.addWidget(self.clear_btn)
+            bottom_row.addWidget(self.close_btn)
 
-        self.layout.addLayout(top_row)
-        self.layout.addWidget(self.token_label)
-        if self.rejoin_label is not None:
-            self.layout.addWidget(self.rejoin_label)
-        self.layout.addWidget(self.label)
-        self.layout.addLayout(tire_row)
-        self.layout.addLayout(settings_toggle_row)
-        self.layout.addWidget(self.settings_widget)
-        self.layout.addWidget(self.btn)
-        self.layout.addLayout(bottom_row)
+        if self._is_receiver:
+            header = QWidget()
+            header.setObjectName("headerBar")
+            header_layout = QVBoxLayout(header)
+            header_layout.setContentsMargins(0, 0, 0, 0)
+            header_layout.setSpacing(10)
+            title_row = QHBoxLayout()
+            title_row.setContentsMargins(0, 0, 0, 0)
+            title_row.setSpacing(12)
+            title_block = QVBoxLayout()
+            title_block.setSpacing(2)
+            app_title = QLabel("AI Race Engineer")
+            app_title.setObjectName("appTitle")
+            app_sub = QLabel("Engineer workstation — voice plays on the sim PC")
+            app_sub.setObjectName("appSubtitle")
+            title_block.addWidget(app_title)
+            title_block.addWidget(app_sub)
+            title_row.addLayout(title_block, 1)
+            self.close_btn.setFixedHeight(34)
+            self.close_btn.setMinimumWidth(76)
+            title_row.addWidget(self.close_btn, 0, Qt.AlignTop)
+            header_layout.addLayout(title_row)
+            status_wrap = QWidget()
+            status_wrap.setObjectName("statusBar")
+            status_layout = QHBoxLayout(status_wrap)
+            status_layout.setContentsMargins(10, 8, 10, 8)
+            status_layout.setSpacing(8)
+            status_layout.addWidget(self.conn_badge)
+            status_layout.addWidget(self.ai_badge)
+            status_layout.addStretch(1)
+            status_layout.addWidget(self.token_label)
+            header_layout.addWidget(status_wrap)
+            self._header_widget = header
+            self.layout.addWidget(header)
+
+            left_col = QWidget()
+            left_col.setObjectName("mainColumn")
+            left_layout = QVBoxLayout(left_col)
+            left_layout.setContentsMargins(0, 0, 0, 0)
+            left_layout.setSpacing(14)
+            if self._lan_panel is not None:
+                left_layout.addWidget(self._lan_panel)
+            if self._advice_card is not None:
+                left_layout.addWidget(self._advice_card, 1)
+            if self._action_bar is not None:
+                left_layout.addWidget(self._action_bar)
+            if self.rejoin_label is not None:
+                left_layout.addWidget(self.rejoin_label)
+
+            split_row = QHBoxLayout()
+            split_row.setContentsMargins(0, 0, 0, 0)
+            split_row.setSpacing(20)
+            split_row.addWidget(left_col, 1)
+            if self._sidebar_scroll is not None:
+                split_row.addWidget(self._sidebar_scroll, 0)
+            self.layout.addLayout(split_row, 1)
+        else:
+            self.layout.addLayout(top_row)
+            if self._lan_panel is not None:
+                self.layout.addWidget(self._lan_panel)
+            self.layout.addWidget(self.advice_panel)
+            self.layout.addLayout(tire_row)
+            self.layout.addLayout(action_col)
+            if self.rejoin_label is not None:
+                self.layout.addWidget(self.rejoin_label)
+            self.layout.addLayout(settings_toggle_row)
+            self.layout.addWidget(self.settings_widget)
+
+        if not self._is_receiver:
+            self.layout.addLayout(bottom_row)
         self.setLayout(self.layout)
+
+        self._analyze_hotkey = AnalyzeHotkey(self._hotkey_trigger_analyze)
+        self._local_hotkey = QShortcut(QKeySequence(), self)
+        self._local_hotkey.setContext(Qt.ApplicationShortcut)
+        self._local_hotkey.activated.connect(self._hotkey_trigger_analyze)
+        self._apply_analyze_hotkey()
 
         self.ai_worker = BedrockWorker()
         self.ai_worker.partial.connect(self.display_partial)
@@ -579,24 +1015,26 @@ class AIRaceEngineer(QWidget):
         self._update_action_button_text()
         self._set_ai_status("Idle")
         self._refresh_bedrock_usage_label()
+        if self._role == "receiver" and self._receiver_link is not None:
+            self._connect_receiver_link()
 
         if self.rejoin_label is not None:
             # Intentionally blank/hidden until the first PIT recommendation.
             pass
 
+        if self._hotkey_migrated:
+            self._save_config()
+
     def _load_config(self) -> dict:
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+        return load_config()
 
     def _schedule_save_config(self, _val: int):
         # Debounce disk writes while user is clicking.
         self._save_config_timer.start(400)
 
     def _relayout_overlay(self):
+        if self._is_receiver:
+            return
         self.adjustSize()
         w = min(max(self.minimumWidth(), self.width()), self.maximumWidth())
         h = min(max(self.minimumHeight(), self.height()), self.maximumHeight())
@@ -624,7 +1062,9 @@ class AIRaceEngineer(QWidget):
         bo = po + int(self._config.get("bedrock_tokens_runtime_output", 0))
         charge = _bedrock_estimated_charge_usd(bi, bo)
         self.token_label.setText(
-            f"Bedrock: {bi:,} in · {bo:,} out · est. {_format_charge_usd(charge)} total"
+            f"est. {_format_charge_usd(charge)} · {bi:,} in · {bo:,} out"
+            if self._is_receiver
+            else f"Bedrock: {bi:,} in · {bo:,} out · est. {_format_charge_usd(charge)} total"
         )
 
     def _on_bedrock_usage_report(self, inp: int, outp: int):
@@ -633,6 +1073,20 @@ class AIRaceEngineer(QWidget):
         self._config["bedrock_tokens_runtime_input"] = int(self._config.get("bedrock_tokens_runtime_input", 0)) + inp
         self._config["bedrock_tokens_runtime_output"] = int(self._config.get("bedrock_tokens_runtime_output", 0)) + outp
         self._save_config()
+
+    def _on_voice_settings_changed(self, *_args):
+        self._schedule_save_config(0)
+
+    def _on_show_pit_impact_toggled(self, on: bool) -> None:
+        if on:
+            self.rejoin_label.show()
+        else:
+            self.rejoin_label.hide()
+            self.rejoin_label.setVisible(False)
+        self._schedule_save_config(0)
+
+    def _request_timeout_ms(self) -> int:
+        return int(self.request_timeout_spin.value()) * 1000
 
     def _save_config(self):
         try:
@@ -643,58 +1097,205 @@ class AIRaceEngineer(QWidget):
             data["auto_apply_track_pit_loss"] = bool(self.auto_track_pit_toggle.isChecked())
             data["bedrock_tokens_prior_input"] = int(self.prior_input_spin.value())
             data["bedrock_tokens_prior_output"] = int(self.prior_output_spin.value())
+            data["voice_enabled"] = bool(self.voice_enabled_toggle.isChecked())
+            data["voice_sim_enabled"] = bool(self.voice_sim_toggle.isChecked())
             data["voice_read_why"] = bool(self.voice_why_toggle.isChecked())
-            _sync_legacy_total_keys(data)
-            tmp = CONFIG_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp, CONFIG_PATH)
-            self._config = data
+            data["show_pit_impact"] = bool(self.show_pit_impact_toggle.isChecked())
+            data["request_timeout_sec"] = int(self.request_timeout_spin.value())
+            data["analyze_hotkey"] = self._current_hotkey()
+            data["analyze_hotkey_enabled"] = bool(self.hotkey_enabled_toggle.isChecked())
+            if self._role == "receiver":
+                data["race_link_host"] = str(getattr(self, "_link_host", "")).strip()
+                data["race_link_port"] = int(getattr(self, "_link_port", DEFAULT_RACE_LINK_PORT))
+            write_config(data)
+            self._config = load_config()
             self._refresh_bedrock_usage_label()
         except Exception:
             pass
 
     def _ensure_default_config_file(self):
-        # Create a config file on first run so racers can find/edit it.
-        if os.path.exists(CONFIG_PATH):
+        ensure_default_config_file()
+
+    def _refresh_lan_device_list(self) -> None:
+        if self._role != "receiver" or not hasattr(self, "lan_device_list"):
+            return
+        connected_host = ""
+        if self._receiver_link and self._receiver_link.is_linked():
+            connected_host = str(getattr(self, "_link_host", "")).strip()
+
+        self.lan_device_list.clear()
+        devices = self._lan_discovery.devices() if self._lan_discovery is not None else []
+        if not devices:
+            item = QListWidgetItem("No sim PCs found — run: python3 main.py --role broadcaster")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.lan_device_list.addItem(item)
+            if hasattr(self, "lan_status_label"):
+                self.lan_status_label.setText("Listening on LAN — start broadcaster on the sim PC.")
+        else:
+            for dev in devices:
+                host = dev.get("host", "")
+                port = dev.get("port", DEFAULT_RACE_LINK_PORT)
+                name = dev.get("name") or host
+                label = f"{name}  ·  {host}:{port}"
+                if dev.get("iracing"):
+                    label += "  ·  iRacing online"
+                elif dev.get("track"):
+                    label += f"  ·  {dev['track']}"
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, dev)
+                if connected_host and host == connected_host:
+                    item.setSelected(True)
+                self.lan_device_list.addItem(item)
+            if hasattr(self, "lan_status_label"):
+                n = len(devices)
+                self.lan_status_label.setText(f"{n} sim PC{'s' if n != 1 else ''} on LAN — click to connect.")
+
+        self.layout.activate()
+        self._relayout_overlay()
+
+    def _on_lan_device_clicked(self, item: QListWidgetItem) -> None:
+        dev = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(dev, dict):
+            return
+        host = str(dev.get("host") or "").strip()
+        if not host:
             return
         try:
-            tmp = CONFIG_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "clear_after_sec": 120,
-                        "auto_apply_track_pit_loss": True,
-                        "voice_read_why": False,
-                        "bedrock_tokens_prior_input": 0,
-                        "bedrock_tokens_prior_output": 0,
-                        "bedrock_tokens_runtime_input": 0,
-                        "bedrock_tokens_runtime_output": 0,
-                        "bedrock_tokens_input_total": 0,
-                        "bedrock_tokens_output_total": 0,
-                    },
-                    f,
-                )
-            os.replace(tmp, CONFIG_PATH)
-        except Exception:
-            pass
+            port = int(dev.get("port", DEFAULT_RACE_LINK_PORT))
+        except (TypeError, ValueError):
+            port = DEFAULT_RACE_LINK_PORT
+        self._link_host = host
+        self._link_port = port
+        self._connect_receiver_link()
+        self._schedule_save_config(0)
+        if hasattr(self, "lan_status_label"):
+            self.lan_status_label.setText(f"Connecting to {host}:{port}…")
+
+    def _connect_receiver_link(self) -> None:
+        if self._receiver_link is None:
+            return
+        host = str(getattr(self, "_link_host", self._link_host_boot)).strip()
+        port = int(getattr(self, "_link_port", self._link_port_boot))
+        if host:
+            self._receiver_link.connect_to(host, port)
+        else:
+            self._receiver_link.disconnect_link()
+            self.telemetry.set_link_up(False)
+
+    def _on_receiver_link_changed(self, up: bool) -> None:
+        self.telemetry.set_link_up(up)
+        self._update_connection_badge()
+        if self._role == "receiver":
+            self._refresh_lan_device_list()
+            if hasattr(self, "lan_status_label"):
+                if up:
+                    host = str(getattr(self, "_link_host", "")).strip()
+                    self.lan_status_label.setText(f"Connected to {host}")
+
+    def _on_remote_snapshot(self, msg: dict) -> None:
+        self.telemetry.ingest_snapshot(msg)
+        connected = self.telemetry.is_connected()
+        if connected and (self._last_sdk_connected is None or self._last_sdk_connected is False):
+            self._maybe_set_default_pit_loss()
+        self._last_sdk_connected = connected
+        self._update_connection_badge()
+        self._update_action_button_text()
+
+    def _style_status_pill(self, label: QLabel, tone: str) -> None:
+        if not self._is_receiver:
+            return
+        border = {
+            "ok": "#2d8a56",
+            "warn": "#b8922e",
+            "bad": "#b84a4a",
+            "info": "#3d8fd9",
+            "muted": "#404858",
+        }.get(tone, "#404858")
+        label.setStyleSheet(f"QLabel#statusPill {{ border-color: {border}; }}")
+
+    def _is_standby_advice(self, text: str) -> bool:
+        if not self._is_receiver:
+            return False
+        standby = _standby_advice_text(True)
+        return (
+            text == standby
+            or text.startswith("Waiting for live")
+            or text.startswith("Timed out")
+        )
+
+    def _set_advice_text(self, text: str):
+        self.advice_label.setText(text)
+        if self._is_receiver:
+            name = "adviceStandby" if self._is_standby_advice(text) else "adviceText"
+            if self.advice_label.objectName() != name:
+                self.advice_label.setObjectName(name)
+                self.advice_label.style().unpolish(self.advice_label)
+                self.advice_label.style().polish(self.advice_label)
+        self.layout.activate()
+        self._relayout_overlay()
+
+    def _current_hotkey(self) -> str:
+        data = self.hotkey_combo.currentData()
+        if data:
+            return normalize_hotkey(str(data))
+        return normalize_hotkey(self.hotkey_combo.currentText())
+
+    def _hotkey_trigger_analyze(self):
+        if self.btn.isEnabled():
+            self.trigger_ai_request()
+
+    def _on_hotkey_settings_changed(self, *_args):
+        self._apply_analyze_hotkey()
+        self._schedule_save_config(0)
+
+    def _apply_analyze_hotkey(self):
+        key = self._current_hotkey()
+        enabled = bool(self.hotkey_enabled_toggle.isChecked())
+        self._analyze_hotkey.stop()
+        self._local_hotkey.setKey(QKeySequence(hotkey_qt_sequence(key)))
+        self._local_hotkey.setEnabled(enabled)
+        global_ok = False
+        if enabled:
+            global_ok = self._analyze_hotkey.start(key)
+        label = hotkey_display_label(key)
+        if enabled and global_ok:
+            self.hotkey_hint.setText(
+                f"Hotkey: {label} — bind this key in iRacing for your wheel button (works while racing)."
+            )
+        elif enabled and sys.platform.startswith("darwin") and not mac_accessibility_trusted():
+            self.hotkey_hint.setText(
+                f"Hotkey: {label} — works while this window is focused. "
+                "For global hotkey: System Settings → Privacy & Security → Accessibility → enable Terminal or Python."
+            )
+        elif enabled:
+            self.hotkey_hint.setText(
+                f"Hotkey: {label} — works when this window is focused (install pynput on Mac for global)."
+            )
+        else:
+            self.hotkey_hint.setText("Hotkey off — use the Analyze button only.")
 
     def trigger_ai_request(self):
         self._idle_clear_timer.stop()
         self._partial_flush_timer.stop()
         self._partial_buffer = None
         if not self.telemetry.ensure_connected():
-            self.label.setText("ENGINEER: NO LINK TO SIM")
+            if self._role == "receiver":
+                if not (self._receiver_link and self._receiver_link.is_linked()):
+                    self._set_advice_text(_standby_advice_text(True))
+                else:
+                    self._set_advice_text("Waiting for live telemetry from the sim PC…")
+            else:
+                self._set_advice_text("ENGINEER: NO LINK TO SIM")
             return
 
         mode = self.telemetry.ui_mode()
-        self.label.setText(
+        self._set_advice_text(
             "Sketching race strategy (fuel & tires)…"
             if mode == "strategy"
             else "Reading the field & corners…"
         )
         self.btn.setEnabled(False)
-        self._request_watchdog.start(REQUEST_TIMEOUT_MS)
+        self._request_watchdog.start(self._request_timeout_ms())
         self._set_ai_status("Requesting")
 
         self._next_request_id += 1
@@ -714,8 +1315,8 @@ class AIRaceEngineer(QWidget):
         self._partial_buffer = None
         cancelled_id = self.ai_worker.cancel_active()
         self._active_request_id = 0
-        self.label.setText("Engineer Standby")
-        self.btn.setEnabled(True)
+        self._set_advice_text(_standby_advice_text(self._is_receiver))
+        self._update_action_button_text()
         if cancelled_id:
             self._set_ai_status("Cancelled")
         if cancelled_id:
@@ -737,8 +1338,8 @@ class AIRaceEngineer(QWidget):
             # iterating forever and the UI stays stuck even though we re-enabled Analyze.
             self.ai_worker.cancel_active()
             self._active_request_id = 0
-            self.label.setText("Timed out — hit Clear/Cancel or try again.")
-            self.btn.setEnabled(True)
+            self._set_advice_text("Timed out — hit Clear or try again.")
+            self._update_action_button_text()
             self._set_ai_status("Timed out")
 
     def display_advice(self, request_id: int, text: str):
@@ -747,10 +1348,8 @@ class AIRaceEngineer(QWidget):
         self._request_watchdog.stop()
         self._partial_flush_timer.stop()
         self._partial_buffer = None
-        self.label.setText(text)
-        self.btn.setEnabled(True)
-        self.layout.activate()
-        self._relayout_overlay()
+        self._set_advice_text(text)
+        self._update_action_button_text()
         # Mark request complete and schedule auto-clear if no further interaction.
         self._active_request_id = 0
         clear_ms = (
@@ -759,47 +1358,37 @@ class AIRaceEngineer(QWidget):
         if clear_ms > 0:
             self._idle_clear_timer.start(clear_ms)
         self._set_ai_status("Error" if str(text).startswith("AI Error") else "Done")
-        if self.rejoin_label is not None:
+        if self.show_pit_impact_toggle.isChecked():
             self._update_pit_impact_from_advice(str(text))
-        if self._feature_voice and not str(text).startswith("AI Error"):
-            full = str(text)
-            head = _first_nonempty_line(full)
-            action = head.split("—", 1)[0].strip() if head else ""
-            threading.Thread(target=self._speak_action, args=(action,), daemon=True).start()
-            if self.voice_why_toggle.isChecked():
-                why = ""
-                for line in full.replace("\r\n", "\n").split("\n"):
-                    s = line.strip()
-                    if s.upper().startswith("WHY:"):
-                        why = s[4:].strip()
-                        break
-                if why:
-                    def speak_why():
-                        try:
-                            import time as _t
-                            _t.sleep(0.25)
-                        except Exception:
-                            pass
-                        self._speak_action(why)
-
-                    threading.Thread(target=speak_why, daemon=True).start()
+        self._relay_advice_to_broadcaster(str(text), partial=False)
+        if self._role == "receiver" and hasattr(self.telemetry, "record_advice"):
+            self.telemetry.record_advice(str(text))
+        if self._should_speak_locally() and not str(text).startswith("AI Error"):
+            include_why = bool(self.voice_why_toggle.isChecked())
+            threading.Thread(
+                target=speak_engineer_advice,
+                args=(str(text),),
+                kwargs={"include_why": include_why},
+                daemon=True,
+            ).start()
 
     def _flush_partial(self):
         if self._active_request_id == 0 or self._partial_buffer is None:
             return
-        self.label.setText(self._partial_buffer)
-        self.layout.activate()
-        self.adjustSize()
+        self._set_advice_text(self._partial_buffer)
 
     def _clear_if_idle(self):
         # Only clear if we are not currently waiting on a request.
         if self._active_request_id == 0 and self.btn.isEnabled():
-            self.label.setText("Engineer Standby")
-            self.layout.activate()
-            self._relayout_overlay()
+            self._set_advice_text(_standby_advice_text(self._is_receiver))
             self._set_ai_status("Idle")
 
     def close_app(self):
+        self._analyze_hotkey.stop()
+        if self._lan_discovery is not None:
+            self._lan_discovery.stop()
+        if self._receiver_link is not None:
+            self._receiver_link.disconnect_link()
         # Quit the entire program (not just hide the overlay widget).
         app = QApplication.instance()
         if app is not None:
@@ -808,6 +1397,21 @@ class AIRaceEngineer(QWidget):
             self.close()
 
     def _update_connection_badge(self):
+        if self._role == "receiver":
+            link = bool(self._receiver_link and self._receiver_link.is_linked())
+            feed = self.telemetry.is_connected()
+            if feed:
+                self.conn_badge.setText("Telemetry · Live")
+                self._style_status_pill(self.conn_badge, "ok")
+            elif link:
+                self.conn_badge.setText("Telemetry · Waiting")
+                self._style_status_pill(self.conn_badge, "warn")
+            else:
+                self.conn_badge.setText("Telemetry · Offline")
+                self._style_status_pill(self.conn_badge, "bad")
+            self._update_action_button_text()
+            return
+
         connected = self.telemetry.is_connected()
         if connected:
             self.conn_badge.setText("iRacing: Online")
@@ -828,6 +1432,18 @@ class AIRaceEngineer(QWidget):
         self._update_action_button_text()
 
     def _update_action_button_text(self):
+        if self._role == "receiver":
+            linked = bool(self._receiver_link and self._receiver_link.is_linked())
+            live = self.telemetry.is_connected()
+            if not linked or not live:
+                self.btn.setText("Analyze")
+            elif self.telemetry.ui_mode() == "strategy":
+                self.btn.setText("Race strategy")
+            else:
+                self.btn.setText("Analyze")
+            if self._active_request_id == 0:
+                self.btn.setEnabled(linked and live)
+            return
         if not self.telemetry.is_connected():
             self.btn.setText(BTN_DISCONNECTED)
         elif self.telemetry.ui_mode() == "strategy":
@@ -881,8 +1497,20 @@ class AIRaceEngineer(QWidget):
         self.pit_spin.blockSignals(False)
 
     def _set_ai_status(self, status: str):
-        self.ai_badge.setText(f"AI: {status}")
+        self.ai_badge.setText(f"AI · {status}")
         status_l = (status or "").lower()
+        if self._is_receiver:
+            if status_l in ("idle", "done"):
+                self._style_status_pill(self.ai_badge, "ok")
+            elif status_l in ("requesting", "streaming"):
+                self._style_status_pill(self.ai_badge, "info")
+            elif status_l in ("timed out", "timeout"):
+                self._style_status_pill(self.ai_badge, "warn")
+            elif status_l in ("cancelled", "canceled"):
+                self._style_status_pill(self.ai_badge, "muted")
+            else:
+                self._style_status_pill(self.ai_badge, "bad")
+            return
         if status_l in ("idle", "done"):
             color = "rgba(46, 204, 113, 140)"
         elif status_l in ("requesting", "streaming"):
@@ -891,12 +1519,36 @@ class AIRaceEngineer(QWidget):
             color = "rgba(241, 196, 15, 170)"
         elif status_l in ("cancelled", "canceled"):
             color = "rgba(149, 165, 166, 170)"
-        else:  # error/unknown
+        else:
             color = "rgba(231, 76, 60, 170)"
         self.ai_badge.setStyleSheet(f"QLabel#connBadge {{ border-color: {color}; }}")
 
+    def _format_pit_impact_line(self, est: dict[str, Any], pit_in_laps: int) -> str:
+        lost = est.get("lost")
+        if not isinstance(lost, int):
+            return "Pit-road impact: unknown"
+        when = "now" if pit_in_laps == 0 else f"in {pit_in_laps} laps"
+        if est.get("caution"):
+            exit_p = est.get("exit_p")
+            lost_lead = est.get("lost_lead")
+            lda = est.get("lda") or 0
+            rows = est.get("grid_rows") or 0
+            parts = [f"Pit impact (yellow): pit {when}"]
+            if isinstance(exit_p, int):
+                parts.append(f"~P{exit_p} on track")
+            if isinstance(lost_lead, int) and lost_lead != lost:
+                parts.append(f"+{lost} spots on screen, ~{lost_lead} lead-lap")
+            elif lost:
+                parts.append(f"~{lost} spots")
+            if lda:
+                parts.append(f"{lda} lap-down stay out (pass on pit road)")
+            if rows:
+                parts.append(f"~{rows} rows back on restart grid")
+            return " · ".join(parts)
+        return f"Pit-road impact: pit {when}, likely give up ~{lost} spots"
+
     def _update_pit_impact_from_advice(self, text: str):
-        if self.rejoin_label is None:
+        if not self.show_pit_impact_toggle.isChecked():
             return
         # Expected format: ACTION — TIMING — REASON [tag] [H|M|L]
         head = _first_nonempty_line(text)
@@ -934,34 +1586,26 @@ class AIRaceEngineer(QWidget):
             return
 
         est = self.telemetry.predict_pit_position_loss(int(self.pit_spin.value()), int(pit_in_laps))
-        lost = est.get("lost")
-        if isinstance(lost, int):
-            when = "now" if pit_in_laps == 0 else f"in {pit_in_laps} laps"
-            self.rejoin_label.setText(f"Pit-road impact: pit {when}, likely give up ~{lost} spots")
-        else:
-            self.rejoin_label.setText("Pit-road impact: unknown")
+        self.rejoin_label.setText(self._format_pit_impact_line(est, int(pit_in_laps)))
 
-    def _speak_action(self, action: str):
-        # Feature-flagged. Speaks only the ACTION (STAY OUT / PIT / PIT NOW).
-        try:
-            a = (action or "").strip()
-            if not a:
-                return
-            if sys.platform.startswith("darwin"):
-                subprocess.run(["say", a], check=False)
-            elif sys.platform.startswith("win"):
-                # Built-in SAPI (no extra dependency)
-                # Avoid nested quoting issues by sanitizing before embedding in PowerShell.
-                safe = a.replace("'", " ").replace("\n", " ").replace("\r", " ")
-                ps = (
-                    "Add-Type -AssemblyName System.Speech; "
-                    "(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("
-                    + repr(safe)
-                    + ")"
-                )
-                subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=False)
-        except Exception:
-            pass
+    def _relay_advice_to_broadcaster(self, text: str, *, partial: bool = False) -> None:
+        if self._role != "receiver" or self._receiver_link is None:
+            return
+        if not self._receiver_link.is_linked():
+            return
+        self._receiver_link.send_advice(
+            text,
+            partial=partial,
+            speak=bool(self.voice_sim_toggle.isChecked()),
+            include_why=bool(self.voice_why_toggle.isChecked()),
+        )
+
+    def _should_speak_locally(self) -> bool:
+        if not bool(self.voice_enabled_toggle.isChecked()):
+            return False
+        if self._role == "receiver" and self._receiver_link is not None and self._receiver_link.is_linked():
+            return False
+        return True
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:

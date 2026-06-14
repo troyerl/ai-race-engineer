@@ -1,8 +1,11 @@
+import argparse
 import sys
 
-from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication
 
+from broadcaster_ui import BroadcasterWindow
+from race_link import DEFAULT_RACE_LINK_PORT
 from ui import AIRaceEngineer
 
 
@@ -21,7 +24,6 @@ def _resource_path(relative_path: str) -> str:
 
 
 def _set_windows_app_user_model_id(app_id: str) -> None:
-    # Helps Windows taskbar grouping/icon for packaged apps.
     try:
         import ctypes
 
@@ -38,6 +40,23 @@ def main():
     except Exception:
         pass
 
+    parser = argparse.ArgumentParser(description="AI Race Engineer overlay")
+    parser.add_argument(
+        "--role",
+        choices=["local", "broadcaster", "receiver"],
+        default="local",
+        help=(
+            "local = iRacing + AI on same PC; "
+            "broadcaster = sim PC streams telemetry and speaks calls (no advice text); "
+            "receiver = engineer PC runs AI and shows advice"
+        ),
+    )
+    parser.add_argument("--bind", default="0.0.0.0", help="Broadcaster listen address (sim PC)")
+    parser.add_argument("--connect", default=None, help="Broadcaster LAN IP (receiver / AI PC)")
+    parser.add_argument("--port", type=int, default=None, help=f"TCP port (default {DEFAULT_RACE_LINK_PORT})")
+    args = parser.parse_args()
+    port = int(args.port) if args.port is not None else DEFAULT_RACE_LINK_PORT
+
     if sys.platform.startswith("win"):
         _set_windows_app_user_model_id("ai-race-engineer.overlay")
 
@@ -49,7 +68,14 @@ def main():
     icon_path = _resource_path("icon.png")
     icon = QIcon(icon_path)
     app.setWindowIcon(icon)
-    window = AIRaceEngineer()
+
+    if args.role == "broadcaster":
+        window = BroadcasterWindow(bind_host=args.bind, port=port)
+    elif args.role == "receiver":
+        window = AIRaceEngineer(role="receiver", link_host=args.connect, link_port=port)
+    else:
+        window = AIRaceEngineer(role="local")
+
     window.setWindowIcon(icon)
     window.show()
     sys.exit(app.exec())

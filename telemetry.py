@@ -42,6 +42,288 @@ def _sanitize_lap_count(v: Any) -> int | None:
     return i
 
 
+# CarIdxTrackSurface / TrkLoc (irsdk)
+_TRK_NOT_IN_WORLD = -1
+_TRK_OFF_TRACK = 0
+_TRK_IN_STALL = 1
+_TRK_APPROACHING_PITS = 2
+_TRK_ON_TRACK = 3
+
+_SURFACE_CODES = {
+    _TRK_NOT_IN_WORLD: "nw",
+    _TRK_OFF_TRACK: "off",
+    _TRK_IN_STALL: "stall",
+    _TRK_APPROACHING_PITS: "ap",
+    _TRK_ON_TRACK: "ot",
+}
+
+_PITTING_SURFACES = frozenset({_TRK_IN_STALL, _TRK_APPROACHING_PITS})
+
+
+def _surface_code(v: Any) -> str | None:
+    try:
+        return _SURFACE_CODES.get(int(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_pitting_surface(v: Any) -> bool:
+    try:
+        return int(v) in _PITTING_SURFACES
+    except (TypeError, ValueError):
+        return False
+
+
+def _parse_session_flags_bools(flags: Any, pits_open: Any = None) -> dict[str, bool]:
+    """Decode SessionFlags + PitsOpen into explicit booleans for strategy logic."""
+    out = {"yel": False, "cau": False, "grn": False, "pcl": False}
+    try:
+        flags_int = int(flags)
+    except (TypeError, ValueError):
+        flags_int = 0
+
+    Flags = getattr(irsdk, "Flags", None)
+    if Flags is not None:
+        for name, key in (
+            ("yellow", "yel"),
+            ("yellow_waving", "yel"),
+            ("caution", "cau"),
+            ("caution_waving", "cau"),
+            ("green", "grn"),
+        ):
+            bit = getattr(Flags, name, None)
+            if bit is not None:
+                try:
+                    if flags_int & int(bit):
+                        out[key] = True
+                except (TypeError, ValueError):
+                    pass
+
+    if pits_open is not None:
+        try:
+            out["pcl"] = not bool(pits_open)
+        except Exception:
+            pass
+    return out
+
+
+def _c_to_f(v: Any) -> float | None:
+    try:
+        if v is None:
+            return None
+        return round(float(v) * 9.0 / 5.0 + 32.0, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_corner_tire_wear(ir_get, corner: str) -> float | None:
+    """Average L/M/R tread remaining % for a corner, or PitSv*offset when in the stall."""
+    offset_key = f"PitSv{corner}Toffset"
+    off = ir_get(offset_key, None)
+    try:
+        if off is not None:
+            return round(float(off), 3)
+    except (TypeError, ValueError):
+        pass
+    vals: list[float] = []
+    for part in ("L", "M", "R"):
+        v = ir_get(f"{corner}wear{part}", None)
+        if v is None:
+            v = ir_get(f"{corner}wear", None)
+        try:
+            if v is not None:
+                vals.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    if not vals:
+        return None
+    return round(sum(vals) / len(vals), 3)
+
+
+def _read_tire_wear_corners(ir_get) -> dict[str, float] | None:
+    out: dict[str, float] = {}
+    for corner in ("LF", "RF", "LR", "RR"):
+        w = _read_corner_tire_wear(ir_get, corner)
+        if w is not None:
+            out[corner] = w
+    return out or None
+
+
+def _leader_lap_from_car_laps(laps: list | None) -> int | None:
+    best: int | None = None
+    if not isinstance(laps, (list, tuple)):
+        return None
+    for x in laps:
+        try:
+            v = int(x)
+            if v > 0:
+                best = v if best is None else max(best, v)
+        except (TypeError, ValueError):
+            continue
+    return best
+
+
+def _car_is_pitting(idx: int, on_pit_road: list | None, surfaces: list | None) -> bool:
+    if isinstance(on_pit_road, (list, tuple)) and idx < len(on_pit_road):
+        try:
+            if bool(on_pit_road[idx]):
+                return True
+        except (TypeError, ValueError):
+            pass
+    if isinstance(surfaces, (list, tuple)) and idx < len(surfaces):
+        return _is_pitting_surface(surfaces[idx])
+    return False
+
+
+def _is_caution_flags(flags_bools: dict[str, bool] | None, flag_state: str | None = None) -> bool:
+    if isinstance(flags_bools, dict) and (flags_bools.get("cau") or flags_bools.get("yel")):
+        return True
+    return str(flag_state or "").upper() == "CAUTION"
+
+
+def compute_caution_pit_impact(
+    player_idx: int,
+    player_pos: int,
+    positions: list,
+    laps: list | None,
+    *,
+    pit_loss_sec: int,
+    pit_in_laps: int,
+    hd: dict | None = None,
+    on_pit_road: list | None = None,
+    surfaces: list | None = None,
+) -> dict[str, Any]:
+    """
+    Estimate caution-pit cost: lead-lap positions lost, on-track class position, restart rows.
+
+    Under yellow, lap-down cars that stay out can inflate class position loss vs lead-lap
+    competitors — restart grid is usually lead-lap order first.
+    """
+    base = {"p": player_pos, "n": int(pit_in_laps), "pl": int(pit_loss_sec), "caution": True}
+    leader_lap = _leader_lap_from_car_laps(laps)
+    if leader_lap is None or player_pos <= 0 or not isinstance(positions, (list, tuple)):
+        return {**base, "lost": None}
+
+    def _lap_at(idx: int) -> int | None:
+        if not isinstance(laps, (list, tuple)) or idx >= len(laps):
+            return None
+        try:
+            v = int(laps[idx])
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _pos_at(idx: int) -> int | None:
+        if idx >= len(positions):
+            return None
+        try:
+            v = int(positions[idx])
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    lead_positions: list[int] = []
+    for idx in range(len(positions)):
+        if idx == player_idx:
+            continue
+        lap_v = _lap_at(idx)
+        pos_v = _pos_at(idx)
+        if lap_v is not None and pos_v is not None and lap_v >= leader_lap:
+            lead_positions.append(pos_v)
+
+    player_lap = _lap_at(player_idx)
+    if player_lap is not None and player_lap >= leader_lap:
+        lead_positions.append(player_pos)
+    lead_positions = sorted(set(lead_positions))
+
+    try:
+        player_rank_lead = lead_positions.index(player_pos) + 1
+    except ValueError:
+        player_rank_lead = player_pos
+
+    lead_ahead = [idx for idx in range(len(positions)) if _pos_at(idx) is not None and _pos_at(idx) < player_pos and (_lap_at(idx) or 0) >= leader_lap]
+    lap_down_ahead = [
+        idx
+        for idx in range(len(positions))
+        if idx != player_idx and _pos_at(idx) is not None and _pos_at(idx) < player_pos and (_lap_at(idx) or 0) < leader_lap
+    ]
+    behind_stay_out = [
+        idx
+        for idx in range(len(positions))
+        if idx != player_idx and _pos_at(idx) is not None and _pos_at(idx) > player_pos
+        and not _car_is_pitting(idx, on_pit_road, surfaces)
+    ]
+
+    herd = hd if isinstance(hd, dict) else {}
+    try:
+        pra = float(herd.get("pra", 0.35))
+    except (TypeError, ValueError):
+        pra = 0.35
+    try:
+        prb = float(herd.get("prb", 0.25))
+    except (TypeError, ValueError):
+        prb = 0.25
+    pra = max(0.0, min(1.0, pra))
+    prb = max(0.0, min(1.0, prb))
+
+    stay_out_lead_ahead = sum(1 for idx in lead_ahead if not _car_is_pitting(idx, on_pit_road, surfaces))
+    if lead_ahead:
+        stay_out_lead_ahead = max(stay_out_lead_ahead, int(round(len(lead_ahead) * (1.0 - pra))))
+
+    pitting_lead_ahead = sum(1 for idx in lead_ahead if _car_is_pitting(idx, on_pit_road, surfaces))
+    if lead_ahead and pitting_lead_ahead == 0:
+        pitting_lead_ahead = int(round(len(lead_ahead) * pra))
+
+    lap_down_stay_out_ahead = sum(
+        1 for idx in lap_down_ahead if not _car_is_pitting(idx, on_pit_road, surfaces)
+    )
+    behind_pass = len(behind_stay_out)
+    lap_down_on_track = sum(
+        1 for idx in behind_stay_out if (_lap_at(idx) or 0) < leader_lap
+    ) + lap_down_stay_out_ahead
+
+    exit_rank_lead = min(len(lead_positions) if lead_positions else player_rank_lead, stay_out_lead_ahead + pitting_lead_ahead + 1)
+    lost_lead = max(0, exit_rank_lead - player_rank_lead)
+
+    if pit_in_laps > 0:
+        # Under caution, laps until pit rarely change the herd much — small bump.
+        lost_lead += min(2, int(pit_in_laps))
+
+    exit_class = min(len(positions), player_pos + lost_lead + behind_pass)
+    total_lost = max(0, exit_class - player_pos)
+    grid_rows = max(0, int(round(lost_lead * 0.75)))
+
+    return {
+        **base,
+        "lost": total_lost,
+        "exit_p": exit_class,
+        "lost_lead": lost_lead,
+        "lda": lap_down_on_track,
+        "grid_rows": grid_rows,
+        "lrk": player_rank_lead,
+        "pra": round(pra, 2),
+        "prb": round(prb, 2),
+    }
+
+
+def _compact_caution_pit_intel(impact: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for src, dst in (
+        ("lrk", "lrk"),
+        ("lda", "lda"),
+        ("lost_lead", "ll"),
+        ("lost", "tl"),
+        ("exit_p", "xp"),
+        ("grid_rows", "gr"),
+        ("pra", "pra"),
+        ("prb", "prb"),
+    ):
+        v = impact.get(src)
+        if v is not None:
+            out[dst] = v
+    return out
+
+
 class TelemetryTracker:
     def __init__(self):
         self.ir = irsdk.IRSDK()
@@ -62,6 +344,20 @@ class TelemetryTracker:
         self._fuel_prev_lap: int | None = None
         self._fuel_prev_level_L: float | None = None
         self._fuel_per_lap_ema_L: float | None = None
+        self._fuel_last_lap_burn_L: float | None = None
+        self._fuel_burn_samples_L: deque = deque(maxlen=12)
+
+        # Session pit-lane time (PitiExtTime proxy when SDK omits it).
+        self._cumulative_pit_time_s: float = 0.0
+        self._last_pit_tick_session_t: float | None = None
+        self._on_pit_road_for_time: bool = False
+
+        # Tire wear snapshots logged in the pit box (wear vs track temp trends).
+        self._pit_tire_wear_log: deque = deque(maxlen=8)
+        self._logged_stall_this_stop: bool = False
+
+        # Opponent surface transitions (herd dynamics).
+        self._last_car_surface: dict[int, int] = {}
 
     def ensure_connected(self) -> bool:
         if not self.ir.is_connected:
@@ -107,6 +403,7 @@ class TelemetryTracker:
         if pl is not None and pf is not None:
             if lap_int < pl:
                 self._fuel_per_lap_ema_L = None
+                self._fuel_last_lap_burn_L = None
             elif lap_int > pl:
                 dl = lap_int - pl
                 df = pf - fuel_level
@@ -116,9 +413,245 @@ class TelemetryTracker:
                         alpha = 0.45
                         ema = self._fuel_per_lap_ema_L
                         self._fuel_per_lap_ema_L = sample if ema is None else (alpha * sample + (1 - alpha) * ema)
+                        if dl == 1:
+                            self._fuel_last_lap_burn_L = round(df, 4)
+                            self._fuel_burn_samples_L.append(self._fuel_last_lap_burn_L)
 
         self._fuel_prev_lap = lap_int
         self._fuel_prev_level_L = fuel_level
+
+    def _tracked_indices(self, player_idx: int, player_pos: int, positions: list) -> set[int]:
+        tracked = {player_idx}
+        for idx, pos in enumerate(positions):
+            try:
+                p = int(pos)
+            except (TypeError, ValueError):
+                continue
+            if p <= 0:
+                continue
+            if p <= 3 or abs(p - player_pos) <= 2:
+                tracked.add(idx)
+        return tracked
+
+    def _projected_reentry_gap(
+        self,
+        player_idx: int,
+        *,
+        lap_dist: list | None,
+        surfaces: list | None,
+        pit_loss_sec: float,
+        lap_s: float,
+        traffic_window: float = 0.035,
+    ) -> dict[str, Any]:
+        """Estimate whether a pit now merges into clean air or a traffic pack."""
+        if not isinstance(lap_dist, (list, tuple)) or player_idx >= len(lap_dist):
+            return {"v": "UNKNOWN"}
+        try:
+            player_dist = float(lap_dist[player_idx])
+        except (TypeError, ValueError):
+            return {"v": "UNKNOWN"}
+        if not (0.0 <= player_dist <= 1.0) or lap_s <= 0:
+            return {"v": "UNKNOWN"}
+
+        pit_frac = (float(pit_loss_sec) / float(lap_s)) % 1.0
+        reentry_dist = (player_dist + pit_frac) % 1.0
+        pack = 0
+        for idx, dist in enumerate(lap_dist):
+            if idx == player_idx:
+                continue
+            try:
+                d = float(dist)
+            except (TypeError, ValueError):
+                continue
+            if not (0.0 <= d <= 1.0):
+                continue
+            if isinstance(surfaces, (list, tuple)) and idx < len(surfaces):
+                try:
+                    if int(surfaces[idx]) not in (_TRK_ON_TRACK, _TRK_APPROACHING_PITS):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            dd = abs((d - reentry_dist + 0.5) % 1.0 - 0.5)
+            if dd <= traffic_window:
+                pack += 1
+
+        if pack == 0:
+            verdict = "CLEAN"
+        elif pack >= 2:
+            verdict = "PACK"
+        else:
+            verdict = "TRAFFIC"
+        return {"v": verdict, "n": pack, "dp": round(reentry_dist, 4)}
+
+    def _pitting_ratios(
+        self,
+        player_idx: int,
+        player_pos: int,
+        positions: list,
+        surfaces: list | None,
+        on_pit_road: list | None,
+        *,
+        window: int = 5,
+        caution: bool,
+    ) -> dict[str, Any]:
+        if not caution or player_pos <= 0:
+            return {}
+        ahead_total = ahead_pit = behind_total = behind_pit = 0
+        for idx, pos in enumerate(positions):
+            try:
+                p = int(pos)
+            except (TypeError, ValueError):
+                continue
+            if p <= 0 or idx == player_idx:
+                continue
+            pitting = False
+            if isinstance(on_pit_road, (list, tuple)) and idx < len(on_pit_road):
+                try:
+                    pitting = bool(on_pit_road[idx])
+                except (TypeError, ValueError):
+                    pitting = False
+            if not pitting and isinstance(surfaces, (list, tuple)) and idx < len(surfaces):
+                pitting = _is_pitting_surface(surfaces[idx])
+            if p < player_pos and p >= player_pos - window:
+                ahead_total += 1
+                if pitting:
+                    ahead_pit += 1
+            elif p > player_pos and p <= player_pos + window:
+                behind_total += 1
+                if pitting:
+                    behind_pit += 1
+
+        out: dict[str, Any] = {}
+        if ahead_total:
+            out["pra"] = round(ahead_pit / ahead_total, 2)
+        if behind_total:
+            out["prb"] = round(behind_pit / behind_total, 2)
+        return out
+
+    def _herd_counts(
+        self,
+        player_idx: int,
+        player_pos: int,
+        positions: list,
+        surfaces: list | None,
+        *,
+        window: int = 5,
+    ) -> dict[str, int]:
+        counts = {"apa": 0, "apb": 0, "isa": 0, "isb": 0}
+        if player_pos <= 0 or not isinstance(surfaces, (list, tuple)):
+            return counts
+        for idx, pos in enumerate(positions):
+            try:
+                p = int(pos)
+            except (TypeError, ValueError):
+                continue
+            if p <= 0 or idx == player_idx or idx >= len(surfaces):
+                continue
+            try:
+                surf = int(surfaces[idx])
+            except (TypeError, ValueError):
+                continue
+            if p < player_pos and p >= player_pos - window:
+                if surf == _TRK_APPROACHING_PITS:
+                    counts["apa"] += 1
+                elif surf == _TRK_IN_STALL:
+                    counts["isa"] += 1
+            elif p > player_pos and p <= player_pos + window:
+                if surf == _TRK_APPROACHING_PITS:
+                    counts["apb"] += 1
+                elif surf == _TRK_IN_STALL:
+                    counts["isb"] += 1
+        return counts
+
+    def _build_field_intel(
+        self,
+        player_idx: int,
+        player_pos: int,
+        positions: list,
+        *,
+        pit_loss_sec: int,
+        lap_s: float,
+        flags_bools: dict[str, bool],
+    ) -> dict[str, Any]:
+        tracked = self._tracked_indices(player_idx, player_pos, positions)
+        lap_dist = self._ir_get("CarIdxLapDistPct", []) or []
+        f2 = self._ir_get("CarIdxF2Time", []) or []
+        surfaces = self._ir_get("CarIdxTrackSurface", []) or []
+        on_pit = self._ir_get("CarIdxOnPitRoad", []) or []
+
+        dist_map: dict[str, float] = {}
+        f2_map: dict[str, float] = {}
+        surf_map: dict[str, str] = {}
+        for idx in sorted(tracked):
+            pos = positions[idx] if idx < len(positions) else None
+            try:
+                p = int(pos)
+            except (TypeError, ValueError):
+                continue
+            if p <= 0:
+                continue
+            label = "YOU" if idx == player_idx else f"P{p}"
+            if idx < len(lap_dist):
+                try:
+                    dist_map[label] = round(float(lap_dist[idx]), 4)
+                except (TypeError, ValueError):
+                    pass
+            if idx < len(f2):
+                try:
+                    f2_map[label] = round(float(f2[idx]), 3)
+                except (TypeError, ValueError):
+                    pass
+            if idx < len(surfaces):
+                sc = _surface_code(surfaces[idx])
+                if sc:
+                    surf_map[label] = sc
+
+        fi: dict[str, Any] = {}
+        if dist_map:
+            fi["dist"] = dist_map
+        if f2_map:
+            fi["f2"] = f2_map
+        if surf_map:
+            fi["surf"] = surf_map
+
+        hd = self._herd_counts(player_idx, player_pos, positions, surfaces)
+        pr = self._pitting_ratios(
+            player_idx,
+            player_pos,
+            positions,
+            surfaces,
+            on_pit,
+            caution=bool(flags_bools.get("cau") or flags_bools.get("yel")),
+        )
+        hd.update(pr)
+        if any(hd.values()):
+            fi["hd"] = hd
+
+        rej = self._projected_reentry_gap(
+            player_idx,
+            lap_dist=lap_dist,
+            surfaces=surfaces,
+            pit_loss_sec=float(pit_loss_sec),
+            lap_s=float(lap_s),
+        )
+        if rej.get("v") != "UNKNOWN":
+            fi["rej"] = rej
+        if _is_caution_flags(flags_bools):
+            cpi = compute_caution_pit_impact(
+                player_idx,
+                int(player_pos),
+                positions,
+                self._ir_get("CarIdxLap", []) or [],
+                pit_loss_sec=int(pit_loss_sec),
+                pit_in_laps=0,
+                hd=fi.get("hd") if isinstance(fi, dict) else None,
+                on_pit_road=on_pit,
+                surfaces=surfaces,
+            )
+            compact = _compact_caution_pit_intel(cpi)
+            if compact:
+                fi["cpi"] = compact
+        return fi
 
     # ----------------------------
     # Small helpers (shared logic)
@@ -235,22 +768,47 @@ class TelemetryTracker:
 
     def predict_pit_position_loss(self, pit_loss_sec: int, pit_in_laps: int) -> dict[str, Any]:
         """
-        Predict how many class positions you'll likely lose if you pit in N laps.
+        Predict class positions lost if you pit in N laps.
 
-        This is intentionally coarse (race-safe, low compute):
-        - Uses gap estimates + simple pace deltas to project gaps forward.
-        - Evaluates only the nearby tracked slice (±2 by class position + top 3).
+        Under caution, separates lead-lap loss from lap-down traffic and estimates
+        restart-grid rows.
         """
         player_idx = self._ir_get("PlayerCarIdx", 0)
         player_pos = self._ir_get("PlayerCarClassPosition", 0)
         positions = self._ir_get("CarIdxClassPosition", []) or []
-
-        you_avg = self._avg_lap_s_for_idx(player_idx, fallback=90.0)
+        laps = self._ir_get("CarIdxLap", []) or []
+        flags = self._ir_get("SessionFlags", 0)
+        pits_open = self._ir_get("PitsOpen", None)
+        flags_bools = _parse_session_flags_bools(flags, pits_open)
+        flag_state = "CAUTION" if _is_caution_flags(flags_bools) else "GREEN"
 
         if not player_pos:
             return {"p": player_pos, "n": pit_in_laps, "pl": pit_loss_sec, "lost": None}
 
-        # Consider cars behind within a few class positions that we likely track.
+        if _is_caution_flags(flags_bools, flag_state):
+            you_avg = self._avg_lap_s_for_idx(player_idx, fallback=90.0)
+            fi = self._build_field_intel(
+                player_idx,
+                player_pos,
+                positions,
+                pit_loss_sec=int(pit_loss_sec),
+                lap_s=float(you_avg),
+                flags_bools=flags_bools,
+            )
+            return compute_caution_pit_impact(
+                player_idx,
+                int(player_pos),
+                positions,
+                laps,
+                pit_loss_sec=int(pit_loss_sec),
+                pit_in_laps=int(pit_in_laps),
+                hd=fi.get("hd") if isinstance(fi, dict) else None,
+                on_pit_road=self._ir_get("CarIdxOnPitRoad", []) or [],
+                surfaces=self._ir_get("CarIdxTrackSurface", []) or [],
+            )
+
+        you_avg = self._avg_lap_s_for_idx(player_idx, fallback=90.0)
+
         behind = []
         for idx, pos in enumerate(positions):
             if isinstance(pos, int) and pos > player_pos and pos <= player_pos + 5:
@@ -261,13 +819,12 @@ class TelemetryTracker:
             g = self._gap_est_s(player_idx, idx, lap_s_fallback=you_avg)
             if g is None:
                 continue
-            # Project gap forward N laps: gap + N * (their_avg - our_avg).
             their_avg = self._avg_lap_s_for_idx(idx, fallback=you_avg)
             projected_gap = float(g) + float(pit_in_laps) * (float(their_avg) - float(you_avg))
             if projected_gap < float(pit_loss_sec):
                 lost += 1
 
-        return {"p": player_pos, "n": int(pit_in_laps), "pl": int(pit_loss_sec), "lost": lost}
+        return {"p": player_pos, "n": int(pit_in_laps), "pl": int(pit_loss_sec), "lost": lost, "caution": False}
 
     def update_field_history(self) -> None:
         if not self.ensure_connected():
@@ -275,7 +832,41 @@ class TelemetryTracker:
 
         # Track pit road transitions to estimate current tire stint length.
         on_pit_road = bool(self._ir_get("OnPitRoad", False))
+        in_stall = bool(self._ir_get("PlayerCarInPitStall", False))
         lap_now = self._ir_get("Lap", None)
+        session_t = self._ir_get("SessionTime", None)
+        try:
+            session_t_f = float(session_t) if session_t is not None else None
+        except (TypeError, ValueError):
+            session_t_f = None
+
+        if on_pit_road and session_t_f is not None:
+            if self._on_pit_road_for_time and self._last_pit_tick_session_t is not None:
+                self._cumulative_pit_time_s += max(0.0, session_t_f - self._last_pit_tick_session_t)
+            self._on_pit_road_for_time = True
+            self._last_pit_tick_session_t = session_t_f
+        else:
+            self._on_pit_road_for_time = False
+            self._last_pit_tick_session_t = None
+            self._logged_stall_this_stop = False
+
+        if in_stall and not self._logged_stall_this_stop:
+            wear = _read_tire_wear_corners(self._ir_get)
+            if wear:
+                entry: dict[str, Any] = {"l": lap_now}
+                try:
+                    tt = self._ir_get("TrackTempCrew", None) or self._ir_get("TrackTemp", None)
+                    at = self._ir_get("AirTemp", None)
+                    if tt is not None:
+                        entry["tt"] = round(float(tt), 1)
+                    if at is not None:
+                        entry["at"] = round(float(at), 1)
+                except (TypeError, ValueError):
+                    pass
+                entry.update(wear)
+                self._pit_tire_wear_log.append(entry)
+                self._logged_stall_this_stop = True
+
         if self._last_on_pit_road is None:
             self._last_on_pit_road = on_pit_road
             if isinstance(lap_now, int):
@@ -293,19 +884,35 @@ class TelemetryTracker:
         positions = self.ir["CarIdxClassPosition"] or []
         player_idx = self.ir["PlayerCarIdx"]
         player_pos = self.ir["PlayerCarClassPosition"]
+        surfaces = self._ir_get("CarIdxTrackSurface", []) or []
 
         # Track only the drivers we care about so memory doesn't grow with the full field.
-        tracked = set()
-        for idx, pos in enumerate(positions):
-            if pos <= 3 or abs(pos - player_pos) <= 2:
-                tracked.add(idx)
-        tracked.add(player_idx)
+        tracked = self._tracked_indices(player_idx, player_pos, positions)
+
+        # Opponent pit-approach / stall surface transitions.
+        for idx in tracked:
+            if idx >= len(surfaces):
+                continue
+            try:
+                surf = int(surfaces[idx])
+            except (TypeError, ValueError):
+                continue
+            prev = self._last_car_surface.get(idx)
+            if prev is not None and surf != prev and surf in _PITTING_SURFACES:
+                pass  # herd state captured in build_packet fi.hd
+            self._last_car_surface[idx] = surf
 
         # Prune any cars that are no longer in the relevant slice.
         for idx in list(self.field_history.keys()):
             if idx not in tracked:
                 self.field_history.pop(idx, None)
                 self.last_recorded_lap.pop(idx, None)
+                self._last_car_surface.pop(idx, None)
+
+        fuel_level = float(self._ir_get("FuelLevel", 0.0) or 0.0)
+        fuel_capacity = self._ir_get("FuelCapacity", None)
+        if isinstance(lap_now, int):
+            self._tick_fuel_per_lap_ema(lap_now, fuel_level, fuel_capacity)
 
         for i in tracked:
             if i >= len(laps) or i >= len(last_lap_times):
@@ -355,35 +962,15 @@ class TelemetryTracker:
             besides caution/yellow (start lights, debris, etc.). We only return CAUTION
             when we can positively identify a caution/yellow bit.
             """
+            fb = _parse_session_flags_bools(flags)
+            if fb.get("cau") or fb.get("yel"):
+                return "CAUTION"
+            if fb.get("grn"):
+                return "GREEN"
             try:
                 flags_int = int(flags)
             except Exception:
                 return "UNKNOWN"
-
-            # Prefer the irsdk-provided flag definitions when available.
-            Flags = getattr(irsdk, "Flags", None)
-            if Flags is not None:
-                try:
-                    f = Flags(flags_int)
-                    cautionish = []
-                    for name in (
-                        "caution",
-                        "cautionWaving",
-                        "yellow",
-                        "yellowWaving",
-                        "yellowWavingAtStart",
-                        "fullCourseCaution",
-                        "localYellow",
-                    ):
-                        bit = getattr(Flags, name, None)
-                        if bit is not None:
-                            cautionish.append(bit)
-                    if cautionish and any((f & bit) for bit in cautionish):
-                        return "CAUTION"
-                except Exception:
-                    pass
-
-            # Fallback: without knowing exact bits, do NOT assume caution from non-zero.
             return "GREEN" if flags_int == 0 else "UNKNOWN"
 
         for idx, pos in enumerate(positions):
@@ -393,35 +980,26 @@ class TelemetryTracker:
                     relevant_history[label] = list(self.field_history[idx])
 
         fuel_level = float(self._ir_get("FuelLevel", 0.0) or 0.0)
+        fuel_level_pct = self._ir_get("FuelLevelPct", None)
+        try:
+            if fuel_level_pct is not None:
+                fuel_level_pct = round(float(fuel_level_pct), 2)
+        except (TypeError, ValueError):
+            fuel_level_pct = None
         fuel_use_per_hour_raw = float(self._ir_get("FuelUsePerHour", 0.0) or 0.0)
         laps_remain = _sanitize_lap_count(self._ir_get("SessionLapsRemain", None))
         laps_total = _sanitize_lap_count(self._ir_get("SessionLapsTotal", None))
         flags = self._ir_get("SessionFlags", 0)
+        pits_open = self._ir_get("PitsOpen", None)
+        flags_bools = _parse_session_flags_bools(flags, pits_open)
         is_on_track = bool(self._ir_get("IsOnTrack", False))
         fuel_capacity_raw = self._ir_get("FuelCapacity", None)
+        pit_sv_fuel_L = self._ir_get("PitSvFuel", None)
+        pit_time_div10 = self._ir_get("PitTimeDivideBy10", None)
+        piti_ext_time = self._ir_get("PitiExtTime", None)
 
         def read_tire_wear_snapshot() -> dict[str, Any] | None:
-            """
-            Best-effort read of tire wear/percent remaining from iRacing.
-            Field names vary by car/build; if we can't find anything reliable,
-            return None and let the AI use stint length as a proxy.
-            """
-            candidates = [
-                ("LF", "LFwear"),
-                ("RF", "RFwear"),
-                ("LR", "LRwear"),
-                ("RR", "RRwear"),
-            ]
-            out: dict[str, Any] = {}
-            for corner, key in candidates:
-                v = self._ir_get(key, None)
-                if v is None:
-                    continue
-                try:
-                    out[corner] = round(float(v), 3)
-                except Exception:
-                    out[corner] = v
-            return out or None
+            return _read_tire_wear_corners(self._ir_get)
 
         # Stint length estimate (laps since last pit-road exit).
         lap_int = self._ir_get("Lap", None)
@@ -591,6 +1169,96 @@ class TelemetryTracker:
             # Hosted / test sessions often expose ~604800s placeholder — omit so the model does not treat it as real stint clock.
             session_time_remain = None
 
+        session_time_elapsed = self._ir_get("SessionTime", None)
+        if isinstance(session_time_elapsed, (int, float)) and float(session_time_elapsed) >= 86400.0:
+            session_time_elapsed = None
+
+        session_type = self._ir_get("SessionType", None)
+        if session_type is not None:
+            session_type = str(session_type).strip() or None
+
+        air_temp_c = self._ir_get("AirTemp", None)
+        track_temp_c = self._ir_get("TrackTempCrew", None) or self._ir_get("TrackTemp", None)
+        try:
+            if air_temp_c is not None:
+                air_temp_c = round(float(air_temp_c), 1)
+        except (TypeError, ValueError):
+            air_temp_c = None
+        try:
+            if track_temp_c is not None:
+                track_temp_c = round(float(track_temp_c), 1)
+        except (TypeError, ValueError):
+            track_temp_c = None
+
+        air_temp_f = _c_to_f(air_temp_c)
+        track_temp_f = _c_to_f(track_temp_c)
+        track_wetness = self._ir_get("TrackWetness", None)
+        try:
+            if track_wetness is not None:
+                track_wetness = round(float(track_wetness), 3)
+        except (TypeError, ValueError):
+            track_wetness = None
+
+        player_class = self._ir_get("PlayerCarClass", None)
+        if player_class is not None:
+            player_class = str(player_class).strip() or None
+
+        tire_compound = None
+        for key in ("PlayerCarDryTireType", "PlayerTireCompound", "PlayerCarLeftFrontTireType"):
+            v = self._ir_get(key, None)
+            if isinstance(v, str) and v.strip():
+                tire_compound = v.strip()
+                break
+
+        speed_mph = None
+        try:
+            spd = self._ir_get("Speed", None)
+            if spd is not None:
+                speed_mph = round(float(spd) * 2.23694, 1)
+        except (TypeError, ValueError):
+            speed_mph = None
+
+        pit_lane_time_s = None
+        try:
+            if piti_ext_time is not None:
+                pit_lane_time_s = round(float(piti_ext_time), 1)
+        except (TypeError, ValueError):
+            pit_lane_time_s = None
+        if pit_lane_time_s is None and self._cumulative_pit_time_s > 0:
+            pit_lane_time_s = round(self._cumulative_pit_time_s, 1)
+
+        pit_lane_penalty_s = None
+        try:
+            if pit_time_div10 is not None:
+                pit_lane_penalty_s = round(float(pit_time_div10) * 10.0, 2)
+        except (TypeError, ValueError):
+            pit_lane_penalty_s = None
+
+        pit_sv_fuel_us = None
+        try:
+            if pit_sv_fuel_L is not None:
+                pit_sv_fuel_us = round(_liters_to_us_gal(float(pit_sv_fuel_L)), 3)
+        except (TypeError, ValueError):
+            pit_sv_fuel_us = None
+
+        fuel_burn_last_us = None
+        if self._fuel_last_lap_burn_L is not None:
+            fuel_burn_last_us = round(_liters_to_us_gal(self._fuel_last_lap_burn_L), 5)
+        fuel_burn_hist_us = None
+        if self._fuel_burn_samples_L:
+            fuel_burn_hist_us = [round(_liters_to_us_gal(x), 5) for x in list(self._fuel_burn_samples_L)[-6:]]
+
+        field_intel = self._build_field_intel(
+            player_idx,
+            player_pos,
+            positions,
+            pit_loss_sec=int(pit_loss_sec),
+            lap_s=float(avg_lap_s),
+            flags_bools=flags_bools,
+        )
+
+        twl = list(self._pit_tire_wear_log) if self._pit_tire_wear_log else None
+
         mode = self.ui_mode()
 
         # Compact schema to reduce tokens (short keys, no nulls, rounded floats).
@@ -605,17 +1273,34 @@ class TelemetryTracker:
             "x": {"md": mode, "u": "us", "fe": (1 if fuel_est_ok else 0), "ll": (1 if lap_data_ok else 0)},
             "s": {  # session
                 "st": self._ir_get("SessionState", None),
+                "ty": session_type,
+                "ses": self._ir_get("SessionNum", None),
                 "tr": session_time_remain,
+                "te": session_time_elapsed,
                 "lt": laps_total,
                 "ot": is_on_track,
                 "ig": self._ir_get("IsInGarage", None),
+                "at": air_temp_f,
+                "tt": track_temp_f,
+                "atc": air_temp_c,
+                "ttc": track_temp_c,
+                "wn": track_wetness,
+                "cls": player_class,
+                "flb": flags_bools,
+                "pto": pit_lane_penalty_s,
             },
             "m": {  # me
                 "l": self._ir_get("Lap", None),
                 "lp": last_pit_lap,
                 "lr": laps_remain,
                 "p": player_pos,
+                "ful": round(fuel_level, 4),
                 "fu": round(_liters_to_us_gal(fuel_level), 3),
+                "fup": fuel_level_pct,
+                "fbl": fuel_burn_last_us,
+                "fbh": fuel_burn_hist_us,
+                "psf": pit_sv_fuel_us,
+                "pte": pit_lane_time_s,
                 "fph": round(float(fuel_use_per_hour_raw) * _KG_TO_LB, 3),
                 "fpl": round(_liters_to_us_gal(fuel_use_per_lap_est), 5),
                 "fpe": round(_liters_to_us_gal(float(fpl_ema)), 5) if fpl_ema is not None else None,
@@ -644,6 +1329,8 @@ class TelemetryTracker:
                 "tws": (not on_pit_road),
                 "twsl": tire_wear_last_known_stint_laps,
                 "twr": tire_wear_rate_est,
+                "cmp": tire_compound,
+                "sp": speed_mph,
             },
             "r": {  # race_info
                 "pl": int(pit_loss_sec),
@@ -654,6 +1341,10 @@ class TelemetryTracker:
             "rv": rivals,
             "f": relevant_history,
         }
+        if field_intel:
+            packet["fi"] = field_intel
+        if twl:
+            packet["twl"] = twl
 
         if not fuel_est_ok:
             mm = packet.get("m")
