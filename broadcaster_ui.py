@@ -81,6 +81,16 @@ class BroadcasterWindow(QWidget):
                 padding: 8px 10px;
                 font-weight: 600;
             }
+            QPushButton#minBtn {
+                background-color: rgb(42, 46, 58);
+                color: #E8EEF2;
+                font-weight: 800;
+                border-radius: 10px;
+                padding: 10px;
+                border: 1px solid rgb(60, 64, 76);
+            }
+            QPushButton#minBtn:hover { background-color: rgb(56, 60, 72); }
+            QPushButton#minBtn:pressed { background-color: rgb(34, 38, 48); }
             QPushButton#closeBtn {
                 background-color: rgb(192, 57, 43);
                 color: white;
@@ -133,6 +143,10 @@ class BroadcasterWindow(QWidget):
         hint.setObjectName("subLabel")
         hint.setWordWrap(True)
 
+        min_btn = QPushButton("MINIMIZE")
+        min_btn.setObjectName("minBtn")
+        min_btn.clicked.connect(self.showMinimized)
+
         close_btn = QPushButton("CLOSE")
         close_btn.setObjectName("closeBtn")
         close_btn.clicked.connect(self._close)
@@ -144,6 +158,7 @@ class BroadcasterWindow(QWidget):
         layout.addLayout(lan_name_row)
         layout.addWidget(lan_name_hint)
         layout.addWidget(hint)
+        layout.addWidget(min_btn)
         layout.addWidget(close_btn)
 
         self._save_timer = QTimer(self)
