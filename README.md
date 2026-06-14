@@ -43,11 +43,20 @@ See `.env-example`.
 
 ## Running the app
 
-From the project folder:
+From the project folder on either machine:
 
 ```bash
 python3 main.py
 ```
+
+A startup dialog asks whether this PC is the **Sim PC (Broadcaster)** or **Engineer PC (Receiver)**.
+
+| Role | Machine | What it does |
+|------|---------|----------------|
+| **Broadcaster** | Sim PC (iRacing) | Streams telemetry; speaks engineer calls aloud |
+| **Receiver** | Engineer PC | Connects over LAN; runs AI advice overlay |
+
+Advanced: pass `--role local`, `--role broadcaster`, or `--role receiver` to skip the picker. Single-PC mode (`--role local`) runs iRacing + AI on one machine.
 
 ## Packaging a Windows executable
 

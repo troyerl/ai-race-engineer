@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QApplication
 
 from broadcaster_ui import BroadcasterWindow
 from race_link import DEFAULT_RACE_LINK_PORT
+from role_picker import pick_startup_role
 from ui import AIRaceEngineer
 
 
@@ -44,10 +45,10 @@ def main():
     parser.add_argument(
         "--role",
         choices=["local", "broadcaster", "receiver"],
-        default="local",
+        default=None,
         help=(
-            "local = iRacing + AI on same PC; "
-            "broadcaster = sim PC streams telemetry and speaks calls (no advice text); "
+            "Skip the startup picker: local = iRacing + AI on same PC; "
+            "broadcaster = sim PC streams telemetry and speaks calls; "
             "receiver = engineer PC runs AI and shows advice"
         ),
     )
@@ -69,9 +70,15 @@ def main():
     icon = QIcon(icon_path)
     app.setWindowIcon(icon)
 
-    if args.role == "broadcaster":
+    role = args.role
+    if role is None:
+        role = pick_startup_role()
+        if role is None:
+            sys.exit(0)
+
+    if role == "broadcaster":
         window = BroadcasterWindow(bind_host=args.bind, port=port)
-    elif args.role == "receiver":
+    elif role == "receiver":
         window = AIRaceEngineer(role="receiver", link_host=args.connect, link_port=port)
     else:
         window = AIRaceEngineer(role="local")

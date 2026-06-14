@@ -128,7 +128,7 @@ class BroadcasterWindow(QWidget):
         lan_name_hint.setWordWrap(True)
 
         hint = QLabel(
-            "On the engineer PC run: python3 main.py --role receiver — then click this machine in the LAN list."
+            "On the engineer PC, start the app and choose Receiver — then click this machine in the LAN list."
         )
         hint.setObjectName("subLabel")
         hint.setWordWrap(True)

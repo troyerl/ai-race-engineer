@@ -1126,7 +1126,7 @@ class AIRaceEngineer(QWidget):
         self.lan_device_list.clear()
         devices = self._lan_discovery.devices() if self._lan_discovery is not None else []
         if not devices:
-            item = QListWidgetItem("No sim PCs found — run: python3 main.py --role broadcaster")
+            item = QListWidgetItem("No sim PCs found — start broadcaster mode on the sim PC.")
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.lan_device_list.addItem(item)
             if hasattr(self, "lan_status_label"):
