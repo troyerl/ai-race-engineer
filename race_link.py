@@ -32,7 +32,7 @@ def _encode_line(obj: dict) -> bytes:
 
 
 class _AdviceBridge(QObject):
-    received = Signal(str, bool)
+    received = Signal(str, bool, bool, bool)  # text, partial, speak, include_why
 
 
 class _ClientPool:
