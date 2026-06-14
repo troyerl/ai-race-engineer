@@ -2,6 +2,7 @@ import os
 import sys
 import threading
 import json
+from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
