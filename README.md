@@ -29,7 +29,22 @@ Python packages used:
 - `PySide6`
 - `boto3` (and `botocore`)
 - `irsdk`
-- Optional: `python-dotenv` (only needed if you want `.env` auto-loading)
+- Optional: `python-dotenv` (loads `.env` on startup)
+- Optional: `pynput` (global hotkey while iRacing has focus; macOS needs Accessibility)
+
+Install everything:
+
+```bash
+pip install PySide6 boto3 irsdk python-dotenv pynput
+```
+
+Or with a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install PySide6 boto3 irsdk python-dotenv pynput
+```
 
 ## Configuration
 
@@ -40,6 +55,91 @@ Python packages used:
 You can set it via your shell, or by creating a `.env` file locally (not committed).
 
 See `.env-example`.
+
+## Local testing (single PC)
+
+Use this path when you want to try the app on **one machine** with iRacing and the AI overlay together — no LAN, no second PC.
+
+### 1. Prerequisites
+
+- Python 3.10+
+- iRacing installed and able to enter a session (test drive, practice, or race)
+- AWS Bedrock access to the configured model (`us.anthropic.claude-sonnet-4-6-v1:0` by default)
+- Dependencies installed (see **Requirements** above)
+
+### 2. Set your Bedrock token
+
+Copy the example env file and add your token:
+
+```bash
+cp .env-example .env
+```
+
+Edit `.env`:
+
+```bash
+IRACING_BEDROCK_TOKEN=your_bedrock_bearer_token_here
+```
+
+### 3. Start iRacing first
+
+Launch iRacing and load into a session (garage, test drive, or on track). The SDK only provides telemetry once the sim is running.
+
+### 4. Run local mode
+
+Skip the startup role picker and open the single-PC overlay:
+
+```bash
+python3 main.py --role local
+```
+
+You should see the overlay window. The status badge should change from **iRacing: Offline** to **iRacing: Online** once telemetry connects.
+
+### 5. Quick functional test
+
+1. Drive a few laps so the app has lap times and fuel data.
+2. Set **Pit loss (sec)** and **New tire sets left** if needed (or enable auto pit-loss in preferences).
+3. Click **ANALYZE FIELD & ADVISE** (or press **Spacebar** when the overlay is focused).
+4. Confirm advice streams in live — you should see text appear incrementally, then a final pit/stay-out call.
+5. Click **CLEAR / CANCEL** to reset and try again.
+
+Optional checks:
+
+- **Voice enabled** (preferences): reads the finished call aloud on this PC.
+- **Show pit impact**: after a PIT call, a caution-aware pit-road impact line appears under the advice.
+- **Hotkey**: Space works in-app always; with `pynput` installed, Space can work globally (on macOS, grant **Accessibility** to your terminal or Python in System Settings → Privacy & Security).
+
+### 6. Config file
+
+Settings are saved to `~/.ai_race_engineer.json` (hotkey, voice, pit loss, token usage counters, etc.). Delete that file to reset preferences.
+
+### Local troubleshooting
+
+| Symptom | What to try |
+|---------|-------------|
+| **iRacing: Offline** | Start iRacing before the overlay; restart the overlay after joining a session. |
+| **Error: IRACING_BEDROCK_TOKEN not found** | Add the token to `.env` or export it in your shell. |
+| **Analyze does nothing / times out** | Check Bedrock credentials and model access; watch the terminal for errors. |
+| **No global hotkey on Mac** | Install `pynput` and enable Accessibility for the app running Python. |
+| **trace trap on Mac at startup** | Usually a `pynput`/Accessibility issue — the in-app Space shortcut still works. |
+
+### Testing the two-machine setup locally
+
+You can also simulate broadcaster + receiver on one computer (useful before splitting across two PCs):
+
+**Terminal 1 — broadcaster (needs iRacing running):**
+
+```bash
+python3 main.py --role broadcaster
+```
+
+**Terminal 2 — receiver:**
+
+```bash
+python3 main.py --role receiver
+```
+
+On the receiver, pick the broadcaster from the LAN device list. Advice is generated on the receiver; calls can be spoken on the broadcaster if voice relay is enabled.
 
 ## Running the app
 
