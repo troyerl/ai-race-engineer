@@ -50,19 +50,53 @@ def _tts_phrase(line: str) -> str:
 
 def _speech_lines(full: str, *, include_why: bool) -> list[str]:
     """Content lines to read aloud, in display order."""
+    try:
+        from strategy_engine import lapped_danger_voice_for_advice
+
+        voice_override = lapped_danger_voice_for_advice(full)
+        if voice_override:
+            return [voice_override]
+        if "divebomb threat" in (full or "").lower() or "guard the entry" in (full or "").lower():
+            return ["Divebomb threat inside, guard the entry."]
+    except Exception:
+        voice_override = None
+
     out: list[str] = []
     for line in (full or "").replace("\r\n", "\n").split("\n"):
         s = line.strip()
         if not s:
             continue
         upper = s.upper()
+        if upper.startswith(("=", "-")) or upper.startswith(("MACHINE STATE", "PERFORMANCE", "ENVIRONMENT")):
+            continue
         if upper.startswith("TRIGGER:") or upper.startswith("FORECAST:"):
+            continue
+        if "STRATEGY CALL" in upper:
+            bracket = re.search(r"\[\s*([^\]]+)\s*\]", s)
+            if bracket:
+                action = _tts_phrase(bracket.group(1).strip())
+                pit_m = re.search(r"TARGET PIT:\s*LAP\s*(\d+)", s, re.I)
+                svc_m = re.search(r"SERVICE TYPE:\s*([^·\n]+)", s, re.I)
+                bits = [action]
+                if pit_m:
+                    bits.append(f"target pit lap {pit_m.group(1)}")
+                if svc_m:
+                    bits.append(_tts_phrase(svc_m.group(1).strip()))
+                out.append(". ".join(bits))
+            continue
+        if upper.startswith("WHY"):
+            if include_why:
+                why = s.split(":", 1)[-1].strip()
+                if why:
+                    out.append(_tts_phrase(why))
             continue
         if upper.startswith("WHY:"):
             if include_why:
                 why = s[4:].strip()
                 if why:
                     out.append(_tts_phrase(why))
+            continue
+        if s.startswith("[") and "Reentry" in s:
             continue
         out.append(_tts_phrase(s))
     return out

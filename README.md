@@ -58,6 +58,16 @@ Settings are saved to `~/.ai_race_engineer.json` (hotkey, voice, pit loss, etc.)
 
 Optional: create a `.env` file if you use `python-dotenv` for other local secrets (not required for the strategy engine).
 
+### Unit tests (strategy & calculations)
+
+Run the calculation, strategy, and **auto-alert display trigger** test suite with the standard library (no extra test dependencies):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+`tests/test_advice_outputs.py` asserts the **full formatted text** (call line, WHY, FORECAST, TRIGGER/CONF) for every live scenario. `tests/test_auto_alert_engine.py` verifies the **same text** is what gets delivered when auto-alerts fire.
+
 ## Local testing (single PC)
 
 Use this path when you want to try the app on **one machine** with iRacing and the engineer overlay together — no LAN, no second PC.

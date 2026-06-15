@@ -27,8 +27,9 @@ from app_config import (
     merge_config_defaults,
     write_config,
 )
+from auto_alert_engine import AutoMonitorState, evaluate_auto_alert_tick, reset_auto_monitor_state
 from race_constants import ALERT_LAP_HORIZON, get_default_pit_loss_seconds, resolve_track_length_miles
-from strategy_engine import advice_call_line, run_strategy, should_auto_alert
+from strategy_engine import advice_call_line, run_strategy
 from strategy_worker import StrategyWorker
 from hotkey import (
     DEFAULT_HOTKEY,
@@ -125,10 +126,8 @@ class AIRaceEngineer(QWidget):
         self._pit_user_modified = False
         self._tire_user_modified = False
         self._last_sdk_connected = None
-        self._auto_last_lap: int | None = None
-        self._auto_last_caution = False
+        self._auto_monitor = AutoMonitorState()
         self._auto_last_call_line = ""
-        self._auto_caution_announced = False
         self._last_delivered_call_line = ""
         self._link_host_boot = (link_host or "").strip() or str(self._config.get("race_link_host", "")).strip()
         self._link_port_boot = int(link_port if link_port is not None else self._config.get("race_link_port", DEFAULT_RACE_LINK_PORT))
@@ -194,9 +193,10 @@ class AIRaceEngineer(QWidget):
             }
             QLabel#adviceText {
                 color: #E8F5E9;
-                font-size: 17px;
-                font-weight: 700;
-                line-height: 142%;
+                font-family: "Menlo", "Consolas", "Courier New", monospace;
+                font-size: 10px;
+                font-weight: 500;
+                line-height: 145%;
                 background: transparent;
                 border: none;
                 padding: 0;
@@ -403,7 +403,7 @@ class AIRaceEngineer(QWidget):
         self.advice_label.setObjectName("adviceStandby" if self._is_receiver else "adviceText")
         self.advice_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.advice_label.setWordWrap(True)
-        self.advice_label.setMinimumHeight(200 if self._is_receiver else 96)
+        self.advice_label.setMinimumHeight(280 if self._is_receiver else 160)
         self.advice_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         if not self._is_receiver:
             advice_layout.addWidget(self.advice_header)
@@ -1221,10 +1221,8 @@ class AIRaceEngineer(QWidget):
             self.hotkey_hint.setText("Hotkey off — use the Analyze button only.")
 
     def _reset_auto_monitor(self) -> None:
-        self._auto_last_lap = None
-        self._auto_last_caution = False
+        self._auto_monitor = reset_auto_monitor_state()
         self._auto_last_call_line = ""
-        self._auto_caution_announced = False
         self._last_delivered_call_line = ""
 
     def _check_auto_strategy(self) -> None:
@@ -1243,20 +1241,10 @@ class AIRaceEngineer(QWidget):
         lap, is_caution = get_state()
         if lap is None:
             return
-
-        lap_changed = self._auto_last_lap is None or lap != self._auto_last_lap
-        caution_changed = is_caution != self._auto_last_caution
+        lap_changed = self._auto_monitor.last_lap is None or lap != self._auto_monitor.last_lap
+        caution_changed = is_caution != self._auto_monitor.last_caution
         if not lap_changed and not caution_changed:
             return
-
-        caution_started = caution_changed and is_caution
-        caution_ended = caution_changed and not is_caution
-
-        if not is_caution:
-            self._auto_caution_announced = False
-
-        self._auto_last_lap = lap
-        self._auto_last_caution = is_caution
 
         try:
             packet_json = self.telemetry.build_packet(
@@ -1269,28 +1257,18 @@ class AIRaceEngineer(QWidget):
         if not isinstance(telemetry, dict):
             return
 
-        advice = run_strategy(telemetry, mode="live")
-        if not should_auto_alert(
-            telemetry,
-            advice,
-            caution_started=caution_started,
-            caution_ended=caution_ended,
-        ):
+        self._auto_monitor, decision = evaluate_auto_alert_tick(
+            self._auto_monitor,
+            lap=lap,
+            is_caution=is_caution,
+            telemetry=telemetry,
+            last_delivered_call_line=self._last_delivered_call_line,
+        )
+        if not decision.deliver or not decision.advice:
             return
 
-        call_line = advice_call_line(advice)
-        if caution_started:
-            if self._auto_caution_announced:
-                return
-            if call_line and call_line == self._last_delivered_call_line:
-                self._auto_caution_announced = True
-                return
-            self._auto_caution_announced = True
-        elif call_line and call_line == self._last_delivered_call_line:
-            return
-
-        self._auto_last_call_line = call_line
-        self._deliver_advice(advice, auto=True)
+        self._auto_last_call_line = decision.call_line or ""
+        self._deliver_advice(decision.advice, auto=True)
 
     def _deliver_advice(self, text: str, *, auto: bool = False) -> None:
         call_line = advice_call_line(str(text))

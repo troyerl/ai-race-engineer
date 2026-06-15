@@ -1,0 +1,183 @@
+"""Tactical offensive/defensive context and strategy advice tests."""
+
+from __future__ import annotations
+
+import unittest
+
+from context_engine import (
+    DriverContextTracker,
+    ThermalStressState,
+    calculate_rolling_trend,
+    compute_overtake_difficulty_index,
+)
+from race_constants import (
+    BRAKE_ZONE_LAP_DIST_START,
+    DRAFT_GAP_SEC,
+    HIGH_LAT_SECTOR_END,
+    HIGH_LAT_SECTOR_START,
+    ODI_RIVAL_DEGRAD_MULT,
+    RIVAL_DEGRAD_TREND_MIN,
+    STEER_SAMPLE_LAT_G,
+    THERMAL_GREASY_C,
+)
+from strategy_engine import (
+    tactical_defensive_advice,
+    tactical_undercut_advice,
+)
+from tests.fixtures import inside_window_telemetry
+
+
+class MockIRacing:
+    def __init__(self, state: dict | None = None) -> None:
+        self.state = dict(state or {})
+
+    def set(self, **kwargs) -> None:
+        self.state.update(kwargs)
+
+    def __call__(self, key: str, default=None):
+        return self.state.get(key, default)
+
+
+class RollingTrendTests(unittest.TestCase):
+    def test_positive_trend_when_rival_slowing(self) -> None:
+        trend = calculate_rolling_trend([90.0, 90.3, 90.6], window=3)
+        self.assertAlmostEqual(trend, 0.3, places=2)
+
+    def test_insufficient_history_returns_zero(self) -> None:
+        self.assertEqual(calculate_rolling_trend([90.0], window=3), 0.0)
+
+
+class OdiRivalDegradTests(unittest.TestCase):
+    def test_rival_degrad_lowers_odi_when_wear_stable(self) -> None:
+        base = compute_overtake_difficulty_index(
+            pace_delta_ahead=0.5,
+            pace_delta_behind=0.0,
+            reentry_verdict="CLEAN",
+            draft_streak=0,
+        )
+        adj = compute_overtake_difficulty_index(
+            pace_delta_ahead=0.5,
+            pace_delta_behind=0.0,
+            reentry_verdict="CLEAN",
+            draft_streak=0,
+            rival_degrad=RIVAL_DEGRAD_TREND_MIN + 0.05,
+            wear_stable=True,
+        )
+        self.assertAlmostEqual(adj["score"], base["score"] * ODI_RIVAL_DEGRAD_MULT)
+
+
+class UndercutPredictorTests(unittest.TestCase):
+    def test_undercut_flag_in_draft_with_margin(self) -> None:
+        tracker = DriverContextTracker()
+        ir = MockIRacing({"LapDistPct": 0.5, "LatAccel": 0.0, "Speed": 50.0})
+        tracker.poll(
+            ir,
+            player_idx=0,
+            lap=10,
+            on_track=True,
+            gap_ahead_s=DRAFT_GAP_SEC - 0.2,
+            is_caution=False,
+            ahead_lap_times=[92.0, 92.1, 92.2],
+            best_lap_s=90.0,
+            pace_delta_ahead=0.3,
+            pit_loss_sec=45.0,
+        )
+        self.assertTrue(tracker.fi_odi_undercut)
+
+    def test_no_undercut_without_draft(self) -> None:
+        tracker = DriverContextTracker()
+        ir = MockIRacing({"LapDistPct": 0.5, "LatAccel": 0.0})
+        tracker.poll(
+            ir,
+            player_idx=0,
+            lap=10,
+            on_track=True,
+            gap_ahead_s=3.0,
+            is_caution=False,
+            ahead_lap_times=[92.0, 92.1, 92.2],
+            best_lap_s=90.0,
+            pace_delta_ahead=0.3,
+        )
+        self.assertFalse(tracker.fi_odi_undercut)
+
+
+class ThermalStressTests(unittest.TestCase):
+    def test_greasy_state_above_threshold(self) -> None:
+        tracker = DriverContextTracker()
+        ir = MockIRacing(
+            {
+                "LapDistPct": 0.5,
+                "LatAccel": 0.0,
+                "LFtempCM": THERMAL_GREASY_C + 1.0,
+                "RFtempCM": 90.0,
+            }
+        )
+        tracker.poll(ir, player_idx=0, lap=5, on_track=True, gap_ahead_s=None, is_caution=False)
+        self.assertEqual(tracker.m_drv_therm_stress, ThermalStressState.GREASY)
+
+
+class DivebombTests(unittest.TestCase):
+    def test_divebomb_flag_in_brake_zone(self) -> None:
+        tracker = DriverContextTracker()
+        lap_dist = (BRAKE_ZONE_LAP_DIST_START + 0.02)
+        ir = MockIRacing({"LapDistPct": lap_dist, "LatAccel": 0.0})
+        tracker.poll(
+            ir,
+            player_idx=0,
+            lap=8,
+            on_track=True,
+            gap_behind_s=0.35,
+            is_caution=False,
+            session_time_elapsed=10.0,
+        )
+        tracker.poll(
+            ir,
+            player_idx=0,
+            lap=8,
+            on_track=True,
+            gap_behind_s=0.15,
+            is_caution=False,
+            session_time_elapsed=10.5,
+        )
+        extras = tracker.build_packet_extras(
+            track_temp_c=None,
+            tire_wear_rate_est=None,
+            pit_loss_sec=45.0,
+            tire_falloff_s=0.08,
+            fuel_stint_cap=25,
+            rivals={},
+            you_pace={},
+            reentry_verdict="CLEAN",
+            current_lap=8,
+            gap_behind_s=0.35,
+        )
+        self.assertTrue(extras["fi"].get("tac", {}).get("db"))
+
+
+class TacticalAdviceTests(unittest.TestCase):
+    def test_tactical_undercut_advice_from_packet(self) -> None:
+        tel = inside_window_telemetry(
+            m={"fl": 1.8, "sl": 10, "lr": 30, "lp": 1, "l": 20},
+            r={"ftl": 25},
+            rv={"ahead": {"pos": 4}},
+            fi={"rej": {"v": "CLEAN"}, "odi": {"uc": True, "pa": 0.3, "pb": 0.0, "score": 0.3}},
+        )
+        advice = tactical_undercut_advice(tel)
+        self.assertIsNotNone(advice)
+        assert advice is not None
+        self.assertIn("UNDERCUT ACTIVE", advice.upper())
+        self.assertIn("OVERTAKE", advice)
+
+    def test_tactical_defensive_cool_tires(self) -> None:
+        tel = inside_window_telemetry(
+            m={"gb": 0.4, "drv": {"ts": 2, "tsn": "GREASY"}},
+            fi={"tac": {"cool": True}},
+        )
+        advice = tactical_defensive_advice(tel)
+        self.assertIsNotNone(advice)
+        assert advice is not None
+        self.assertIn("OVERHEATING", advice.upper())
+
+
+if __name__ == "__main__":
+    unittest.main()

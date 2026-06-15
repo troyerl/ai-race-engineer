@@ -11,6 +11,11 @@ Primary source files:
 | Garage / pre-race plan | `pre_race_strategy.py` |
 | Track pit-loss default | `ui.py` |
 | Receiver LAN snapshots | `remote_telemetry.py`, `race_memory.py` |
+| Voice relay | `speech.py`, `broadcaster_ui.py` |
+| Driver / environment context (§16) | `context_engine.py` |
+| Shared scalars | `race_constants.py` |
+
+§§1–16 = **implemented** in the repository (SDK fields may be missing per car/session; documented fallbacks apply).
 
 ---
 
@@ -672,4 +677,208 @@ TRIGGER: FUEL|TIRES  CONF: M
 
 ---
 
-*This file describes behavior as implemented in the repository. iRacing SDK availability varies by car/session; when data is missing, documented fallbacks apply.*
+## 16. Driver context & environment extensions
+
+The sections below extend the baseline engine with track temperature, marbles, incidents, steering fatigue, drafting, and overtake difficulty (ODI). Building blocks: `m.twr` / `twsl` (§3), `pace_stats` (§1), `fi.rej` (§6.3), fuel EMA (§2), `rivals.ahead/behind` pace (§1). Implementation: `context_engine.py`, wired in `telemetry.py` and `strategy_engine.py`.
+
+---
+
+### 16.1 Dynamic track & environmental evolution
+
+Real tracks and high-fidelity sim sessions evolve over a stint. The baseline engine today treats wear falloff (`m.fo`) and burn EMA as sufficient; these additions would make stint caps and call timing temperature- and line-dependent.
+
+#### 16.1.1 Track temperature vs. tire wear rate
+
+**SDK inputs:** `TrackTempCrew` or `TrackTemp` (°C, already in packet as `s.ttc` / `s.tt`), corner wear snapshots in pit box (`twl[].tt`).
+
+**Baseline calibration** (first stint or after each tire change):
+
+```
+twr_baseline[corner] = wear_delta / stint_laps     # existing §3.3 at reference temp
+T_ref                = track_temp_at_calibration
+```
+
+**Temperature-adjusted wear rate** (example linear model; coefficients TBD per series):
+
+```
+delta_T = T_current − T_ref
+twr_adj[corner] = twr_baseline[corner] × (1 + k_temp × delta_T)
+
+k_temp < 0   # hotter track → faster wear (typical)
+```
+
+**Stint cap adjustment** (extends §12.5 / live forecast):
+
+```
+tire_stint_cap_base = first_lap where cumulative triangular cost > pit_loss + bump   # §12.5
+
+If delta_T ≤ −10°C (track cooled):
+    tire_stint_cap = round(tire_stint_cap_base × (1 + 0.05 × |delta_T| / 10))   # e.g. +5% per 10°C cool
+Else if delta_T ≥ +10°C:
+    tire_stint_cap = max(1, round(tire_stint_cap_base × (1 − 0.08 × delta_T / 10))
+```
+
+**Engineer call use:** when `|delta_T| ≥ 10` and `tire_stint_cap` shifts by ≥ 2 laps vs pre-race plan, append NOTE or WHY: *"Track cooled — extend tire stint ~N laps vs plan."*
+
+#### 16.1.2 Marbles / off-line accumulation
+
+**SDK inputs:** `CarIdxTrackSurface`, `CarIdxLapDistPct`, lateral offset proxy (`LatAccel` spikes + `LapDistPct` not near racing line — or `PlayerCarIdx` off-track incidents).
+
+**Off-line event** (per lap):
+
+```
+off_line_lap = true if any of:
+  - PlayerCarInComponentIncidentCount increased (off-track component)
+  - LatAccel magnitude > threshold AND LapDistPct outside [line_min, line_max] for track (calibrated or % from center)
+```
+
+**Marble pickup state:**
+
+```
+marble_laps_remaining = 2   # after each off-line pass event
+grip_penalty_factor     = 0.97^(marble_laps_remaining)   # illustrative; tune per car
+```
+
+**Engineer call use:** when `marble_laps_remaining > 0`:
+
+```
+WHY: Pickup on tires — expect understeer for a lap or two; avoid offline passes.
+CONF: M
+TRIGGER: TIRES
+```
+
+Decay `marble_laps_remaining` by 1 each completed green lap in clean air.
+
+---
+
+### 16.2 Driver consistency & psychology (incident tracker)
+
+Strategy should adapt when the driver is making repeated micro-errors, not only when lap time degrades.
+
+#### 16.2.1 Incident point tracking
+
+**SDK inputs:** `PlayerCarInComponentIncidentCount` (per-component array), session incident limits from SessionInfo / `WeekendInfo` if available.
+
+**Rolling window** (per stint):
+
+```
+off_track_events = count of off-track component increments in last W_laps (W = 3)
+incident_rate    = off_track_events / W_laps
+license_headroom = max(0, incident_limit − session_incidents_so_far)   # if limit known
+```
+
+**Triggers:**
+
+| Condition | Voice / UI |
+|-----------|------------|
+| `off_track_events ≥ 2` within 3 laps | *"Pushing too hard — back it down 2%."* (`TRIGGER: TRACK`, `CONF: M`) |
+| `license_headroom ≤ 2` and rival within 1.0 s | Bias toward **STAY OUT** / let faster car pass (avoid 0x on defense) |
+| `license_headroom ≤ 1` | Suppress aggressive **PIT NOW** unless fuel critical |
+
+**Packet shape:** `m.inc = {ot: off_track_events_3lap, hr: license_headroom, tot: session_incidents}`.
+
+#### 16.2.2 Steering input smoothness (micro-correction delta)
+
+**SDK inputs:** `SteeringWheelAngle` (or `Steering`) sampled at 10–20 Hz in a defined high-speed corner sector (e.g. `LapDistPct ∈ [0.35, 0.42]` on track X — or highest `LatAccel` sector per lap).
+
+**Per-lap metric:**
+
+```
+samples = SteeringWheelAngle(t) in corner_sector
+steer_std = std_dev(samples)
+steer_baseline = EMA(steer_std over clean laps at stint start)
+delta_steer = steer_std / max(steer_std_baseline, ε)
+```
+
+**Interpretation:**
+
+```
+delta_steer > 1.4  → tire or driver fatigue likely (corrections increasing)
+delta_steer > 1.8  → voice: "Car is loose — consider short-shifting or pit when window opens"
+```
+
+Correlate with `m.fo` and `m.twr`: if `delta_steer` rises while lap time is flat, prefer earlier tire stop in forecast by 1–2 laps.
+
+**Packet shape:** `m.drv = {ss: steer_std, ssr: delta_steer}`.
+
+---
+
+### 16.4 Advanced traffic & drafting logic
+
+Extends §6 (field intel) and §8 (green-flag loss) with fuel and pace context.
+
+#### 16.4.1 Drafting / aerodynamic wake
+
+**Detection:**
+
+```
+in_draft = (gap_behind_car_ahead < 1.5 s) AND (not passing) AND on_track
+draft_lap_count += 1 per lap while in_draft
+```
+
+Use `m.gb` inverse / `CarIdxF2Time` to car ahead; “not passing” = your `LapDistPct` not gaining > 0.02 per lap on that car.
+
+**Fuel EMA exclusion:**
+
+```
+On lap boundary:
+  if draft_lap_count_last_lap ≥ 1:
+    exclude this lap's fuel sample from green-flag EMA update   # §2.1
+    tag lap as draft_inflated in burn history (m.fbh meta)
+  else:
+    normal EMA update
+```
+
+**Effect:** after 5 consecutive draft laps, temporarily expect **lower** clean-air burn when projecting stops; do not shorten fuel stint from draft-skewed samples.
+
+**Temperature side-effect (optional):** `in_draft` → increment engine/tire temp proxy; pairs with §16.1.1 `k_temp`.
+
+**Packet shape:** `fi.draft = {on: bool, streak: int, ex: laps_excluded_from_ema}`.
+
+#### 16.4.2 Relative pace dynamic (overtake difficulty index)
+
+**Inputs:** `rivals.ahead.pace.avg_last3_s`, `rivals.behind.pace.avg_last3_s`, your `pc.avg_last3_s`, `fi.rej.v` (§6.3).
+
+```
+pace_delta_ahead  = your_avg3 − ahead_avg3     # positive = you are faster
+pace_delta_behind = behind_avg3 − your_avg3    # positive = pressure from behind
+```
+
+**Overtake difficulty index (ODI):**
+
+```
+ODI = pace_delta_ahead
+      − (0.5 if rej.v == PACK else 0)
+      − (0.3 if draft_lap_count ≥ 3 else 0)    # stuck in train
+```
+
+**Strategy override** (when `inside_window` would call pit):
+
+| Condition | Call |
+|-----------|------|
+| `ODI ≥ 0.5` and `rej.v == PACK` | **STAY OUT** — *"You have pace to pass on track; don't pit into traffic."* |
+| `ODI ≥ 0.5` and `inside_window` and fuel not critical | Defer pit 1–2 laps; re-check ODI |
+| `ODI < −0.3` and `pace_delta_behind > 0.2` | Pit when window opens — undercut threat |
+
+Integrates with existing PACK delay (§10.2 row 6): PACK + fast pace → stronger stay-out; PACK + slow pace → keep delay or pit.
+
+**Packet shape:** `fi.odi = {pa: pace_delta_ahead, pb: pace_delta_behind, score: ODI}`.
+
+---
+
+### 16.5 Implementation notes
+
+| Topic | Depends on | Risk |
+|-------|------------|------|
+| Track temp wear | `twl` history + `s.ttc` | Car/track-specific `k_temp` needs calibration |
+| Marbles | Incident + lateral data | False positives on street circuits |
+| Incidents | `PlayerCarInComponentIncidentCount` | License limits not always in YAML |
+| Steering std | High-rate sampling + sector map | CPU / packet size; per-track sectors |
+| Draft EMA skip | Gap + lap dist | Must not starve EMA on oval traffic |
+| ODI | Rival pace buffers (§1) | Requires stable `rivals.ahead` link |
+
+When implemented, constants for §16 live in `race_constants.py` and engineer-call text in `strategy_engine.py`, matching patterns in §10–§11.
+
+---
+
+*This file describes behavior as implemented in the repository (§§1–16). iRacing SDK availability varies by car/session; when data is missing, documented fallbacks apply.*

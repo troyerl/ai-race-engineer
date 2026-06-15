@@ -65,9 +65,10 @@ QLabel#cardHint {
     background: transparent;
 }
 QLabel#adviceText {
-    font-size: 19px;
-    font-weight: 600;
-    line-height: 155%;
+    font-family: "Menlo", "Consolas", "Courier New", monospace;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 145%;
     color: #eef6f0;
 }
 QLabel#adviceStandby {

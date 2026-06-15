@@ -32,6 +32,7 @@ from race_constants import (
     triangular_payback_lap,
     wrap_lap_distance_delta,
 )
+from context_engine import DriverContextTracker
 from pre_race_strategy import find_race_session, race_lap_total_from_session
 
 # AI-facing packet uses US customary fuel units (internal math stays liters + kg/h).
@@ -196,6 +197,202 @@ def _leader_lap_from_car_laps(laps: list | None) -> int | None:
         except (TypeError, ValueError):
             continue
     return best
+
+
+def _find_leader_idx(
+    laps: list | None,
+    positions: list | None,
+    surfaces: list | None,
+) -> int | None:
+    """Car index of the race leader (class P1 on the lead lap, on track)."""
+    leader_lap = _leader_lap_from_car_laps(laps)
+    if leader_lap is None or not isinstance(positions, (list, tuple)):
+        return None
+    for idx, pos in enumerate(positions):
+        try:
+            p = int(pos)
+        except (TypeError, ValueError):
+            continue
+        if p != 1:
+            continue
+        lap_v = None
+        if isinstance(laps, (list, tuple)) and idx < len(laps):
+            try:
+                lap_v = int(laps[idx])
+            except (TypeError, ValueError):
+                lap_v = None
+        if lap_v is None or lap_v < leader_lap:
+            continue
+        if isinstance(surfaces, (list, tuple)) and idx < len(surfaces):
+            try:
+                if int(surfaces[idx]) not in (_TRK_ON_TRACK, _TRK_APPROACHING_PITS):
+                    continue
+            except (TypeError, ValueError):
+                pass
+        return idx
+    return None
+
+
+def _gap_to_leader_seconds(
+    player_idx: int,
+    leader_idx: int | None,
+    *,
+    laps: list | None,
+    lap_dist: list | None,
+    f2_times: list | None,
+    lap_s: float,
+) -> float | None:
+    """Seconds behind the race leader (best-effort; None when unknown)."""
+    if leader_idx is None or player_idx is None:
+        return None
+    lap_s = clamp_avg_lap_seconds(lap_s)
+    if lap_s <= 0:
+        return None
+
+    if isinstance(f2_times, (list, tuple)) and player_idx < len(f2_times):
+        try:
+            g = float(f2_times[player_idx])
+            if g >= 0:
+                return round(g, 2)
+        except (TypeError, ValueError):
+            pass
+
+    leader_lap = None
+    player_lap = None
+    if isinstance(laps, (list, tuple)):
+        if leader_idx < len(laps):
+            try:
+                leader_lap = int(laps[leader_idx])
+            except (TypeError, ValueError):
+                leader_lap = None
+        if player_idx < len(laps):
+            try:
+                player_lap = int(laps[player_idx])
+            except (TypeError, ValueError):
+                player_lap = None
+
+    if leader_lap is None or player_lap is None or leader_lap <= 0 or player_lap <= 0:
+        return None
+
+    lap_delta = max(0, leader_lap - player_lap)
+    if lap_delta == 0 and isinstance(lap_dist, (list, tuple)):
+        if player_idx < len(lap_dist) and leader_idx < len(lap_dist):
+            ld_p = clamp_lap_distance_pct(lap_dist[player_idx])
+            ld_l = clamp_lap_distance_pct(lap_dist[leader_idx])
+            if ld_p is not None and ld_l is not None:
+                dd = wrap_lap_distance_delta(ld_p, ld_l)
+                if dd >= 0:
+                    return round(dd * lap_s, 2)
+                return round((1.0 + dd) * lap_s, 2)
+
+    if lap_delta > 0:
+        on_lap = 0.0
+        if isinstance(lap_dist, (list, tuple)) and player_idx < len(lap_dist) and leader_idx < len(lap_dist):
+            ld_p = clamp_lap_distance_pct(lap_dist[player_idx])
+            ld_l = clamp_lap_distance_pct(lap_dist[leader_idx])
+            if ld_p is not None and ld_l is not None:
+                on_lap = max(0.0, (1.0 - ld_p + ld_l) % 1.0) * lap_s
+        if lap_delta == 1 and on_lap > 0:
+            return round(on_lap, 2)
+        return round(lap_delta * lap_s + on_lap, 2)
+
+    return None
+
+
+def compute_reentry_verdict(
+    player_idx: int,
+    *,
+    lap_dist: list | None,
+    surfaces: list | None,
+    laps: list | None,
+    positions: list | None,
+    f2_times: list | None,
+    pit_loss_sec: float,
+    lap_s: float,
+    traffic_window: float = REENTRY_WINDOW_PCT,
+) -> dict[str, Any]:
+    """
+    Project pit reentry traffic (§6.3) and green-flag lap-down risk (§8 extension).
+
+    When pit loss exceeds gap to the leader, sets ``v=LAPPED_DANGER`` and ``pll`` ≥ 1.
+    """
+    if not isinstance(lap_dist, (list, tuple)) or player_idx >= len(lap_dist):
+        return {"v": "UNKNOWN"}
+
+    player_dist = clamp_lap_distance_pct(lap_dist[player_idx])
+    lap_s = clamp_avg_lap_seconds(lap_s)
+    if player_dist is None or lap_s <= 0:
+        return {"v": "UNKNOWN"}
+
+    leader_lap = _leader_lap_from_car_laps(laps)
+    pit_frac = (float(pit_loss_sec) / lap_s) % 1.0
+    reentry_dist = (player_dist + pit_frac) % 1.0
+    pack = 0
+    lap_down_in_window = 0
+
+    for idx, dist in enumerate(lap_dist):
+        if idx == player_idx:
+            continue
+        d = clamp_lap_distance_pct(dist)
+        if d is None:
+            continue
+        if isinstance(surfaces, (list, tuple)) and idx < len(surfaces):
+            try:
+                if int(surfaces[idx]) not in (_TRK_ON_TRACK, _TRK_APPROACHING_PITS):
+                    continue
+            except (TypeError, ValueError):
+                pass
+        dd = abs(wrap_lap_distance_delta(reentry_dist, d))
+        if dd <= traffic_window:
+            pack += 1
+            if leader_lap is not None and isinstance(laps, (list, tuple)) and idx < len(laps):
+                try:
+                    car_lap = int(laps[idx])
+                    if 0 < car_lap < leader_lap:
+                        lap_down_in_window += 1
+                except (TypeError, ValueError):
+                    pass
+
+    if pack == 0:
+        base_verdict = "CLEAN"
+    elif pack >= 2:
+        base_verdict = "PACK"
+    else:
+        base_verdict = "TRAFFIC"
+
+    leader_idx = _find_leader_idx(laps, positions, surfaces)
+    gap_to_leader = _gap_to_leader_seconds(
+        player_idx,
+        leader_idx,
+        laps=laps,
+        lap_dist=lap_dist,
+        f2_times=f2_times,
+        lap_s=lap_s,
+    )
+
+    projected_laps_lost = 0
+    if gap_to_leader is not None and float(pit_loss_sec) > gap_to_leader:
+        projected_laps_lost = int((float(pit_loss_sec) - gap_to_leader) // lap_s)
+
+    verdict = base_verdict
+    if projected_laps_lost >= 1:
+        verdict = "LAPPED_DANGER"
+
+    out: dict[str, Any] = {
+        "v": verdict,
+        "bv": base_verdict,
+        "n": pack,
+        "dp": round(reentry_dist, 4),
+    }
+    if gap_to_leader is not None:
+        out["gtl"] = gap_to_leader
+    if projected_laps_lost > 0:
+        out["pll"] = projected_laps_lost
+    if lap_down_in_window > 0:
+        out["ldw"] = lap_down_in_window
+    if leader_lap is not None:
+        out["ll"] = leader_lap
+    return out
 
 
 def _car_is_pitting(idx: int, on_pit_road: list | None, surfaces: list | None) -> bool:
@@ -394,6 +591,9 @@ class TelemetryTracker:
         # Opponent surface transitions (herd dynamics).
         self._last_car_surface: dict[int, int] = {}
 
+        self._ctx = DriverContextTracker()
+        self._incident_limit_loaded = False
+
     def ensure_connected(self) -> bool:
         if not self.ir.is_connected:
             self.ir.startup()
@@ -449,7 +649,14 @@ class TelemetryTracker:
             return default
         return default if v is None else v
 
-    def _tick_fuel_per_lap_ema(self, lap_int: Any, fuel_level: float, fuel_capacity: Any) -> None:
+    def _tick_fuel_per_lap_ema(
+        self,
+        lap_int: Any,
+        fuel_level: float,
+        fuel_capacity: Any,
+        *,
+        exclude_sample: bool = False,
+    ) -> None:
         """Track liters consumed per lap from lap-boundary deltas (more reliable than idle kg/h)."""
         if not isinstance(lap_int, int):
             return
@@ -466,7 +673,7 @@ class TelemetryTracker:
             if lap_int < pl:
                 self._fuel_per_lap_ema_L = None
                 self._fuel_last_lap_burn_L = None
-            elif lap_int > pl:
+            elif lap_int > pl and not exclude_sample:
                 dl = lap_int - pl
                 df = pf - fuel_level
                 if dl >= 1 and df > 0.02:
@@ -503,42 +710,23 @@ class TelemetryTracker:
         surfaces: list | None,
         pit_loss_sec: float,
         lap_s: float,
+        laps: list | None = None,
+        positions: list | None = None,
+        f2_times: list | None = None,
         traffic_window: float = REENTRY_WINDOW_PCT,
     ) -> dict[str, Any]:
-        """Estimate whether a pit now merges into clean air or a traffic pack."""
-        if not isinstance(lap_dist, (list, tuple)) or player_idx >= len(lap_dist):
-            return {"v": "UNKNOWN"}
-        player_dist = clamp_lap_distance_pct(lap_dist[player_idx])
-        lap_s = clamp_avg_lap_seconds(lap_s)
-        if player_dist is None or lap_s <= 0:
-            return {"v": "UNKNOWN"}
-
-        pit_frac = (float(pit_loss_sec) / lap_s) % 1.0
-        reentry_dist = (player_dist + pit_frac) % 1.0
-        pack = 0
-        for idx, dist in enumerate(lap_dist):
-            if idx == player_idx:
-                continue
-            d = clamp_lap_distance_pct(dist)
-            if d is None:
-                continue
-            if isinstance(surfaces, (list, tuple)) and idx < len(surfaces):
-                try:
-                    if int(surfaces[idx]) not in (_TRK_ON_TRACK, _TRK_APPROACHING_PITS):
-                        continue
-                except (TypeError, ValueError):
-                    pass
-            dd = abs(wrap_lap_distance_delta(reentry_dist, d))
-            if dd <= traffic_window:
-                pack += 1
-
-        if pack == 0:
-            verdict = "CLEAN"
-        elif pack >= 2:
-            verdict = "PACK"
-        else:
-            verdict = "TRAFFIC"
-        return {"v": verdict, "n": pack, "dp": round(reentry_dist, 4)}
+        """Estimate whether a pit now merges into clean air or lap-down danger."""
+        return compute_reentry_verdict(
+            player_idx,
+            lap_dist=lap_dist,
+            surfaces=surfaces,
+            laps=laps,
+            positions=positions,
+            f2_times=f2_times,
+            pit_loss_sec=float(pit_loss_sec),
+            lap_s=float(lap_s),
+            traffic_window=traffic_window,
+        )
 
     def _pitting_ratios(
         self,
@@ -690,6 +878,9 @@ class TelemetryTracker:
             surfaces=surfaces,
             pit_loss_sec=float(pit_loss_sec),
             lap_s=float(lap_s),
+            laps=self._ir_get("CarIdxLap", []) or [],
+            positions=positions,
+            f2_times=f2,
         )
         if rej.get("v") != "UNKNOWN":
             fi["rej"] = rej
@@ -713,6 +904,28 @@ class TelemetryTracker:
     # ----------------------------
     # Small helpers (shared logic)
     # ----------------------------
+
+    def _maybe_load_incident_limit(self) -> None:
+        if self._incident_limit_loaded:
+            return
+        self._incident_limit_loaded = True
+        sy = self.get_session_yaml_dict()
+        if not isinstance(sy, dict):
+            return
+        wi = sy.get("WeekendInfo")
+        if not isinstance(wi, dict):
+            return
+        opts = wi.get("WeekendOptions")
+        if not isinstance(opts, dict):
+            return
+        for key in ("IncidentLimit", "IncidentLimitPerRace"):
+            try:
+                lim = int(opts.get(key))
+                if lim > 0:
+                    self._ctx.set_incident_limit(lim)
+                    return
+            except (TypeError, ValueError):
+                continue
 
     def _idx_by_class_pos(self, target_pos: int) -> int | None:
         positions = self._ir_get("CarIdxClassPosition", []) or []
@@ -967,6 +1180,12 @@ class TelemetryTracker:
                     if isinstance(lap_now, int):
                         self._fuel_prev_lap = lap_now
                         self._fuel_prev_level_L = fuel_level
+                tt = self._ir_get("TrackTempCrew", None) or self._ir_get("TrackTemp", None)
+                try:
+                    tt_f = float(tt) if tt is not None else None
+                except (TypeError, ValueError):
+                    tt_f = None
+                self._ctx.reset_stint(track_temp_c=tt_f)
             self._last_on_pit_road = on_pit_road
 
         laps = self.ir["CarIdxLap"] or []
@@ -1001,8 +1220,60 @@ class TelemetryTracker:
 
         fuel_level = clamp_nonneg_liters(self._ir_get("FuelLevel", 0.0))
         fuel_capacity = self._ir_get("FuelCapacity", None)
+        self._maybe_load_incident_limit()
+
+        flags = _parse_session_flags_bools(
+            self._ir_get("SessionFlags", 0),
+            self._ir_get("PitsOpen", None),
+        )
+        is_caution = bool(flags.get("cau") or flags.get("yel"))
+        on_track = bool(self._ir_get("IsOnTrack", False))
+        avg_lap_s = self._avg_lap_s_for_idx(player_idx, fallback=DEFAULT_AVG_LAP_S)
+        ahead_idx = self._idx_by_class_pos(player_pos - 1) if player_pos else None
+        behind_idx = self._idx_by_class_pos(player_pos + 1) if player_pos else None
+        gap_ahead_s = self._gap_est_s(player_idx, ahead_idx, lap_s_fallback=avg_lap_s)
+        gap_behind_s = self._gap_est_s(player_idx, behind_idx, lap_s_fallback=avg_lap_s)
+        lap_i = lap_now if isinstance(lap_now, int) else None
+        ahead_times = list(self.field_history.get(ahead_idx, [])) if ahead_idx is not None else None
+        best_lap = None
+        you_times_early = list(self.field_history.get(player_idx, []))
+        if you_times_early:
+            best_lap = min(you_times_early)
+        pa_early = None
+        if ahead_times and you_times_early:
+            you_avg = sum(you_times_early[-3:]) / min(3, len(you_times_early))
+            ah_avg = sum(ahead_times[-3:]) / min(3, len(ahead_times))
+            if ah_avg > 0:
+                pa_early = you_avg - ah_avg
+        session_te = self._ir_get("SessionTime", None)
+        if session_te is None:
+            session_te = self._ir_get("SessionTimeElapsed", None)
+        try:
+            session_te_f = float(session_te) if session_te is not None else None
+        except (TypeError, ValueError):
+            session_te_f = None
+        self._ctx.poll(
+            self._ir_get,
+            player_idx=player_idx,
+            lap=lap_i,
+            on_track=on_track,
+            gap_ahead_s=gap_ahead_s,
+            gap_behind_s=gap_behind_s,
+            is_caution=is_caution,
+            session_time_elapsed=session_te_f,
+            ahead_lap_times=ahead_times,
+            pit_loss_sec=float(self._ir_get("PitLaneTime", 45) or 45),
+            best_lap_s=best_lap,
+            pace_delta_ahead=pa_early,
+        )
+
         if isinstance(lap_now, int):
-            self._tick_fuel_per_lap_ema(lap_now, fuel_level, fuel_capacity)
+            self._tick_fuel_per_lap_ema(
+                lap_now,
+                fuel_level,
+                fuel_capacity,
+                exclude_sample=self._ctx.consume_fuel_ema_skip(),
+            )
 
         for i in tracked:
             if i >= len(laps) or i >= len(last_lap_times):
@@ -1451,6 +1722,32 @@ class TelemetryTracker:
             packet["fi"] = field_intel
         if twl:
             packet["twl"] = twl
+
+        reentry_verdict = None
+        if isinstance(field_intel, dict):
+            rej_obj = field_intel.get("rej")
+            if isinstance(rej_obj, dict):
+                reentry_verdict = rej_obj.get("v")
+        stint_cap_laps = max(1, int(ftl)) if ftl is not None else 25
+        ctx_extras = self._ctx.build_packet_extras(
+            track_temp_c=track_temp_c,
+            tire_wear_rate_est=tire_wear_rate_est,
+            pit_loss_sec=float(pit_loss_sec),
+            tire_falloff_s=float(falloff_s) if isinstance(falloff_s, (int, float)) else 0.08,
+            fuel_stint_cap=stint_cap_laps,
+            rivals=rivals,
+            you_pace=you_pace,
+            reentry_verdict=reentry_verdict,
+            current_lap=lap_int if isinstance(lap_int, int) else None,
+            gap_behind_s=gap_behind_s,
+        )
+        if isinstance(ctx_extras.get("m"), dict) and ctx_extras["m"]:
+            packet["m"].update(ctx_extras["m"])
+        if isinstance(ctx_extras.get("s"), dict) and ctx_extras["s"]:
+            packet["s"].update(ctx_extras["s"])
+        fi_extra = ctx_extras.get("fi")
+        if isinstance(fi_extra, dict) and fi_extra:
+            packet.setdefault("fi", {}).update(fi_extra)
 
         if session_yaml:
             packet["sy"] = session_yaml

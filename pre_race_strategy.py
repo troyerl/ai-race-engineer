@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from context_engine import adjust_tire_stint_cap_for_track_temp
 from race_constants import IRSDK_TIRE_SETS_UNLIMITED, TIRE_COST_THRESHOLD_BUMP, first_lap_triangular_cost_exceeds
 
 _IRACING_LAPS_UNKNOWN_MIN = 32000
@@ -183,6 +184,9 @@ def generate_pre_race_green_plan(
     session_yaml: dict[str, Any],
     baseline: dict[str, Any],
     rules: dict[str, Any],
+    *,
+    track_temp_c: float | None = None,
+    track_temp_ref_c: float | None = None,
 ) -> dict[str, Any]:
     """
     Calculates a definitive pit stop strategy assuming standard uninterrupted green flag conditions.
@@ -216,6 +220,14 @@ def generate_pre_race_green_plan(
     )
     if exceed_lap is not None:
         tire_stint_cap = exceed_lap
+
+    if track_temp_c is not None:
+        ref = track_temp_ref_c if track_temp_ref_c is not None else track_temp_c
+        tire_stint_cap, _ = adjust_tire_stint_cap_for_track_temp(
+            tire_stint_cap,
+            track_temp_c=track_temp_c,
+            ref_temp_c=ref,
+        )
 
     stint_length = max(1, min(fuel_stint_cap, tire_stint_cap))
     total_stops = max(0, int(total_laps / stint_length))
@@ -373,5 +385,32 @@ def run_pre_race_plan(telemetry: dict[str, Any], *, track_name: str | None = Non
     session_yaml = session_yaml_from_telemetry(telemetry, track_name=track_name)
     baseline = baseline_from_telemetry(telemetry)
     rules = rules_from_telemetry(telemetry)
-    plan = generate_pre_race_green_plan(session_yaml, baseline, rules)
+    s = telemetry.get("s", {}) if isinstance(telemetry.get("s"), dict) else {}
+    track_temp_c = None
+    track_temp_ref_c = None
+    try:
+        if s.get("ttc") is not None:
+            track_temp_c = float(s["ttc"])
+    except (TypeError, ValueError):
+        track_temp_c = None
+    tenv = s.get("tenv")
+    if isinstance(tenv, dict):
+        try:
+            if tenv.get("ref") is not None:
+                track_temp_ref_c = float(tenv["ref"])
+        except (TypeError, ValueError):
+            track_temp_ref_c = None
+        if track_temp_c is None:
+            try:
+                if tenv.get("cur") is not None:
+                    track_temp_c = float(tenv["cur"])
+            except (TypeError, ValueError):
+                pass
+    plan = generate_pre_race_green_plan(
+        session_yaml,
+        baseline,
+        rules,
+        track_temp_c=track_temp_c,
+        track_temp_ref_c=track_temp_ref_c,
+    )
     return format_pre_race_plan(plan)
