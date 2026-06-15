@@ -955,6 +955,18 @@ class TelemetryTracker:
                 if isinstance(lap_now, int):
                     self._stint_start_lap = lap_now
                     self._last_pit_lap = lap_now
+                fuel_level = clamp_nonneg_liters(self._ir_get("FuelLevel", 0.0))
+                fuel_cap = self._ir_get("FuelCapacity", None)
+                try:
+                    cap_f = float(fuel_cap) if fuel_cap is not None else None
+                except (TypeError, ValueError):
+                    cap_f = None
+                if cap_f and cap_f > 0 and fuel_level >= cap_f * 0.88:
+                    self._fuel_per_lap_ema_L = None
+                    self._fuel_last_lap_burn_L = None
+                    if isinstance(lap_now, int):
+                        self._fuel_prev_lap = lap_now
+                        self._fuel_prev_level_L = fuel_level
             self._last_on_pit_road = on_pit_road
 
         laps = self.ir["CarIdxLap"] or []

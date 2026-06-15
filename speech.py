@@ -56,7 +56,7 @@ def _speech_lines(full: str, *, include_why: bool) -> list[str]:
         if not s:
             continue
         upper = s.upper()
-        if upper.startswith("TRIGGER:"):
+        if upper.startswith("TRIGGER:") or upper.startswith("FORECAST:"):
             continue
         if upper.startswith("WHY:"):
             if include_why:

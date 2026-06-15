@@ -33,7 +33,7 @@ flowchart LR
 User-adjustable inputs that feed calculations:
 
 - **Pit loss (sec)** — time lost vs staying out (default from track length; see below).
-- **Tire sets remaining** — affects whether stops are `4 TIRES` vs `FUEL ONLY`.
+- **Tire sets remaining** — affects whether stops are `4 TIRES` vs `FUEL ONLY`. Auto-syncs from SDK (`TireSetsAvailable` in race; `PlayerCarDryTireSetLimit` in practice/qualifying when the series caps sets).
 
 ---
 
@@ -90,6 +90,8 @@ fuel_per_lap_ema = FUEL_EMA_ALPHA × sample + (1 − FUEL_EMA_ALPHA) × previous
 ```
 
 Lap counter going **backward** (session reset) clears the EMA.
+
+**After pit exit** (transition `OnPitRoad: true → false`): if `FuelLevel ≥ 88%` of tank capacity, clear the lap EMA and lap-boundary trackers so the first flying laps after a fill-up are not skewed by pit-road burn.
 
 ### 2.2 Instantaneous estimate (fallback)
 
@@ -178,6 +180,8 @@ lb/h   = kg/h × 2.204622621847693185
 
 `sl` = laps since last **exit** from pit road (transition `OnPitRoad: true → false` resets stint).
 
+`lp` = lap number recorded at that exit (`last_pit_lap`). Strategy helpers also derive stint length as `Lap − lp` when `sl` is absent.
+
 ### 3.2 Tire wear snapshot
 
 Corner wear = average of L/M/R tread (`LFwearL`, etc.) or `PitSv*Toffset` in the stall.
@@ -217,16 +221,24 @@ For lap = 1, 2, 3, …:
 
 ## 4. Pit window helpers
 
+Telemetry exposes two related flags:
+
 ```
-pit_window_open (pw) = can_make_to_end    # fuel can finish race without stop
+can_make_to_end (mk) = (laps_of_fuel_left ≥ SessionLapsRemain)
+pit_window_open   (pw) = can_make_to_end    # same value in packet; informational
 laps_until_window (pwu) = max(0, laps_remain − laps_of_fuel_left)
 ```
 
-Strategy engine also treats the window as open when:
+**Important:** `mk = true` means you have **enough fuel to finish the race** — it does **not** by itself mean “pit now.”
+
+The strategy engine’s **`inside_window`** (trusted fuel) is:
 
 ```
-pw is true  OR  laps_of_fuel_left ≤ pit_payback_laps (pb)
+inside_window = (mk is false)           # cannot make it to the end on fuel → must plan a stop
+             OR (fuel_laps_left ≤ pb)   # within tire payback range (m.pb)
 ```
+
+Untrusted fuel (`x.fe = 0` or `fcq` low): `inside_window = fuel_laps_left ≤ 2`.
 
 ---
 
@@ -393,7 +405,7 @@ Entry: `evaluate_and_forecast_strategy(telemetry)` in `strategy_engine.py`.
 
 ```
 fuel_laps_left = m.fl
-inside_window  = m.pw OR (fuel_laps_left ≤ m.pb)
+inside_window  = (m.mk is false) OR (fuel_laps_left ≤ m.pb)
 fuel_critical  = fuel_laps_left ≤ 1
 ```
 
@@ -405,6 +417,14 @@ inside_window  = fuel_laps_left ≤ 2
 fuel_critical  = fuel_laps_left ≤ 1
 ```
 
+**Post-pit quiet** (`_post_pit_alert_quiet`): if stint laps since last pit exit are below:
+
+```
+min_stint_before_alert = max(POST_PIT_ALERT_MIN_STINT_LAPS, ftl − ALERT_LAP_HORIZON − 1)
+```
+
+(default `POST_PIT_ALERT_MIN_STINT_LAPS = 6`), suppress **PIT NOW** from an open window unless fuel is critical. Holds **STAY OUT** with reason “fresh stint after pit stop.”
+
 ### 10.2 Immediate decision (priority order)
 
 | # | Condition | Action |
@@ -413,7 +433,8 @@ fuel_critical  = fuel_laps_left ≤ 1
 | 2 | On pit road / in stall | STAY OUT (REPAIR if `PitRepairLeft > 0`) |
 | 3 | Yellow/caution | Caution rules ([§7](#7-caution-pit-impact), fuel critical) |
 | 4 | Fuel critical | PIT NOW |
-| 5 | Pit window open + reentry `CLEAN` | PIT NOW |
+| 5 | Pit window open + reentry `CLEAN` + not in post-pit quiet | PIT NOW |
+| 5b | Pit window open + reentry `CLEAN` + post-pit quiet | STAY OUT (fresh stint) |
 | 6 | Pit window open + reentry `PACK` | STAY OUT (delay 1 lap) |
 | 7 | Default | STAY OUT |
 
@@ -431,11 +452,12 @@ Skipped while yellow is active (`paused_for_caution`).
 Simulation state after immediate call:
 
 - If pitting now: next lap starts with full tank stint `max_tank_stint = max(1, ftl − 1)`
-- If staying out: seed fuel from **green-flag EMA only** (Section 10.3 stint inflation fix):
+- If staying out: seed fuel via `_forecast_fuel_laps_seed()`:
+  - **Laps 0–3 after pit exit:** `sim_fuel = max(max_tank_stint, green_fuel_laps) − 1` (full-tank stint, not stale pre-pit burn)
+  - **Otherwise:** `sim_fuel = green_fuel_laps − 1` from green-flag EMA only (Section 2.3; not caution-inflated `m.fl`)
 
 ```
 green_fuel_laps = fuel_liters / m.fpe_ema_L     # m.fpe in packet, converted to L/lap
-sim_fuel        = green_fuel_laps − 1            # not live m.fl (caution-inflated)
 ```
 
 Implemented as `green_flag_fuel_laps_from_telemetry()` in `race_constants.py`.
@@ -469,14 +491,29 @@ Heuristic from WHY text and flags:
 
 ## 11. Auto pit alerts
 
-Fires every lap and on caution entry when `should_auto_alert()` is true (default horizon **`ALERT_LAP_HORIZON` = 5** laps).
+Evaluated on the engineer PC when **Auto pit alerts** is on (`ui.py` → `_check_auto_strategy()`). Triggers on **lap change** or **caution state change** (receiver: once per LAN snapshot, not duplicated on the local poll timer).
 
-Alert if **any** of:
+Default horizon: **`ALERT_LAP_HORIZON` = 5** laps.
 
-1. Parsed call is `PIT` / `PIT NOW` within **N** laps
-2. `fuel_laps_left ≤ N` and (already pit call, or `pw`, or `fuel ≤ pb + 1`)
-3. Under caution: fuel ≤ `min(3, N)` with pit window / pit call
-4. Forecast lists a stop with `laps_from_now ≤ N`
+### 11.1 When `should_auto_alert()` returns true
+
+1. **Caution just started** (`caution_started` and yellow/caution flags active) — always announce the engineer call (pit / stay out), even if the call line matches a prior alert.
+2. **Explicit pit timing** — parsed call is `PIT` / `PIT NOW` with `laps_until_pit ≤ N`.
+3. **Fuel pressure** — `fuel_laps_left ≤ N` and (pit call, `mk` is false, or `fuel ≤ pb + 1`). **Fuel critical** (`≤ 1` lap) always alerts even during post-pit quiet.
+4. **Forecast stop** — projected stop with `laps_from_now ≤ N`, unless:
+   - caution **just ended** (`caution_ended` — forecast resume alone does not alert), or
+   - **post-pit quiet** (Section 10.1) is active.
+
+### 11.2 Delivery deduplication
+
+- **Call line** (first line: `ACTION — TIMING — SERVICE`) is the dedup key for voice and relay — not the full text (FORECAST changes every lap).
+- Same call line on consecutive laps does not re-speak unless caution started.
+- One caution announcement per yellow (`_auto_caution_announced` until green).
+- Sim PC (`broadcaster_ui.py`) also dedupes TTS by call line.
+
+### 11.3 Voice (sim PC)
+
+TTS reads the **call line** and optional **WHY** only. **FORECAST** and **TRIGGER** lines are display-only (skipped by `speech.py`).
 
 ---
 
@@ -484,7 +521,36 @@ Alert if **any** of:
 
 Entry: `run_pre_race_plan()` → `generate_pre_race_green_plan()`.
 
-### 12.1 Baseline from telemetry
+Used in **garage / off-track** mode (`ui_mode() == strategy`) — including when you are in **practice or qualifying** on a race server but want the **race** stint plan.
+
+### 12.1 Race session resolution
+
+`find_race_session()` scans embedded SessionInfo YAML (`packet.sy`) for the **Race** session, not the current session:
+
+- `SessionType` case-insensitive `"race"`
+- `SessionName` in `{RACE, MAIN RACE, FEATURE RACE, …}` (iRacing often uses uppercase `RACE`)
+- Prefers the last non-skipped race session in the weekend list
+
+Packet hints when YAML is slim:
+
+- `s.race_lt` — race `SessionLaps` from YAML (never practice/qual lap count)
+- `r.tsl` — race-weekend tire allocation (`PlayerCarDryTireSetLimit`)
+
+Fallback synthesis (`session_yaml_from_telemetry`) uses `s.race_lt`, not `s.lt`, unless the current session is already the race.
+
+### 12.2 Tire set limit (pre-race rules)
+
+`race_tire_set_limit()` priority:
+
+1. `r.tsl` / `r.ts_limit` in packet (`PlayerCarDryTireSetLimit`)
+2. `WeekendInfo.WeekendOptions` tire keys
+3. Race session YAML tire keys
+4. `r.ts` remaining sets **only** when current session is race
+5. Default **2**
+
+SDK value **255** = unlimited (`IRSDK_TIRE_SETS_UNLIMITED`) → keep manual UI value.
+
+### 12.3 Baseline from telemetry
 
 | Input | Source |
 |-------|--------|
@@ -494,14 +560,14 @@ Entry: `run_pre_race_plan()` → `generate_pre_race_green_plan()`.
 | `pit_lane_loss_time_s` | User `r.pl` (default 45) |
 | `fuel_tank_capacity_gal` | `r.fc` |
 
-### 12.2 Race length
+### 12.4 Race length
 
-From SessionInfo YAML race session:
+From SessionInfo YAML **race** session (`find_race_session`):
 
-- Use `SessionLaps` if valid (&lt; 32000)
-- Else `SessionTime` / `SessionTimeRemain` ÷ `avg_lap_time_s`
+- Use `SessionLaps` if valid (integer &lt; 32000; string `"unlimited"` rejected)
+- Else scheduled `SessionTime` ÷ `avg_lap_time_s` (not current-session `SessionLapsTotal`)
 
-### 12.3 Stint caps
+### 12.5 Stint caps
 
 ```
 fuel_stint_cap = floor(max_capacity / fuel_burn) − 1
@@ -512,7 +578,7 @@ tire_stint_cap: smallest lap L where sum_{i=1..L}(i × tire_falloff) > pit_loss 
 stint_length = min(fuel_stint_cap, tire_stint_cap)
 ```
 
-### 12.4 Stop count & schedule
+### 12.6 Stop count & schedule
 
 ```
 total_stops = floor(total_laps / stint_length)
@@ -523,16 +589,20 @@ Pit on laps: stint_length, 2×stint_length, …
 Service BOTH if fuel-limited stint or tire sets allow; else FUEL ONLY or 4 TIRES
 ```
 
+NOTE: ~{total} race laps at {track}; plan assumes green-flag run — adjust for cautions
+
 Formatted output lines: FUEL / TIRES / STOPS / NOTE / TRIGGER.
 
 ---
 
 ## 13. Receiver (engineer PC) differences
 
-- Telemetry arrives as **LAN snapshots**; `RemoteTelemetry` overlays your pit loss and tire sets on the cached packet.
+- Telemetry arrives as **LAN snapshots** (~250 ms); `RemoteTelemetry` overlays your pit loss and tire sets on the cached packet.
+- Auto alerts run on snapshot ingest only (not also on the local telemetry poll) to avoid duplicate triggers.
 - **Caution pit impact** reuses broadcaster-computed `fi.cpi` when present.
 - **Green-flag loss** uses gap-behind shortcut when full field projection is unavailable.
 - `RaceMemory` rolls snapshots into lap rollups, caution/pit events, and trend features (`packet.h`) — does not change core strategy formulas above.
+- Voice is relayed to the sim PC when **Speak on sim PC** is on; engineer PC does not speak locally while linked.
 
 ---
 
@@ -553,6 +623,8 @@ All alignment scalars live in **`race_constants.py`** (GridNotes v1.0.x — Sect
 | Reentry traffic window | `REENTRY_WINDOW_PCT` | 0.035 (3.5%) | `telemetry.py` |
 | Herd tracking window | `HERD_POSITION_WINDOW` | ±5 positions | `telemetry.py` |
 | Auto alert horizon | `ALERT_LAP_HORIZON` | 5 laps | `strategy_engine.py`, `ui.py` |
+| Post-pit alert quiet min | `POST_PIT_ALERT_MIN_STINT_LAPS` | 6 laps | `race_constants.py`, `strategy_engine.py` |
+| Unlimited tire sets sentinel | `IRSDK_TIRE_SETS_UNLIMITED` | 255 | `race_constants.py`, `telemetry.py` |
 | Pre-race tire cost buffer | `TIRE_COST_THRESHOLD_BUMP` | 30.0 s | `pre_race_strategy.py` |
 | Fuel laps clamp multiplier | `FUEL_LAPS_CLAMP_MULTIPLIER` | 2.0 | `telemetry.py` |
 | Fuel laps clamp offset | `FUEL_LAPS_CLAMP_OFFSET` | 30.0 laps | `telemetry.py` |
@@ -569,6 +641,10 @@ Other module-local values:
 
 Shared helpers in `race_constants.py`: `clamp_fuel_use_kg_h()`, `clamp_nonneg_liters()`, `clamp_avg_lap_seconds()`, `clamp_lap_distance_pct()`, `resolve_combined_burn_rate()`, `green_flag_fuel_laps_from_telemetry()`, `triangular_payback_lap()`, `wrap_lap_distance_delta()`, `cumulative_triangular_wear_cost()`.
 
+Pre-race helpers in `pre_race_strategy.py`: `find_race_session()`, `race_lap_total_from_yaml()`, `race_tire_set_limit()`.
+
+Strategy helpers in `strategy_engine.py`: `_laps_since_pit_stop()`, `_post_pit_alert_quiet()`, `_forecast_fuel_laps_seed()`, `advice_call_line()`.
+
 ---
 
 ## 15. Output format (engineer call)
@@ -578,9 +654,11 @@ Shared helpers in `race_constants.py`: `clamp_fuel_use_kg_h()`, `clamp_nonneg_li
 ```
 ACTION — THIS LAP — SERVICE
 WHY: ...
-FORECAST: ...   (or "Paused under caution")
-TRIGGER: FUEL|FLAGS|...  CONF: H|M|L
+FORECAST: ...   (or "Paused under caution")   # display only; not spoken
+TRIGGER: FUEL|FLAGS|...  CONF: H|M|L           # display only; not spoken
 ```
+
+Voice reads line 1 and optionally line 2 (WHY). Engineer call dashes are normalized for speech (e.g. `PIT — THIS LAP — 4 TIRES` → “Pit. This lap. Four tires.”).
 
 **Garage / strategy mode** (5 lines):
 
@@ -588,7 +666,7 @@ TRIGGER: FUEL|FLAGS|...  CONF: H|M|L
 FUEL: ~X laps/tank · Y-lap stints
 TIRES: ~X laps/set · N planned stop(s)
 STOPS: L27 BOTH; L54 BOTH; ...
-NOTE: ~L laps at Track; green-flag assumption
+NOTE: ~L race laps at Track; green-flag assumption
 TRIGGER: FUEL|TIRES  CONF: M
 ```
 

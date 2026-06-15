@@ -28,7 +28,7 @@ from app_config import (
     write_config,
 )
 from race_constants import ALERT_LAP_HORIZON, get_default_pit_loss_seconds, resolve_track_length_miles
-from strategy_engine import run_strategy, should_auto_alert
+from strategy_engine import advice_call_line, run_strategy, should_auto_alert
 from strategy_worker import StrategyWorker
 from hotkey import (
     DEFAULT_HOTKEY,
@@ -128,6 +128,8 @@ class AIRaceEngineer(QWidget):
         self._auto_last_lap: int | None = None
         self._auto_last_caution = False
         self._auto_last_call_line = ""
+        self._auto_caution_announced = False
+        self._last_delivered_call_line = ""
         self._link_host_boot = (link_host or "").strip() or str(self._config.get("race_link_host", "")).strip()
         self._link_port_boot = int(link_port if link_port is not None else self._config.get("race_link_port", DEFAULT_RACE_LINK_PORT))
         if self._role == "receiver":
@@ -1142,7 +1144,8 @@ class AIRaceEngineer(QWidget):
     def _on_telemetry_poll(self) -> None:
         self.telemetry.update_field_history()
         self._maybe_sync_tire_sets_from_sdk()
-        self._check_auto_strategy()
+        if self._role != "receiver":
+            self._check_auto_strategy()
 
     def _style_status_pill(self, label: QLabel, tone: str) -> None:
         if not self._is_receiver:
@@ -1221,6 +1224,8 @@ class AIRaceEngineer(QWidget):
         self._auto_last_lap = None
         self._auto_last_caution = False
         self._auto_last_call_line = ""
+        self._auto_caution_announced = False
+        self._last_delivered_call_line = ""
 
     def _check_auto_strategy(self) -> None:
         if not bool(self.auto_pit_alerts_toggle.isChecked()):
@@ -1244,6 +1249,12 @@ class AIRaceEngineer(QWidget):
         if not lap_changed and not caution_changed:
             return
 
+        caution_started = caution_changed and is_caution
+        caution_ended = caution_changed and not is_caution
+
+        if not is_caution:
+            self._auto_caution_announced = False
+
         self._auto_last_lap = lap
         self._auto_last_caution = is_caution
 
@@ -1259,17 +1270,41 @@ class AIRaceEngineer(QWidget):
             return
 
         advice = run_strategy(telemetry, mode="live")
-        if not should_auto_alert(telemetry, advice):
+        if not should_auto_alert(
+            telemetry,
+            advice,
+            caution_started=caution_started,
+            caution_ended=caution_ended,
+        ):
             return
 
-        call_line = advice.split("\n", 1)[0].strip()
-        if call_line == self._auto_last_call_line and lap_changed and not caution_changed:
+        call_line = advice_call_line(advice)
+        if caution_started:
+            if self._auto_caution_announced:
+                return
+            if call_line and call_line == self._last_delivered_call_line:
+                self._auto_caution_announced = True
+                return
+            self._auto_caution_announced = True
+        elif call_line and call_line == self._last_delivered_call_line:
             return
 
         self._auto_last_call_line = call_line
         self._deliver_advice(advice, auto=True)
 
     def _deliver_advice(self, text: str, *, auto: bool = False) -> None:
+        call_line = advice_call_line(str(text))
+        if auto and call_line and call_line == self._last_delivered_call_line:
+            self._set_advice_text(str(text))
+            self._update_action_button_text()
+            self._set_ai_status("Auto")
+            if self.show_pit_impact_toggle.isChecked():
+                self._update_pit_impact_from_advice(str(text))
+            return
+
+        if call_line:
+            self._last_delivered_call_line = call_line
+
         self._idle_clear_timer.stop()
         self._set_advice_text(text)
         self._update_action_button_text()
@@ -1335,6 +1370,7 @@ class AIRaceEngineer(QWidget):
         cancelled_id = self.ai_worker.cancel_active()
         self._active_request_id = 0
         self._auto_last_call_line = ""
+        self._last_delivered_call_line = ""
         self._set_advice_text(_standby_advice_text(self._is_receiver))
         self._update_action_button_text()
         if cancelled_id:
@@ -1375,9 +1411,10 @@ class AIRaceEngineer(QWidget):
             self._set_ai_status("Error")
             self.btn.setEnabled(True)
             return
-        call_line = str(text).split("\n", 1)[0].strip()
+        call_line = advice_call_line(str(text))
         if call_line:
             self._auto_last_call_line = call_line
+            self._last_delivered_call_line = call_line
         self._deliver_advice(str(text), auto=False)
         self.btn.setEnabled(True)
 

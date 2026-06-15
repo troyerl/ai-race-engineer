@@ -13,6 +13,7 @@ from app_config import ensure_default_config_file, load_config, write_config
 from race_link import DEFAULT_RACE_LINK_PORT, BroadcasterService
 from lan_discovery import BroadcasterBeacon
 from speech import speak_engineer_advice
+from strategy_engine import advice_call_line
 from telemetry import DEFAULT_TIRE_SETS_FALLBACK, TelemetryTracker
 
 # Receiver overrides pit loss on the engineer PC; tire sets stream from SDK on the sim PC.
@@ -29,7 +30,7 @@ class BroadcasterWindow(QWidget):
         self.telemetry = TelemetryTracker()
         self._bind_host = bind_host
         self._port = int(port)
-        self._last_spoken_advice = ""
+        self._last_spoken_call_line = ""
 
         self._voice_done.connect(self._on_voice_done)
 
@@ -255,9 +256,11 @@ class BroadcasterWindow(QWidget):
         if not body or body.startswith(("AI Error", "Error:")):
             self.voice_badge.setText("Voice: engineer PC reported an error")
             return
-        if body == self._last_spoken_advice:
+        call_line = advice_call_line(body)
+        if call_line and call_line == self._last_spoken_call_line:
             return
-        self._last_spoken_advice = body
+        if call_line:
+            self._last_spoken_call_line = call_line
         self.voice_badge.setText("Voice: speaking engineer call…")
 
         def _speak() -> None:

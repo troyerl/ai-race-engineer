@@ -12,6 +12,7 @@ from typing import Any
 from race_constants import (
     ALERT_LAP_HORIZON,
     DEFAULT_CAUTION_BURN_L,
+    POST_PIT_ALERT_MIN_STINT_LAPS,
     clamp_nonneg_liters,
     green_flag_fuel_laps_from_telemetry,
     triangular_payback_lap,
@@ -143,6 +144,45 @@ def _resolve_pit_payback_laps(telemetry: dict[str, Any]) -> float:
     return 0.0
 
 
+def _laps_since_pit_stop(telemetry: dict[str, Any]) -> int | None:
+    """Laps completed on the current stint (since last pit exit)."""
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    sl = m.get("sl")
+    if isinstance(sl, int) and sl >= 0:
+        return sl
+    lap = m.get("l")
+    last_pit = m.get("lp")
+    if isinstance(lap, int) and isinstance(last_pit, int):
+        return max(0, lap - last_pit)
+    return None
+
+
+def _post_pit_alert_quiet(telemetry: dict[str, Any], *, alert_horizon: int = ALERT_LAP_HORIZON) -> bool:
+    """Defer forecast pit nags early in a fresh stint after a stop."""
+    since = _laps_since_pit_stop(telemetry)
+    if since is None:
+        return False
+    r = telemetry.get("r", {}) if isinstance(telemetry.get("r"), dict) else {}
+    ftl = _safe_float(r.get("ftl"), 12.0)
+    min_stint = max(
+        POST_PIT_ALERT_MIN_STINT_LAPS,
+        int(max(1.0, ftl - float(alert_horizon) - 1.0)),
+    )
+    return since < min_stint
+
+
+def _forecast_fuel_laps_seed(telemetry: dict[str, Any], *, max_tank_stint: float) -> float:
+    """Green-flag forecast fuel seed; full tank after a recent pit stop."""
+    green = green_flag_fuel_laps_from_telemetry(
+        telemetry,
+        fallback_l_per_lap=DEFAULT_CAUTION_BURN_L,
+    )
+    since = _laps_since_pit_stop(telemetry)
+    if since is not None and since <= 3:
+        return max(0.0, max(max_tank_stint, green) - 1.0)
+    return max(0.0, green - 1.0)
+
+
 def _fuel_context(telemetry: dict[str, Any]) -> tuple[float, bool, bool]:
     """Return (fuel_laps_left, inside_window, is_fuel_critical)."""
     x = telemetry.get("x", {})
@@ -150,7 +190,11 @@ def _fuel_context(telemetry: dict[str, Any]) -> tuple[float, bool, bool]:
     if x.get("fe", 0) == 1 and m.get("fcq") in ("hi", "med"):
         fuel_laps_left = _safe_float(m.get("fl"), 0.0)
         pb_laps = _resolve_pit_payback_laps(telemetry)
-        inside_window = bool(m.get("pw", False)) or (fuel_laps_left <= pb_laps)
+        can_make_to_end = m.get("mk")
+        if can_make_to_end is False:
+            inside_window = True
+        else:
+            inside_window = fuel_laps_left <= pb_laps
         is_fuel_critical = fuel_laps_left <= 1.0
     else:
         fpl = _safe_float(m.get("fpl"), 0.2)
@@ -250,9 +294,14 @@ def evaluate_and_forecast_strategy(telemetry: dict[str, Any]) -> dict[str, Any]:
         immediate_service = "4 TIRES" if tire_sets > 0 else "FUEL ONLY"
         why_reason = "Fuel critical; absolute limit of current tank reached."
     elif inside_window and rej.get("v", "CLEAN") == "CLEAN":
-        immediate_action = "PIT NOW"
-        immediate_service = "4 TIRES" if tire_sets > 0 else "FUEL ONLY"
-        why_reason = "Pit window open; clean reentry air window confirmed."
+        if _post_pit_alert_quiet(telemetry) and not is_fuel_critical:
+            immediate_action = "STAY OUT"
+            immediate_service = "NONE"
+            why_reason = "Fresh stint after pit stop; holding position before next window."
+        else:
+            immediate_action = "PIT NOW"
+            immediate_service = "4 TIRES" if tire_sets > 0 else "FUEL ONLY"
+            why_reason = "Pit window open; clean reentry air window confirmed."
     elif inside_window and rej.get("v") == "PACK":
         immediate_action = "STAY OUT"
         immediate_service = "NONE"
@@ -274,12 +323,7 @@ def evaluate_and_forecast_strategy(telemetry: dict[str, Any]) -> dict[str, Any]:
         else:
             sim_current_lap = current_lap + 1
             sim_laps_remaining = laps_remain - 1
-            # Section 10.3: seed with green-flag EMA laps, not caution-inflated live fl.
-            green_fuel_laps = green_flag_fuel_laps_from_telemetry(
-                telemetry,
-                fallback_l_per_lap=DEFAULT_CAUTION_BURN_L,
-            )
-            sim_fuel_laps_remaining = max(0.0, green_fuel_laps - 1.0)
+            sim_fuel_laps_remaining = _forecast_fuel_laps_seed(telemetry, max_tank_stint=max_tank_stint)
 
         stop_counter = 1
         while sim_laps_remaining > 0:
@@ -423,6 +467,11 @@ def _first_call_line(advice: str) -> str:
     return ""
 
 
+def advice_call_line(advice: str) -> str:
+    """First line of engineer advice (ACTION — TIMING — SERVICE)."""
+    return _first_call_line(advice)
+
+
 def parse_call_line(advice: str) -> tuple[str, str, str]:
     """Parse line 1 into ACTION, TIMING, SERVICE."""
     head = _first_call_line(advice)
@@ -471,34 +520,57 @@ def laps_until_pit(action: str, timing: str) -> int | None:
     return None
 
 
+def _under_caution(telemetry: dict[str, Any]) -> bool:
+    flags = telemetry.get("s", {}).get("flb", {})
+    if not isinstance(flags, dict):
+        return False
+    return bool(flags.get("yel") or flags.get("cau"))
+
+
 def should_auto_alert(
     telemetry: dict[str, Any],
     advice: str,
     *,
     max_laps: int = ALERT_LAP_HORIZON,
     forecast_result: dict[str, Any] | None = None,
+    caution_started: bool = False,
+    caution_ended: bool = False,
 ) -> bool:
     """True when a pit stop is due within max_laps (or fuel window is inside that range)."""
+    if caution_started and _under_caution(telemetry):
+        return True
+
     action, timing, _ = parse_call_line(advice)
     n = laps_until_pit(action, timing)
+    fuel_laps = _fuel_laps_left(telemetry)
+    fuel_critical = fuel_laps is not None and fuel_laps <= 1.0
+
+    if fuel_critical and action in ("PIT", "PIT NOW"):
+        return True
+
+    if caution_ended:
+        return False
+
+    quiet = _post_pit_alert_quiet(telemetry, alert_horizon=max_laps)
+    if quiet:
+        return False
+
     if n is not None and n <= max_laps:
         return True
 
-    fuel_laps = _fuel_laps_left(telemetry)
     if fuel_laps is not None and fuel_laps <= max_laps:
         m = telemetry.get("m", {})
         if action in ("PIT", "PIT NOW"):
             return True
-        if m.get("pw"):
+        if m.get("mk") is False:
             return True
         pb = _resolve_pit_payback_laps(telemetry)
         if pb > 0 and fuel_laps <= pb + 1:
             return True
 
-        flags = telemetry.get("s", {}).get("flb", {})
-        if isinstance(flags, dict) and (flags.get("yel") or flags.get("cau")):
+        if _under_caution(telemetry):
             if fuel_laps <= min(3.0, max_laps):
-                return action in ("PIT", "PIT NOW") or m.get("pw", False)
+                return action in ("PIT", "PIT NOW")
 
     result = forecast_result if isinstance(forecast_result, dict) else evaluate_and_forecast_strategy(telemetry)
     forecast = result.get("green_flag_rest_of_race_forecast", {})
