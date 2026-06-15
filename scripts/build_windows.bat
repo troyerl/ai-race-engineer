@@ -42,6 +42,11 @@ echo.
 echo Build complete:
 echo   dist\AI Race Engineer\AI Race Engineer.exe
 echo.
+echo One-click launch:
+echo   Double-click the .exe above, or pin it to the taskbar.
+echo   Optional Desktop shortcut:
+echo     powershell -ExecutionPolicy Bypass -File scripts\create_windows_shortcut.ps1
+echo.
 endlocal
 exit /b 0
 

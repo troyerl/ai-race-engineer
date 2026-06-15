@@ -11,6 +11,9 @@ __pycache__/
 
 .DS_Store
 
+assets/icon.icns
+assets/icon.iconset
+
 sim_logs/
 
 dist/

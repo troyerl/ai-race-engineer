@@ -68,3 +68,16 @@ coll = COLLECT(
     upx_exclude=[],
     name="AI Race Engineer",
 )
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="AI Race Engineer.app",
+        icon="assets/icon.icns",
+        bundle_identifier="com.airaceengineer.overlay",
+        info_plist={
+            "CFBundleDisplayName": "AI Race Engineer",
+            "CFBundleName": "AI Race Engineer",
+            "NSHighResolutionCapable": True,
+        },
+    )

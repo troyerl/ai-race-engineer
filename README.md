@@ -19,7 +19,8 @@ A small always-on-top iRacing overlay that builds a compact strategy snapshot fr
 main.py                 # Qt app entrypoint
 race_simulator.py       # CLI shim → sim/race_simulator.py
 build_windows.bat       # Windows PyInstaller build (delegates to scripts/)
-ai_race_engineer.spec   # PyInstaller spec
+build_mac.sh            # macOS PyInstaller build (delegates to scripts/)
+ai_race_engineer.spec   # PyInstaller spec (Windows folder + macOS .app)
 
 engineer/               # Core app: strategy, telemetry, UI, networking
   strategy_engine.py    # Deterministic pit/strategy rules
@@ -37,7 +38,7 @@ docs/
   CALCULATIONS.md       # Formula & decision reference
   SIMULATIONS.md        # Offline sim guide
 assets/                 # icon.png, icon.ico, UI SVGs
-scripts/                # make_icon_ico.py, build_windows.bat
+scripts/                # make_icon_ico.py, build_windows.bat, build_mac.sh
 ```
 
 ## Requirements
@@ -173,11 +174,11 @@ A startup dialog asks whether this PC is the **Sim PC (Broadcaster)** or **Engin
 
 Advanced: pass `--role local`, `--role broadcaster`, or `--role receiver` to skip the picker. Single-PC mode (`--role local`) runs iRacing + AI on one machine.
 
-## Packaging a Windows executable
+## Packaging (Windows & Mac)
 
-PyInstaller builds are OS-specific, so **run this on a Windows machine**.
+PyInstaller builds are **OS-specific**: build the Windows `.exe` on Windows and the Mac `.app` on macOS. Each produces a double-click launcher — no Python install required on the target machine.
 
-### One-command build (recommended)
+### Windows (Sim PC or Engineer PC)
 
 From the project folder on **Windows**:
 
@@ -185,23 +186,57 @@ From the project folder on **Windows**:
 build_windows.bat
 ```
 
-The script installs `requirements.txt` + build tools, generates `assets/icon.ico`, and runs PyInstaller via `ai_race_engineer.spec` (or run `scripts/build_windows.bat` directly).
-
 Output:
-- `dist\AI Race Engineer\AI Race Engineer.exe`
 
-Notes:
-- The app uses `assets/icon.png` at runtime (Qt window/app icon).
-- The Windows build script generates a **multi-size** `assets/icon.ico` from `assets/icon.png` (via `scripts/make_icon_ico.py`).
-- iRacing SDK package is **`pyirsdk`** on PyPI (`import irsdk` in code). If pip says *no matching distribution for irsdk*, use `pyirsdk`.
+- `dist\AI Race Engineer\AI Race Engineer.exe` — double-click or pin to the taskbar
 
-### Manual build (if you prefer)
+Optional Desktop shortcut after a successful build:
 
 ```bat
-py -m pip install -r requirements.txt
-py -m pip install -r requirements-build.txt
-py make_icon_ico.py
-py -m PyInstaller --noconfirm --clean ai_race_engineer.spec
+powershell -ExecutionPolicy Bypass -File scripts\create_windows_shortcut.ps1
+```
+
+The script installs dependencies, generates `assets/icon.ico`, and runs PyInstaller via `ai_race_engineer.spec`.
+
+Notes:
+
+- The app uses `assets/icon.png` at runtime (Qt window/app icon).
+- iRacing SDK package is **`pyirsdk`** on PyPI (`import irsdk` in code).
+
+### Mac (Engineer PC / receiver UI)
+
+From the project folder on **macOS**:
+
+```bash
+chmod +x build_mac.sh   # first time only
+./build_mac.sh
+```
+
+Output:
+
+- `dist/AI Race Engineer.app` — double-click, or drag to **Applications** / the **Dock**
+
+Quick launch after building:
+
+```bash
+open "dist/AI Race Engineer.app"
+```
+
+Notes:
+
+- For the **global Space hotkey** while iRacing has focus, grant **Accessibility** to **AI Race Engineer** in System Settings → Privacy & Security (same as running from source with `pynput`).
+- Mac builds are ideal for the **receiver** role (engineer PC). The **broadcaster** role still needs Windows + iRacing on the sim PC.
+
+### Manual build (either OS)
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-build.txt
+# Windows only:
+python scripts/make_icon_ico.py
+# macOS only:
+python3 scripts/make_icon_icns.py
+python -m PyInstaller --noconfirm --clean ai_race_engineer.spec
 ```
 
 ### Build troubleshooting
@@ -210,11 +245,10 @@ py -m PyInstaller --noconfirm --clean ai_race_engineer.spec
 |-------|-----|
 | `No matching distribution found for irsdk` | Use `pyirsdk`: `pip install pyirsdk` |
 | `ModuleNotFoundError` during PyInstaller analysis | Run `pip install -r requirements.txt` first |
-| `'py' is not recognized` | Use `python` instead, or install the [Python launcher](https://docs.python.org/3/using/windows.html#python-launcher-for-windows) |
+| `'py' is not recognized` (Windows) | Use `python` instead, or install the [Python launcher](https://docs.python.org/3/using/windows.html#python-launcher-for-windows) |
 | `icon.png not found` | Run the build from the project root; icon lives in `assets/icon.png` |
-| Build succeeds but exe crashes on start | Rebuild with `build_windows.bat` (uses `ai_race_engineer.spec` with PySide6 bundled) |
-
-**Mac/Linux:** PyInstaller builds are OS-specific. You can build a Mac `.app` for the receiver UI, but the Windows `.exe` must be built on Windows.
+| Build succeeds but app crashes on start | Rebuild with the platform build script (bundles PySide6 via `ai_race_engineer.spec`) |
+| Mac: “app is damaged” / Gatekeeper block | Right-click → Open the first time, or `xattr -cr "dist/AI Race Engineer.app"` for local dev builds |
 
 ### UI controls
 
