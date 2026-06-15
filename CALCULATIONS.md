@@ -12,6 +12,7 @@ Primary source files:
 | Track pit-loss default | `ui.py` |
 | Receiver LAN snapshots | `remote_telemetry.py`, `race_memory.py` |
 | Voice relay | `speech.py`, `broadcaster_ui.py` |
+| Auto-alert orchestration | `auto_alert_engine.py` |
 | Driver / environment context (§16) | `context_engine.py` |
 | Shared scalars | `race_constants.py` |
 
@@ -24,15 +25,17 @@ Primary source files:
 ```mermaid
 flowchart LR
   SDK[iRacing SDK] --> TT[TelemetryTracker]
-  TT --> PKT[JSON packet]
-  PKT --> SE[strategy engine]
-  SE --> UI[Overlay / voice]
+  TT --> CTX[context_engine]
+  CTX --> PKT[JSON packet]
+  PKT --> SE[strategy_engine]
+  SE --> AA[auto_alert_engine]
+  AA --> UI[Overlay / voice]
   TT --> PIT[Pit impact UI]
 ```
 
-1. **Poll** (~250 ms): read SDK vars, update bounded lap history and fuel EMA.
-2. **Build packet**: compact JSON (`m` = you, `s` = session, `r` = race inputs, `fi` = field intel).
-3. **Strategy engine**: immediate pit/stay-out call + optional green-flag stop forecast.
+1. **Poll** (~250 ms): read SDK vars, update bounded lap history, fuel EMA, and §16 context metrics.
+2. **Build packet**: compact JSON (`m` = you, `s` = session, `r` = race inputs, `fi` = field intel, `rv` = rivals).
+3. **Strategy engine**: `resolve_live_advice()` → immediate pit/stay-out call + green-flag stop forecast.
 4. **UI**: display advice, pit-impact line, auto alerts, voice relay.
 
 User-adjustable inputs that feed calculations:
@@ -299,13 +302,35 @@ reentry_dist = (your_lap_dist_pct + pit_frac) mod 1.0
 
 Count on-track cars whose `LapDistPct` is within **`REENTRY_WINDOW_PCT` (±3.5%)** of `reentry_dist`:
 
-| Cars in window | Verdict |
-|----------------|---------|
+| Cars in window | Base verdict (`bv`) |
+|----------------|---------------------|
 | 0 | `CLEAN` |
 | 1 | `TRAFFIC` |
 | ≥ 2 | `PACK` |
 
-Live strategy **delays** a pit when window is open but verdict is `PACK`.
+**Leader lap-down risk** (`compute_reentry_verdict()` in `telemetry.py`):
+
+```
+leader_lap   = max(CarIdxLap) over field
+gap_to_leader = CarIdxF2Time[player] or lap-distance fallback (§5)
+projected_laps_lost = floor((pit_loss_sec − gap_to_leader) / avg_lap_s)   when pit_loss > gap
+```
+
+| Condition | Verdict `v` |
+|-----------|-------------|
+| `projected_laps_lost ≥ 1` | `LAPPED_DANGER` |
+| else | base density verdict (`bv`) |
+
+**Packet shape:** `fi.rej = {v, bv, n, dp, gtl?, pll?, ldw?, ll?}`
+
+- `gtl` — gap to leader (seconds)
+- `pll` — projected laps lost if pitting now
+- `ldw` — lap-down cars inside reentry window
+- `ll` — session leader lap count
+
+When `x.fe = 0`, strategy uses `bv` only (ignores `LAPPED_DANGER` for pit deferral).
+
+Live strategy **delays** a pit when window is open but verdict is `PACK` or `LAPPED_DANGER` (unless fuel critical).
 
 ### 6.4 Caution pit intel (`fi.cpi`)
 
@@ -366,6 +391,8 @@ lda        = lap-down cars likely still ahead on track after stop
 
 ## 8. Green-flag pit position loss
 
+### 8.1 Class P+1…P+5 projection
+
 For each car **P+1 … P+5**:
 
 ```
@@ -379,6 +406,18 @@ lost = count of such cars
 ```
 
 Receiver mode without full field sim uses a shortcut: if `gap_behind < pit_loss_sec` → `lost = 1`.
+
+### 8.2 Leader lap-down deferral (§6.3 extension)
+
+Used by live strategy row **3b** (before fuel-critical pit). Requires `x.fe = 1` and `fuel_laps_left > LAPPED_DANGER_FUEL_MIN_LAPS` (1.5):
+
+```
+STAY OUT when inside_window AND rej.v == LAPPED_DANGER
+WHY: Delaying pit stop — green stop will put us a lap down. Extending to find cleaner window.
+TRIGGER: TRACK  CONF: M
+```
+
+Voice (`speech.py`): *"Stay out, stay out. Pitting now puts us a lap down. Extend this stint."*
 
 ---
 
@@ -437,11 +476,15 @@ min_stint_before_alert = max(POST_PIT_ALERT_MIN_STINT_LAPS, ftl − ALERT_LAP_HO
 | 1 | Pit lane closed (`flb.pcl`) | STAY OUT |
 | 2 | On pit road / in stall | STAY OUT (REPAIR if `PitRepairLeft > 0`) |
 | 3 | Yellow/caution | Caution rules ([§7](#7-caution-pit-impact), fuel critical) |
+| 3b | `inside_window` + `rej.v == LAPPED_DANGER` + `fuel_laps_left > 1.5` + `x.fe == 1` | STAY OUT (lap-down deferral — [§8.2](#82-leader-lap-down-deferral)) |
 | 4 | Fuel critical | PIT NOW |
+| 4b | Offensive undercut matrix ([§16.4.3](#1643-offensive-undercut--runway-guards)) | PIT NOW |
 | 5 | Pit window open + reentry `CLEAN` + not in post-pit quiet | PIT NOW |
 | 5b | Pit window open + reentry `CLEAN` + post-pit quiet | STAY OUT (fresh stint) |
 | 6 | Pit window open + reentry `PACK` | STAY OUT (delay 1 lap) |
 | 7 | Default | STAY OUT |
+
+After rows 1–7, **`_apply_context_directive_overrides()`** may adjust the call ([§10.5](#105-context-directive-overrides)).
 
 **Service** on pit calls:
 
@@ -462,7 +505,7 @@ Simulation state after immediate call:
   - **Otherwise:** `sim_fuel = green_fuel_laps − 1` from green-flag EMA only (Section 2.3; not caution-inflated `m.fl`)
 
 ```
-green_fuel_laps = fuel_liters / m.fpe_ema_L     # m.fpe in packet, converted to L/lap
+green_fuel_laps = fuel_liters / m.fpe_L     # m.fpe in packet (US gal/lap); convert to L/lap for sim
 ```
 
 Implemented as `green_flag_fuel_laps_from_telemetry()` in `race_constants.py`.
@@ -488,9 +531,37 @@ Heuristic from WHY text and flags:
 |---------|----------------|
 | FLAGS | H |
 | REPAIR | H |
+| OVERTAKE (undercut active) | H |
 | FUEL | H if PIT NOW, else M |
-| TIRES | M |
-| TRACK (traffic/pack) | M |
+| TIRES | M (or H for cool-tires defensive) |
+| TRACK (traffic/pack/lap-down deferral) | M |
+
+### 10.5 Context directive overrides
+
+Applied after the immediate table (still before forecast). Requires `inside_window` unless fuel critical.
+
+| Condition | Override |
+|-----------|----------|
+| `ODI ≥ 0.5` and `rej == PACK` | STAY OUT — pace to pass on track |
+| `ODI ≥ 0.5` and would pit (not fuel critical) | STAY OUT — defer one lap |
+| `ODI < −0.3` and `pace_behind > 0.2` and **undercut runway OK** ([§16.4.3](#1643-offensive-undercut--runway-guards)) | PIT NOW — undercut threat from behind |
+| `incident headroom ≤ 1` and would pit | STAY OUT — protect license |
+| `incident headroom ≤ 2` and `gap_behind < 1.0 s` | STAY OUT — let pressure car through |
+
+Appends context notes for marbles, loose steering, track temp when present.
+
+### 10.6 Live advice resolution (`resolve_live_advice`)
+
+`auto_alert_engine.py` and the overlay use this priority chain **before** the main strategy dashboard:
+
+```
+1. incident_push_advice()      # §16.2.1
+2. tactical_undercut_advice()    # §16.4.3 — OFFENSIVE mode only
+3. tactical_defensive_advice()   # §16.4.4 — DEFENSIVE mode only
+4. run_strategy()              # §10.2 table + dashboard
+```
+
+Tactical calls are suppressed under caution and when `fi.sm.n` does not match the required mode.
 
 ---
 
@@ -502,12 +573,17 @@ Default horizon: **`ALERT_LAP_HORIZON` = 5** laps.
 
 ### 11.1 When `should_auto_alert()` returns true
 
+0. **Incident push** (`incident_push_advice()` not None) — always alert.
+0b. **Tactical undercut** (`tactical_undercut_advice()` not None) — OFFENSIVE mode.
+0c. **Tactical defensive** (`tactical_defensive_advice()` not None) — DEFENSIVE mode.
 1. **Caution just started** (`caution_started` and yellow/caution flags active) — always announce the engineer call (pit / stay out), even if the call line matches a prior alert.
 2. **Explicit pit timing** — parsed call is `PIT` / `PIT NOW` with `laps_until_pit ≤ N`.
 3. **Fuel pressure** — `fuel_laps_left ≤ N` and (pit call, `mk` is false, or `fuel ≤ pb + 1`). **Fuel critical** (`≤ 1` lap) always alerts even during post-pit quiet.
 4. **Forecast stop** — projected stop with `laps_from_now ≤ N`, unless:
    - caution **just ended** (`caution_ended` — forecast resume alone does not alert), or
    - **post-pit quiet** (Section 10.1) is active.
+
+`evaluate_auto_alert_tick()` in `auto_alert_engine.py` calls `resolve_live_advice()` ([§10.6](#106-live-advice-resolution)) on each lap or caution transition.
 
 ### 11.2 Delivery deduplication
 
@@ -519,6 +595,15 @@ Default horizon: **`ALERT_LAP_HORIZON` = 5** laps.
 ### 11.3 Voice (sim PC)
 
 TTS reads the **call line** and optional **WHY** only. **FORECAST** and **TRIGGER** lines are display-only (skipped by `speech.py`).
+
+**Voice overrides** (fixed phrases, skip normal line parsing):
+
+| Condition | Spoken text |
+|-----------|-------------|
+| Lap-down deferral WHY ([§8.2](#82-leader-lap-down-deferral)) | *"Stay out, stay out. Pitting now puts us a lap down. Extend this stint."* |
+| Divebomb / guard inside ([§16.4.4](#1644-defensive-tactical-metrics)) | *"Divebomb threat inside, guard the entry."* |
+
+Lap-down voice takes priority over divebomb when both match.
 
 ---
 
@@ -636,6 +721,23 @@ All alignment scalars live in **`race_constants.py`** (GridNotes v1.0.x — Sect
 | Super pit loss | `PIT_LOSS_SUPER_SEC` | 58.0 s | `race_constants.py` → `ui.py` |
 | Short pit loss | `PIT_LOSS_SHORT_SEC` | 42.0 s | `race_constants.py` → `ui.py` |
 | Intermediate pit loss | `PIT_LOSS_INTERMEDIATE_SEC` | 46.0 s | `race_constants.py` → `ui.py` |
+| Lap-down deferral fuel floor | `LAPPED_DANGER_FUEL_MIN_LAPS` | 1.5 laps | `race_constants.py` |
+| Undercut runway (session + stint) | `MIN_UNDERCUT_RUNWAY_LAPS` | 8 laps | `race_constants.py` |
+| Undercut min stint laps | `MIN_UNDERCUT_STINT_LAPS` | 5 laps | `race_constants.py` |
+| Offensive gap ahead max | `UNDERCUT_GAP_AHEAD_MAX_SEC` | 1.0 s | `race_constants.py` |
+| Rival pace delta min (deg proxy) | `UNDERCUT_RIVAL_PACE_DELTA_MIN` | 0.12 s | `race_constants.py` |
+| ODI stay-out / undercut thresholds | `ODI_STAY_OUT_THRESHOLD` / `ODI_UNDERCUT_THRESHOLD` | 0.5 / −0.3 | `race_constants.py` |
+| ODI pack / draft penalties | `ODI_PACK_PENALTY` / `DRAFT_STREAK_ODI_PENALTY` | 0.5 / 0.3 | `race_constants.py` |
+| Rival deg trend threshold | `RIVAL_DEGRAD_TREND_MIN` | 0.15 s/lap | `race_constants.py` |
+| ODI rival-degrad multiplier | `ODI_RIVAL_DEGRAD_MULT` | 0.85 | `race_constants.py` |
+| Strategy mode — defensive gap | `MODE_DEFENSIVE_GAP_BEHIND_MAX` | 0.5 s | `race_constants.py` |
+| Strategy mode — offensive gap ahead | `MODE_OFFENSIVE_GAP_AHEAD_MAX` | 0.7 s | `race_constants.py` |
+| Strategy mode — offensive gap behind min | `MODE_OFFENSIVE_GAP_BEHIND_MIN` | 0.8 s | `race_constants.py` |
+| Thermal warm / greasy | `THERMAL_WARM_C` / `THERMAL_GREASY_C` | 95 / 105 °C | `race_constants.py` |
+| Apex loss alert threshold | `APEX_LOSS_DEFEND_PCT` | 5.0 % | `race_constants.py` |
+| Divebomb gap / closing rate | `DIVEBOMB_GAP_MAX` / `DIVEBOMB_CLOSING_RATE` | 0.4 s / −0.2 s/s | `race_constants.py` |
+| Divebomb voice cooldown | `DIVEBOMB_VOICE_COOLDOWN_S` | 8.0 s | `race_constants.py` |
+| Tactical alert cooldown | `TACTICAL_ALERT_COOLDOWN_LAPS` | 2 laps | `race_constants.py` |
 
 Other module-local values:
 
@@ -648,22 +750,37 @@ Shared helpers in `race_constants.py`: `clamp_fuel_use_kg_h()`, `clamp_nonneg_li
 
 Pre-race helpers in `pre_race_strategy.py`: `find_race_session()`, `race_lap_total_from_yaml()`, `race_tire_set_limit()`.
 
-Strategy helpers in `strategy_engine.py`: `_laps_since_pit_stop()`, `_post_pit_alert_quiet()`, `_forecast_fuel_laps_seed()`, `advice_call_line()`.
+Strategy helpers in `strategy_engine.py`: `_laps_since_pit_stop()`, `_post_pit_alert_quiet()`, `_forecast_fuel_laps_seed()`, `advice_call_line()`, `resolve_live_advice()`, `tactical_undercut_advice()`, `tactical_defensive_advice()`.
+
+Context helpers in `context_engine.py`: `evaluate_strategy_mode()`, `calculate_rolling_trend()`, `compute_overtake_difficulty_index()`, `adjust_tire_stint_cap_for_track_temp()`.
+
+Reentry helpers in `telemetry.py`: `compute_reentry_verdict()`.
 
 ---
 
 ## 15. Output format (engineer call)
 
-**Live mode** (4 lines):
+**Live mode** uses a multi-section **dashboard** (`format_strategy_dashboard()`):
 
 ```
-ACTION — THIS LAP — SERVICE
-WHY: ...
-FORECAST: ...   (or "Paused under caution")   # display only; not spoken
-TRIGGER: FUEL|FLAGS|...  CONF: H|M|L           # display only; not spoken
+================================================================================
+STRATEGY CALL :   [ ACTION ]   ·   TARGET PIT: LAP N   ·   SERVICE TYPE: …
+ WHY           :   HEADLINE …
+                   (optional detail / reentry / context notes)
+================================================================================
+ MACHINE STATE :   CURRENT LAP … · FUEL LEFT … · TARGET FUEL BURN …
+--------------------------------------------------------------------------------
+ PERFORMANCE   :   LAP PACE … · INPUT SMOOTHNESS … · INCIDENTS …
+================================================================================
+ ENVIRONMENT   :   DRAFT … · TRACK TEMP … · GAP AHEAD …
+================================================================================
+FORECAST: …                                    # display only; not spoken
+TRIGGER: FUEL|FLAGS|OVERTAKE|…  CONF: H|M|L    # display only; not spoken
 ```
 
-Voice reads line 1 and optionally line 2 (WHY). Engineer call dashes are normalized for speech (e.g. `PIT — THIS LAP — 4 TIRES` → “Pit. This lap. Four tires.”).
+Legacy 4-line format (`ACTION — THIS LAP — SERVICE`) is still parsed for dedup and relay.
+
+Voice reads the **STRATEGY CALL** action block and optional **WHY** headline. See [§11.3](#113-voice-sim-pc) for fixed voice overrides.
 
 **Garage / strategy mode** (5 lines):
 
@@ -679,127 +796,92 @@ TRIGGER: FUEL|TIRES  CONF: M
 
 ## 16. Driver context & environment extensions
 
-The sections below extend the baseline engine with track temperature, marbles, incidents, steering fatigue, drafting, and overtake difficulty (ODI). Building blocks: `m.twr` / `twsl` (§3), `pace_stats` (§1), `fi.rej` (§6.3), fuel EMA (§2), `rivals.ahead/behind` pace (§1). Implementation: `context_engine.py`, wired in `telemetry.py` and `strategy_engine.py`.
+Implemented in `context_engine.py` (`DriverContextTracker`), merged into each telemetry packet by `telemetry.py`, and consumed by `strategy_engine.py` / `auto_alert_engine.py`. Building blocks: `m.twr` / `twsl` (§3), `pace_stats` (§1), `fi.rej` (§6.3), fuel EMA (§2), rival pace (§1).
 
 ---
 
 ### 16.1 Dynamic track & environmental evolution
 
-Real tracks and high-fidelity sim sessions evolve over a stint. The baseline engine today treats wear falloff (`m.fo`) and burn EMA as sufficient; these additions would make stint caps and call timing temperature- and line-dependent.
+Stint caps and call timing are temperature- and line-dependent when SDK data is available.
 
 #### 16.1.1 Track temperature vs. tire wear rate
 
-**SDK inputs:** `TrackTempCrew` or `TrackTemp` (°C, already in packet as `s.ttc` / `s.tt`), corner wear snapshots in pit box (`twl[].tt`).
+**SDK inputs:** `TrackTempCrew` / `TrackTemp` (`s.ttc` / `s.tt`), corner wear in pit box (`twl[].tt`).
 
-**Baseline calibration** (first stint or after each tire change):
-
-```
-twr_baseline[corner] = wear_delta / stint_laps     # existing §3.3 at reference temp
-T_ref                = track_temp_at_calibration
-```
-
-**Temperature-adjusted wear rate** (example linear model; coefficients TBD per series):
+**Temperature-adjusted stint cap** (`adjust_tire_stint_cap_for_track_temp()`):
 
 ```
 delta_T = T_current − T_ref
-twr_adj[corner] = twr_baseline[corner] × (1 + k_temp × delta_T)
-
-k_temp < 0   # hotter track → faster wear (typical)
+If |delta_T| < TRACK_TEMP_SHIFT_THRESHOLD_C (10°C): cap unchanged
+If delta_T ≤ −10°C: cap × (1 + TRACK_TEMP_COOL_STINT_BONUS × |delta_T| / 10)   # +5% per 10°C cool
+If delta_T ≥ +10°C: cap × (1 − TRACK_TEMP_HOT_STINT_PENALTY × delta_T / 10)    # −8% per 10°C hot
 ```
 
-**Stint cap adjustment** (extends §12.5 / live forecast):
-
-```
-tire_stint_cap_base = first_lap where cumulative triangular cost > pit_loss + bump   # §12.5
-
-If delta_T ≤ −10°C (track cooled):
-    tire_stint_cap = round(tire_stint_cap_base × (1 + 0.05 × |delta_T| / 10))   # e.g. +5% per 10°C cool
-Else if delta_T ≥ +10°C:
-    tire_stint_cap = max(1, round(tire_stint_cap_base × (1 − 0.08 × delta_T / 10))
-```
-
-**Engineer call use:** when `|delta_T| ≥ 10` and `tire_stint_cap` shifts by ≥ 2 laps vs pre-race plan, append NOTE or WHY: *"Track cooled — extend tire stint ~N laps vs plan."*
+**Packet shape:** `s.tenv = {ref, cur, dt?, tsc?}` where `tsc` is the adjusted stint cap.
 
 #### 16.1.2 Marbles / off-line accumulation
 
-**SDK inputs:** `CarIdxTrackSurface`, `CarIdxLapDistPct`, lateral offset proxy (`LatAccel` spikes + `LapDistPct` not near racing line — or `PlayerCarIdx` off-track incidents).
-
-**Off-line event** (per lap):
+**Triggers:** `LatAccel` spike above threshold, or `PlayerTrackSurface == off-track`.
 
 ```
-off_line_lap = true if any of:
-  - PlayerCarInComponentIncidentCount increased (off-track component)
-  - LatAccel magnitude > threshold AND LapDistPct outside [line_min, line_max] for track (calibrated or % from center)
+marble_laps_remaining = MARBLE_LAPS_REMAINING (2) after each event
+Decays −1 per completed green lap in clean air
 ```
 
-**Marble pickup state:**
+**Packet shape:** `m.mar = {lr: laps_remaining}`.
 
-```
-marble_laps_remaining = 2   # after each off-line pass event
-grip_penalty_factor     = 0.97^(marble_laps_remaining)   # illustrative; tune per car
-```
-
-**Engineer call use:** when `marble_laps_remaining > 0`:
-
-```
-WHY: Pickup on tires — expect understeer for a lap or two; avoid offline passes.
-CONF: M
-TRIGGER: TIRES
-```
-
-Decay `marble_laps_remaining` by 1 each completed green lap in clean air.
+Strategy appends a WHY note when marbles are active; `TRIGGER: TIRES`, `CONF: M`.
 
 ---
 
 ### 16.2 Driver consistency & psychology (incident tracker)
 
-Strategy should adapt when the driver is making repeated micro-errors, not only when lap time degrades.
-
 #### 16.2.1 Incident point tracking
 
-**SDK inputs:** `PlayerCarInComponentIncidentCount` (per-component array), session incident limits from SessionInfo / `WeekendInfo` if available.
-
-**Rolling window** (per stint):
+**SDK inputs:** `PlayerCarInComponentIncidentCount`, session incident limit when known.
 
 ```
-off_track_events = count of off-track component increments in last W_laps (W = 3)
-incident_rate    = off_track_events / W_laps
-license_headroom = max(0, incident_limit − session_incidents_so_far)   # if limit known
+off_track_events = sum of component increments in last INCIDENT_WINDOW_LAPS (3)
+license_headroom = incident_limit − session_incidents
 ```
 
-**Triggers:**
-
-| Condition | Voice / UI |
-|-----------|------------|
-| `off_track_events ≥ 2` within 3 laps | *"Pushing too hard — back it down 2%."* (`TRIGGER: TRACK`, `CONF: M`) |
-| `license_headroom ≤ 2` and rival within 1.0 s | Bias toward **STAY OUT** / let faster car pass (avoid 0x on defense) |
+| Condition | Effect |
+|-----------|--------|
+| `off_track_events ≥ 2` in 3 laps | `incident_push_advice()` — *"Pushing too hard — back it down 2%."* |
+| `license_headroom ≤ 2` and `gap_behind < 1.0 s` | Bias **STAY OUT** (§10.5) |
 | `license_headroom ≤ 1` | Suppress aggressive **PIT NOW** unless fuel critical |
 
-**Packet shape:** `m.inc = {ot: off_track_events_3lap, hr: license_headroom, tot: session_incidents}`.
+**Packet shape:** `m.inc = {ot, hr?, tot?}`.
 
 #### 16.2.2 Steering input smoothness (micro-correction delta)
 
-**SDK inputs:** `SteeringWheelAngle` (or `Steering`) sampled at 10–20 Hz in a defined high-speed corner sector (e.g. `LapDistPct ∈ [0.35, 0.42]` on track X — or highest `LatAccel` sector per lap).
-
-**Per-lap metric:**
+High-rate `SteeringWheelAngle` samples in the active corner sector; per-lap std dev vs stint baseline:
 
 ```
-samples = SteeringWheelAngle(t) in corner_sector
-steer_std = std_dev(samples)
-steer_baseline = EMA(steer_std over clean laps at stint start)
-delta_steer = steer_std / max(steer_std_baseline, ε)
+delta_steer = steer_std / max(steer_baseline, ε)
 ```
 
-**Interpretation:**
+When `delta_steer > 1.4`, forecast may pull tire stop forward 1–2 laps (`forecast_tire_pull_laps()`).
 
-```
-delta_steer > 1.4  → tire or driver fatigue likely (corrections increasing)
-delta_steer > 1.8  → voice: "Car is loose — consider short-shifting or pit when window opens"
-```
+**Packet shape:** `m.drv = {ss, ssr, al?, ts, tsn}` — see also §16.4.4 for `al` (apex loss) and `ts`/`tsn` (thermal).
 
-Correlate with `m.fo` and `m.twr`: if `delta_steer` rises while lap time is flat, prefer earlier tire stop in forecast by 1–2 laps.
+---
 
-**Packet shape:** `m.drv = {ss: steer_std, ssr: delta_steer}`.
+### 16.3 Strategy mode orchestration
+
+Evaluated at the start of each `DriverContextTracker.poll()` via `evaluate_strategy_mode()`:
+
+| Mode | Condition | Tactical metrics enabled |
+|------|-----------|--------------------------|
+| `DEFENSIVE` | `0 < gap_behind < MODE_DEFENSIVE_GAP_BEHIND_MAX` (0.5 s) | `fi.tac`, apex / thermal / divebomb |
+| `OFFENSIVE` | `0 < gap_ahead < MODE_OFFENSIVE_GAP_AHEAD_MAX` (0.7 s) **and** `gap_behind ≥ MODE_OFFENSIVE_GAP_BEHIND_MIN` (0.8 s) | `fi.odi.uc`, `fi.odi.rd` |
+| `BALANCED` | otherwise | Macro strategy only (fuel, reentry, forecast) |
+
+Priority: **DEFENSIVE → OFFENSIVE → BALANCED**.
+
+**Packet shape:** `fi.sm = {m: 0|1|2, n: "BALANCED"|"OFFENSIVE"|"DEFENSIVE"}`.
+
+Tactical advice producers (`tactical_undercut_advice`, `tactical_defensive_advice`) require matching `fi.sm.n` ([§10.6](#106-live-advice-resolution)).
 
 ---
 
@@ -809,75 +891,97 @@ Extends §6 (field intel) and §8 (green-flag loss) with fuel and pace context.
 
 #### 16.4.1 Drafting / aerodynamic wake
 
-**Detection:**
-
 ```
-in_draft = (gap_behind_car_ahead < 1.5 s) AND (not passing) AND on_track
-draft_lap_count += 1 per lap while in_draft
+in_draft = gap_ahead < DRAFT_GAP_SEC (1.5 s) AND not passing AND on_track
 ```
 
-Use `m.gb` inverse / `CarIdxF2Time` to car ahead; “not passing” = your `LapDistPct` not gaining > 0.02 per lap on that car.
+On lap complete: if drafted, skip next fuel EMA sample and increment `draft_streak`.
 
-**Fuel EMA exclusion:**
-
-```
-On lap boundary:
-  if draft_lap_count_last_lap ≥ 1:
-    exclude this lap's fuel sample from green-flag EMA update   # §2.1
-    tag lap as draft_inflated in burn history (m.fbh meta)
-  else:
-    normal EMA update
-```
-
-**Effect:** after 5 consecutive draft laps, temporarily expect **lower** clean-air burn when projecting stops; do not shorten fuel stint from draft-skewed samples.
-
-**Temperature side-effect (optional):** `in_draft` → increment engine/tire temp proxy; pairs with §16.1.1 `k_temp`.
-
-**Packet shape:** `fi.draft = {on: bool, streak: int, ex: laps_excluded_from_ema}`.
+**Packet shape:** `fi.draft = {on, streak, ex}` (`ex` = laps excluded from EMA).
 
 #### 16.4.2 Relative pace dynamic (overtake difficulty index)
 
-**Inputs:** `rivals.ahead.pace.avg_last3_s`, `rivals.behind.pace.avg_last3_s`, your `pc.avg_last3_s`, `fi.rej.v` (§6.3).
+**Inputs:** rival `avg_last3_s`, your `pc.avg_last3_s`, `fi.rej.v`, `fi.draft.streak`, rival degradation trend.
 
 ```
-pace_delta_ahead  = your_avg3 − ahead_avg3     # positive = you are faster
-pace_delta_behind = behind_avg3 − your_avg3    # positive = pressure from behind
-```
+pace_delta_ahead  = your_avg3 − ahead_avg3
+pace_delta_behind = behind_avg3 − your_avg3
 
-**Overtake difficulty index (ODI):**
-
-```
 ODI = pace_delta_ahead
-      − (0.5 if rej.v == PACK else 0)
-      − (0.3 if draft_lap_count ≥ 3 else 0)    # stuck in train
+      − ODI_PACK_PENALTY (0.5)   if rej.v == PACK
+      − DRAFT_STREAK_ODI_PENALTY (0.3)   if draft_streak ≥ 3
+      × ODI_RIVAL_DEGRAD_MULT (0.85)   if rival_degrad > RIVAL_DEGRAD_TREND_MIN and wear stable
 ```
 
-**Strategy override** (when `inside_window` would call pit):
+**Strategy overrides** ([§10.5](#105-context-directive-overrides)) when `inside_window`:
 
 | Condition | Call |
 |-----------|------|
-| `ODI ≥ 0.5` and `rej.v == PACK` | **STAY OUT** — *"You have pace to pass on track; don't pit into traffic."* |
-| `ODI ≥ 0.5` and `inside_window` and fuel not critical | Defer pit 1–2 laps; re-check ODI |
-| `ODI < −0.3` and `pace_delta_behind > 0.2` | Pit when window opens — undercut threat |
+| `ODI ≥ ODI_STAY_OUT_THRESHOLD` and `rej == PACK` | **STAY OUT** |
+| `ODI ≥ ODI_STAY_OUT_THRESHOLD` and would pit (not fuel critical) | Defer pit 1 lap |
+| `ODI < ODI_UNDERCUT_THRESHOLD` and `pace_behind > 0.2` and runway OK | **PIT NOW** — undercut threat |
 
-Integrates with existing PACK delay (§10.2 row 6): PACK + fast pace → stronger stay-out; PACK + slow pace → keep delay or pit.
+**Packet shape:** `fi.odi = {pa, pb, score, uc?, rd?}` — `uc`/`rd` only emitted in OFFENSIVE mode.
 
-**Packet shape:** `fi.odi = {pa: pace_delta_ahead, pb: pace_delta_behind, score: ODI}`.
+#### 16.4.3 Offensive undercut & runway guards
+
+**Runway guard** (`_undercut_runway_ok()`): all must pass before any undercut call (immediate row 4b, tactical advice, or defensive undercut override):
+
+```
+laps_remain ≥ MIN_UNDERCUT_RUNWAY_LAPS (8)
+fuel_runway (ftl − stint_laps) ≥ MIN_UNDERCUT_RUNWAY_LAPS
+stint_laps ≥ MIN_UNDERCUT_STINT_LAPS (5)
+```
+
+**Immediate PIT NOW** (`_undercut_opportunity()`): `inside_window`, `rej == CLEAN`, not fuel critical, `0 < gap_ahead < UNDERCUT_GAP_AHEAD_MAX_SEC`, runway OK, and either:
+
+- `fi.odi.uc == true` in OFFENSIVE mode (draft undercut predictor), or
+- rival tire decay proxy: `pace_delta_ahead ≥ UNDERCUT_RIVAL_PACE_DELTA_MIN` (0.12 s)
+
+**Draft undercut predictor** (`_tick_undercut_predictor()`), OFFENSIVE only:
+
+```
+projected_fresh_out = best_lap_or_opponent_pace + 0.15 × (pit_loss / fresh_out)
+undercut_margin = (opponent_pace − projected_fresh_out) − gap_ahead
+fi.odi.uc = true when in_draft AND pace_delta_ahead > 0 AND undercut_margin > 0
+```
+
+**Tactical call** (`tactical_undercut_advice()`): separate high-priority **PIT NOW** with `TRIGGER: OVERTAKE`, `CONF: H` when `uc` is set and runway/reentry gates pass.
+
+**Rival degradation** (`calculate_rolling_trend()` on car-ahead lap history):
+
+```
+fi.odi.rd = lap-over-lap trend (s/lap); positive = rival slowing
+Biases ODI score down (stay-out) when rd > RIVAL_DEGRAD_TREND_MIN
+```
+
+#### 16.4.4 Defensive tactical metrics
+
+Computed only in **DEFENSIVE** mode; alerts respect `TACTICAL_ALERT_COOLDOWN_LAPS` (2) per alert type.
+
+| Metric | Detection | Packet / call |
+|--------|-----------|---------------|
+| **Apex speed loss** | Peak speed baseline vs current in corner; loss > `APEX_LOSS_DEFEND_PCT` (5%) + steer delta | `m.drv.al`; `fi.tac.def_line` → ADJUST DEFENSIVE LINE |
+| **Thermal stress** | Max LF/RF temp: WARM > 95°C, GREASY > 105°C | `m.drv.ts` / `tsn`; `fi.tac.cool` → COOL TIRES |
+| **Divebomb** | Brake zone (`LapDistPct` 0.06–0.20), `gap_behind < DIVEBOMB_GAP_MAX`, closing rate < `DIVEBOMB_CLOSING_RATE` | `fi.tac.db` → GUARD INSIDE; voice override ([§11.3](#113-voice-sim-pc)) |
+
+**Packet shape:** `fi.tac = {def_line?, cool?, db?}` (DEFENSIVE mode only).
 
 ---
 
 ### 16.5 Implementation notes
 
-| Topic | Depends on | Risk |
-|-------|------------|------|
-| Track temp wear | `twl` history + `s.ttc` | Car/track-specific `k_temp` needs calibration |
-| Marbles | Incident + lateral data | False positives on street circuits |
-| Incidents | `PlayerCarInComponentIncidentCount` | License limits not always in YAML |
-| Steering std | High-rate sampling + sector map | CPU / packet size; per-track sectors |
-| Draft EMA skip | Gap + lap dist | Must not starve EMA on oval traffic |
-| ODI | Rival pace buffers (§1) | Requires stable `rivals.ahead` link |
+| Topic | Depends on | Notes |
+|-------|------------|-------|
+| Track temp wear | `twl` + `s.ttc` | Coefficients in `race_constants.py`; tune per series |
+| Marbles | LatAccel + surface | May false-positive on street circuits |
+| Incidents | Component incident array | License limit optional in session YAML |
+| Steering std | 10 Hz sector sampling | Per-track corner sector from highest LatAccel |
+| Draft EMA skip | Gap + lap dist | Prevents draft-skewed fuel projection |
+| ODI / undercut | Rival pace buffers | Requires stable `rv.ahead` link |
+| Strategy mode | `m.ga`, `m.gb` | Re-evaluated every poll tick |
 
-When implemented, constants for §16 live in `race_constants.py` and engineer-call text in `strategy_engine.py`, matching patterns in §10–§11.
+Constants for §16 live in `race_constants.py`; engineer-call text and priority tables in `strategy_engine.py`, matching §10–§11.
 
 ---
 

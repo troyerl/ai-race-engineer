@@ -29,6 +29,9 @@ from race_constants import (
     INCIDENT_WINDOW_LAPS,
     LAT_ACCEL_OFFLINE_THRESHOLD,
     MARBLE_LAPS_REMAINING,
+    MODE_DEFENSIVE_GAP_BEHIND_MAX,
+    MODE_OFFENSIVE_GAP_AHEAD_MAX,
+    MODE_OFFENSIVE_GAP_BEHIND_MIN,
     ODI_PACK_PENALTY,
     ODI_RIVAL_DEGRAD_MULT,
     RIVAL_DEGRAD_TREND_MIN,
@@ -54,6 +57,33 @@ class ThermalStressState(IntEnum):
     CLEAN = 0
     WARM = 1
     GREASY = 2
+
+
+class StrategyMode(IntEnum):
+    BALANCED = 0
+    OFFENSIVE = 1
+    DEFENSIVE = 2
+
+
+def evaluate_strategy_mode(
+    gap_ahead_s: float | None,
+    gap_behind_s: float | None,
+) -> StrategyMode:
+    """
+    High-level offense/defense orchestrator — evaluated before gated tactical metrics.
+
+    Priority: DEFENSIVE (pressure < 0.5s) → OFFENSIVE (strike window) → BALANCED.
+    """
+    if gap_behind_s is not None and 0 < float(gap_behind_s) < MODE_DEFENSIVE_GAP_BEHIND_MAX:
+        return StrategyMode.DEFENSIVE
+    if (
+        gap_ahead_s is not None
+        and gap_behind_s is not None
+        and 0 < float(gap_ahead_s) < MODE_OFFENSIVE_GAP_AHEAD_MAX
+        and float(gap_behind_s) >= MODE_OFFENSIVE_GAP_BEHIND_MIN
+    ):
+        return StrategyMode.OFFENSIVE
+    return StrategyMode.BALANCED
 
 
 def _as_float(v: Any, default: float = 0.0) -> float:
@@ -182,6 +212,7 @@ class DriverContextTracker:
         self._last_defensive_line_lap: int | None = None
         self._last_cool_tires_lap: int | None = None
         self._last_divebomb_voice_at: float | None = None
+        self.current_mode: StrategyMode = StrategyMode.BALANCED
 
     def set_incident_limit(self, limit: int | None) -> None:
         if limit is not None and limit > 0:
@@ -196,6 +227,7 @@ class DriverContextTracker:
         self._marble_laps_remaining = 0
         self._apex_speed_baseline = None
         self.fi_odi_undercut = False
+        self.current_mode = StrategyMode.BALANCED
 
     def consume_fuel_ema_skip(self) -> bool:
         skip = self._skip_next_fuel_ema
@@ -222,6 +254,8 @@ class DriverContextTracker:
         if not on_track or lap is None:
             return
 
+        self.current_mode = evaluate_strategy_mode(gap_ahead_s, gap_behind_s)
+
         lap_dist = _as_float(ir_get("LapDistPct", 0.0))
         lat_g = abs(_as_float(ir_get("LatAccel", 0.0))) / 9.81
         steer = ir_get("SteeringWheelAngle", None)
@@ -235,12 +269,7 @@ class DriverContextTracker:
                 steer_f = None
 
         speed_mps = _as_float(ir_get("Speed", 0.0), 0.0)
-
         in_corner = HIGH_LAT_SECTOR_START <= lap_dist <= HIGH_LAT_SECTOR_END and lat_g >= STEER_SAMPLE_LAT_G
-        if in_corner and steer_f is not None:
-            self._steer_samples.append(steer_f)
-            if speed_mps > 0:
-                self._tick_apex_speed(speed_mps)
 
         in_draft = (
             not is_caution
@@ -249,21 +278,70 @@ class DriverContextTracker:
         )
         self._last_lap_drafted = in_draft
 
+        if in_corner and steer_f is not None:
+            self._steer_samples.append(steer_f)
+
+        self._reset_mode_gated_outputs()
+
+        if self.current_mode == StrategyMode.DEFENSIVE:
+            self._run_defensive_metrics(
+                ir_get,
+                lap=lap,
+                lap_dist=lap_dist,
+                in_corner=in_corner,
+                steer_f=steer_f,
+                speed_mps=speed_mps,
+                gap_behind_s=gap_behind_s,
+                session_time_elapsed=session_time_elapsed,
+            )
+        elif self.current_mode == StrategyMode.OFFENSIVE:
+            self._run_offensive_metrics(
+                in_draft=in_draft,
+                pace_delta_ahead=pace_delta_ahead,
+                gap_ahead_s=gap_ahead_s,
+                ahead_lap_times=ahead_lap_times,
+                best_lap_s=best_lap_s,
+                pit_loss_sec=pit_loss_sec,
+            )
+
+        if steer_f is not None:
+            self._prev_steer = steer_f
+
+        self._tick_incidents(ir_get, lap)
+        self._tick_offline(ir_get, lap, lat_g)
+
+        if self._last_recorded_lap is not None and lap > self._last_recorded_lap:
+            self._on_lap_complete(lap, is_caution=is_caution, tire_falloff_s=tire_falloff_s)
+        self._last_recorded_lap = lap
+
+    def _reset_mode_gated_outputs(self) -> None:
+        """Clear tactical outputs suppressed outside the active strategy mode."""
+        self.fi_odi_undercut = False
+        self.fi_odi_rival_degrad = 0.0
+        self.m_drv_apex_loss = 0.0
+        self.m_drv_therm_stress = ThermalStressState.CLEAN
+        self._divebomb_active = False
+
+    def _run_defensive_metrics(
+        self,
+        ir_get: _IR_GET,
+        *,
+        lap: int,
+        lap_dist: float,
+        in_corner: bool,
+        steer_f: float | None,
+        speed_mps: float,
+        gap_behind_s: float | None,
+        session_time_elapsed: float | None,
+    ) -> None:
+        if in_corner and speed_mps > 0:
+            self._tick_apex_speed(speed_mps)
         self._tick_thermal_stress(ir_get)
         self._tick_divebomb(
             gap_behind_s,
             lap_dist=lap_dist,
             session_time_elapsed=session_time_elapsed,
         )
-        self._tick_undercut_predictor(
-            in_draft=in_draft,
-            pace_delta_ahead=pace_delta_ahead,
-            gap_ahead_s=gap_ahead_s,
-            ahead_lap_times=ahead_lap_times,
-            best_lap_s=best_lap_s,
-            pit_loss_sec=pit_loss_sec,
-        )
-
         if (
             in_corner
             and steer_f is not None
@@ -275,18 +353,26 @@ class DriverContextTracker:
         ):
             self._flag_defensive_line(lap)
 
-        if steer_f is not None:
-            self._prev_steer = steer_f
-
-        self._tick_incidents(ir_get, lap)
-        self._tick_offline(ir_get, lap, lat_g)
-
+    def _run_offensive_metrics(
+        self,
+        *,
+        in_draft: bool,
+        pace_delta_ahead: float | None,
+        gap_ahead_s: float | None,
+        ahead_lap_times: list[float] | None,
+        best_lap_s: float | None,
+        pit_loss_sec: float,
+    ) -> None:
+        self._tick_undercut_predictor(
+            in_draft=in_draft,
+            pace_delta_ahead=pace_delta_ahead,
+            gap_ahead_s=gap_ahead_s,
+            ahead_lap_times=ahead_lap_times,
+            best_lap_s=best_lap_s,
+            pit_loss_sec=pit_loss_sec,
+        )
         if ahead_lap_times and len(ahead_lap_times) >= 3:
             self.fi_odi_rival_degrad = round(calculate_rolling_trend(ahead_lap_times, window=3), 4)
-
-        if self._last_recorded_lap is not None and lap > self._last_recorded_lap:
-            self._on_lap_complete(lap, is_caution=is_caution, tire_falloff_s=tire_falloff_s)
-        self._last_recorded_lap = lap
 
     def _tick_apex_speed(self, speed_mps: float) -> None:
         if speed_mps <= 0:
@@ -435,7 +521,8 @@ class DriverContextTracker:
             self._steer_samples.clear()
 
         if (
-            self.m_drv_therm_stress == ThermalStressState.GREASY
+            self.current_mode == StrategyMode.DEFENSIVE
+            and self.m_drv_therm_stress == ThermalStressState.GREASY
             and self._prev_gap_behind is not None
             and 0 < self._prev_gap_behind < DEFENSIVE_GAP_BEHIND_MAX
         ):
@@ -529,6 +616,7 @@ class DriverContextTracker:
             "streak": self._draft_streak,
             "ex": self._draft_laps_excluded_ema,
         }
+        fi_extra["sm"] = {"m": int(self.current_mode), "n": self.current_mode.name}
 
         pa = pb = None
         ahead = rivals.get("ahead") if isinstance(rivals.get("ahead"), dict) else None
@@ -544,31 +632,39 @@ class DriverContextTracker:
                 pb = bh - you_avg
 
         wear_stable = abs(float(tire_falloff_s)) <= WEAR_STABLE_FALLOFF_MAX
+        rival_degrad_for_odi = (
+            self.fi_odi_rival_degrad if self.current_mode == StrategyMode.OFFENSIVE else None
+        )
         odi = compute_overtake_difficulty_index(
             pace_delta_ahead=pa,
             pace_delta_behind=pb,
             reentry_verdict=reentry_verdict,
             draft_streak=self._draft_streak,
-            rival_degrad=self.fi_odi_rival_degrad,
+            rival_degrad=rival_degrad_for_odi,
             wear_stable=wear_stable,
         )
-        odi["uc"] = self.fi_odi_undercut
-        odi["rd"] = self.fi_odi_rival_degrad
+        odi["uc"] = self.fi_odi_undercut if self.current_mode == StrategyMode.OFFENSIVE else False
+        odi["rd"] = self.fi_odi_rival_degrad if self.current_mode == StrategyMode.OFFENSIVE else 0.0
         fi_extra["odi"] = odi
 
         tac: dict[str, Any] = {}
-        if self._tactical_alert_ready(self._last_defensive_line_lap, current_lap):
-            if self.m_drv_apex_loss > APEX_LOSS_DEFEND_PCT and gap_behind_s is not None and 0 < gap_behind_s < DEFENSIVE_GAP_BEHIND_MAX:
-                tac["def_line"] = True
-        if self._tactical_alert_ready(self._last_cool_tires_lap, current_lap):
-            if (
-                self.m_drv_therm_stress == ThermalStressState.GREASY
-                and gap_behind_s is not None
-                and 0 < gap_behind_s < DEFENSIVE_GAP_BEHIND_MAX
-            ):
-                tac["cool"] = True
-        if self._divebomb_active:
-            tac["db"] = True
+        if self.current_mode == StrategyMode.DEFENSIVE:
+            if self._tactical_alert_ready(self._last_defensive_line_lap, current_lap):
+                if (
+                    self.m_drv_apex_loss > APEX_LOSS_DEFEND_PCT
+                    and gap_behind_s is not None
+                    and 0 < gap_behind_s < DEFENSIVE_GAP_BEHIND_MAX
+                ):
+                    tac["def_line"] = True
+            if self._tactical_alert_ready(self._last_cool_tires_lap, current_lap):
+                if (
+                    self.m_drv_therm_stress == ThermalStressState.GREASY
+                    and gap_behind_s is not None
+                    and 0 < gap_behind_s < DEFENSIVE_GAP_BEHIND_MAX
+                ):
+                    tac["cool"] = True
+            if self._divebomb_active:
+                tac["db"] = True
         if tac:
             fi_extra["tac"] = tac
 

@@ -116,7 +116,8 @@ SCHEMA_DOCUMENTATION: dict[str, Any] = {
         "cpi": "Caution pit analytics {tl, ll, lda, xp, gr, ...}",
         "draft": "Draft state {on, streak, ex}",
         "odi": "Overtake difficulty {pa, pb, score, uc, rd}",
-        "tac": "Tactical alerts {def_line, cool, db}",
+        "tac": "Tactical alerts {def_line, cool, db} — DEFENSIVE mode only",
+        "sm": "Strategy mode {m: enum, n: BALANCED|OFFENSIVE|DEFENSIVE}",
     },
     "twl": "Pit box tire wear log array",
     "m_inc": "m.inc off-track window {ot, hr, tot}",
@@ -290,7 +291,7 @@ def _undercut_opportunity(
         return False
     fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
     odi = fi.get("odi") if isinstance(fi.get("odi"), dict) else {}
-    if odi.get("uc"):
+    if odi.get("uc") and _strategy_mode(telemetry) == "OFFENSIVE":
         return True
     return _rival_tires_decaying(telemetry)
 
@@ -497,9 +498,22 @@ def incident_push_advice(telemetry: dict[str, Any]) -> str | None:
     )
 
 
+def _strategy_mode(telemetry: dict[str, Any]) -> str:
+    """Read orchestration mode from fi.sm (defaults BALANCED)."""
+    fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
+    sm = fi.get("sm")
+    if isinstance(sm, dict):
+        name = str(sm.get("n", "") or "").upper()
+        if name in ("BALANCED", "OFFENSIVE", "DEFENSIVE"):
+            return name
+    return "BALANCED"
+
+
 def tactical_undercut_advice(telemetry: dict[str, Any]) -> str | None:
     """§16.4 offensive — draft undercut predictor (fi.odi.uc) with runway guard."""
     if _under_caution(telemetry):
+        return None
+    if _strategy_mode(telemetry) != "OFFENSIVE":
         return None
     fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
     odi = fi.get("odi") if isinstance(fi.get("odi"), dict) else {}
@@ -532,6 +546,8 @@ def tactical_undercut_advice(telemetry: dict[str, Any]) -> str | None:
 def tactical_defensive_advice(telemetry: dict[str, Any]) -> str | None:
     """§16 defensive — apex loss, thermal stress, divebomb (fi.tac)."""
     if _under_caution(telemetry):
+        return None
+    if _strategy_mode(telemetry) != "DEFENSIVE":
         return None
     fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
     tac = fi.get("tac")
