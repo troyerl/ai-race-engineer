@@ -10,7 +10,7 @@ from engineer.race_constants import (
     STEER_STD_HIGH,
     TRACK_TEMP_SHIFT_THRESHOLD_C,
 )
-from engineer.strategy_engine import advice_call_line, incident_push_advice, parse_call_line, run_strategy
+from engineer.strategy_engine import advice_call_line, incident_push_advice, parse_call_line, resolve_live_advice, run_strategy
 from tests.advice_assertions import assert_advice, assert_telemetry_advice, parse_advice
 from tests.fixtures import base_live_telemetry, inside_window_telemetry
 
@@ -100,6 +100,7 @@ class CautionAdviceTextTests(unittest.TestCase):
         assert_telemetry_advice(
             self,
             base_live_telemetry(
+                m={"p": 15},
                 s={"flb": {"yel": True, "cau": True}},
                 fi={"hd": {"pra": 0.7}, "cpi": {"ll": 2}},
             ),
@@ -124,6 +125,139 @@ class CautionAdviceTextTests(unittest.TestCase):
             forecast_exact="FORECAST: Paused under caution — re-run after green",
             trigger="FLAGS",
             conf="M",
+        )
+
+    def test_caution_stay_out_top_ten_high_position_cost(self) -> None:
+        assert_telemetry_advice(
+            self,
+            base_live_telemetry(
+                m={"p": 5, "sl": 5, "fl": 20.0, "mk": True, "fcq": "hi"},
+                s={"flb": {"yel": True, "cau": True}},
+                fi={"hd": {"pra": 0.7}, "cpi": {"ll": 2}},
+            ),
+            action="STAY OUT",
+            service="NONE",
+            why_contains="TOP-TEN POSITION",
+            forecast_exact="FORECAST: Paused under caution — re-run after green",
+            trigger="FLAGS",
+            conf="M",
+        )
+
+    def test_caution_podium_p2_stays_out_with_fuel(self) -> None:
+        assert_telemetry_advice(
+            self,
+            base_live_telemetry(
+                m={"p": 2, "fl": 20.75, "mk": True, "fcq": "hi"},
+                s={"flb": {"yel": True, "cau": True}},
+                fi={"hd": {"pra": 0.7}, "cpi": {"ll": 1}},
+            ),
+            action="STAY OUT",
+            service="NONE",
+            why_contains="PODIUM POSITION",
+            trigger="FLAGS",
+            conf="M",
+        )
+
+    def test_caution_top_ten_no_herd_stays_out(self) -> None:
+        assert_telemetry_advice(
+            self,
+            base_live_telemetry(
+                m={"p": 8, "fl": 6.0, "mk": True, "fcq": "hi"},
+                s={"flb": {"yel": True, "cau": True}},
+                fi={"hd": {"pra": 0.35}, "cpi": {"ll": 1}},
+            ),
+            action="STAY OUT",
+            service="NONE",
+            why_contains="FIELD NOT BOXING",
+            trigger="FLAGS",
+            conf="M",
+        )
+
+    def test_caution_top_ten_fuel_abundance_stays_out(self) -> None:
+        assert_telemetry_advice(
+            self,
+            base_live_telemetry(
+                m={"p": 10, "fl": 14.75, "mk": True, "fcq": "hi"},
+                s={"flb": {"yel": True, "cau": True}},
+                fi={"hd": {"pra": 0.75}, "cpi": {"ll": 1}},
+            ),
+            action="STAY OUT",
+            service="NONE",
+            why_contains="TOP 10 FUEL",
+            trigger="FLAGS",
+            conf="M",
+        )
+
+    def test_white_flag_coast_suppresses_pit_window(self) -> None:
+        assert_telemetry_advice(
+            self,
+            inside_window_telemetry(
+                m={
+                    "l": 60,
+                    "lr": 1,
+                    "sl": 12,
+                    "fl": 3.0,
+                    "mk": False,
+                    "p": 1,
+                },
+                s={"lt": 60, "flb": {}},
+                fi={"rej": {"v": "CLEAN"}},
+            ),
+            action="STAY OUT",
+            service="NONE",
+            why_contains="COAST TO CHECKERED",
+            trigger="FUEL",
+            conf="M",
+        )
+
+
+class MacroPitPriorityTests(unittest.TestCase):
+    def test_fuel_window_beats_tactical_cool(self) -> None:
+        tel = inside_window_telemetry(
+            m={
+                "p": 18,
+                "l": 30,
+                "lr": 15,
+                "sl": 16,
+                "lp": 1,
+                "fl": 1.8,
+                "mk": False,
+                "gb": 0.12,
+                "fcq": "hi",
+            },
+            fi={
+                "rej": {"v": "CLEAN"},
+                "sm": {"n": "DEFENSIVE"},
+                "tac": {"cool": True},
+            },
+            r={"ftl": 18, "pl": 46, "ts": 3, "fc": 20.0},
+        )
+        parsed = parse_advice(resolve_live_advice(tel))
+        self.assertIn(parsed.action, ("PIT", "PIT NOW"))
+        self.assertNotEqual(parsed.action, "COOL TIRES")
+
+    def test_leader_stretch_beats_window_pit(self) -> None:
+        assert_telemetry_advice(
+            self,
+            inside_window_telemetry(
+                m={
+                    "p": 1,
+                    "l": 30,
+                    "lr": 30,
+                    "sl": 15,
+                    "lp": 10,
+                    "fl": 3.0,
+                    "mk": False,
+                    "gb": 2.0,
+                    "pb": 2,
+                },
+                r={"ftl": 18, "pl": 58, "ts": 3, "fc": 20.0},
+                s={"lt": 60, "flb": {}},
+                fi={"rej": {"v": "CLEAN"}, "hd": {"prb": 0.2}},
+            ),
+            action="STAY OUT",
+            service="NONE",
+            why_contains="LEADER STRETCH",
         )
 
 

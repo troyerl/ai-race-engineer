@@ -28,6 +28,9 @@ python3 race_simulator.py --scenario join_leader_lap12
 # Tactical regression gate (yellow L2–3)
 python3 race_simulator.py --scenario tactical_caution_gate -v
 
+# Pre-race caution-branch strategy (from saved telemetry packet)
+python3 scripts/pre_race_sim.py --packet sim_logs/my_packet.json
+
 # Long green-flag races by track class
 python3 race_simulator.py --scenario long_short_track    # 120 laps, short oval
 python3 race_simulator.py --scenario long_medium_track     # 90 laps, intermediate
@@ -108,6 +111,7 @@ High apex loss or greasy temps auto-select a high-lat corner sector (`LapDistPct
 | `--start-lap` | scenario default | Override mid-race join lap. |
 | `--seed` | `42` | RNG seed for pace jitter. |
 | `--packet-json` | off | Append full telemetry JSON per lap to the log. |
+| `--follow-strategy` | off | Execute `PIT` / `PIT NOW` immediate directives (models stop cost + position loss). |
 | `--list-scenarios` | — | Print scenario names and exit. |
 | `-v` / `--verbose` | off | Echo the log file to stdout after the run. |
 
@@ -133,6 +137,8 @@ python3 race_simulator.py --scenario join_traffic_p8_lap30   # 40-car grid, P18
 | `join_traffic_p8_lap30` | 40 | P18 |
 | `join_last_lap18` | 35 | P35 (last) |
 | `undercut` | 35 | P6 |
+| `undercut_pace_stable` | 32 | P6 | Join L14 — stable pace, offensive undercut fires |
+| `undercut_pace_unstable` | 32 | P6 | Join L14 — erratic pace, undercut suppressed |
 | `lapped_danger` | 36 | P28 |
 | `long_short_track` | 32 | P12 | 120-lap Bristol-style short oval |
 | `long_medium_track` | 32 | P12 | 90-lap Charlotte-style intermediate |
@@ -188,6 +194,8 @@ Override lap count for a quicker smoke run: `--laps 30` (still uses scenario fue
 | `caution_lap8` | 20 | Yellow L8–L10; field boxes (`pra=0.75`); hero pits L9. |
 | `tactical_caution_gate` | 5 | Yellow L2–L3; regression gate for caution + tactical suppression. |
 | `undercut` | 25 | L12 offensive window: draft, close gap, rival tire deg. |
+| `undercut_pace_stable` | 17 (join 14→30) | Pace stability gate **open** — offensive undercut PIT NOW on L14. |
+| `undercut_pace_unstable` | 17 (join 14→30) | Same undercut window; high clean-lap σ suppresses offensive gamble. |
 | `defensive_pressure` | 18 | Car &lt;0.5s behind from L10; synthetic apex/thermal stress L11+. |
 | `lapped_danger` | 22 | Leader a lap ahead; 190s pit loss → `LAPPED_DANGER` deferral. |
 | `fuel_window` | 30 | Mid-race fuel payback window with clean reentry. |
@@ -244,6 +252,19 @@ python3 race_simulator.py --scenario join_traffic_p5_lap22 --start-lap 25
 - Lap 12 hook: rival ahead high tire wear, hero in draft at 0.45s.
 - IRSDK overrides on L12–L13 for corner-sector context sampling.
 
+**`undercut_pace_stable` / `undercut_pace_unstable`**
+
+- Mid-race join at **lap 14/30**, P6, fuel inside pit payback window (`fl≈2.2`, `ftl=25`).
+- Degraded rival ahead in draft at 0.35s; `cpi_xp=5` projects merge to P5.
+- Simulator feeds the real `CleanLapGate` — `m.pc.std_clean_s` / `n_clean` on every packet.
+- **Stable:** tight uniform jitter (`±0.03s`) → L14 `PACE STABILITY: offense_ok=True` → **offensive undercut** immediate directive.
+- **Unstable:** swing jitter (`±0.50s`) seeded into stint history → σ ≥ 0.40 → undercut blocked; engine holds position or boxes on fuel only.
+
+```bash
+python3 race_simulator.py --scenario undercut_pace_stable -v
+python3 race_simulator.py --scenario undercut_pace_unstable -v
+```
+
 **`defensive_pressure`**
 
 - From L10: `gap_to_behind_s = 0.35`, `gap_to_ahead_s = 2.0`.
@@ -287,6 +308,7 @@ VOICE:
 | Field | Meaning |
 |-------|---------|
 | `Mode` | `fi.sm.n` from context tracker (`BALANCED` / `OFFENSIVE` / `DEFENSIVE`). |
+| `PACE STABILITY` | `std_clean_s`, `n_clean`, and `offense_ok` from `CleanLapGate` (when ≥5 clean laps). |
 | `TACTICAL` | Post-tick snapshot: context mode, `fi.odi.uc`, apex loss, thermal state, `fi.tac` flags, fired alert IDs. |
 | `SIM TELEMETRY` | Values synthesized by `generate_simulated_packet_extras` before the context poll. |
 | `TARGET PIT` | `CHECKERED` when run-to-finish; else lap number capped to race distance. |
@@ -365,6 +387,7 @@ Add `_scenario_my_test()` to `_load_scenarios()`.
 | `max_tire_temp` | Tactical | Front tire temp target (`LFtempCM` / `RFtempCM`). |
 | `pra` | `fi.hd` | Override herd pit ratio for caution immediate logic. |
 | `cpi_ll` | `fi.cpi` | Override lead spots lost under caution. |
+| `cpi_xp` | `fi.cpi` | Override projected merge position (offensive undercut net-gain tests). |
 | `LapDistPct` | IRSDK | Track position (corner sector for lat-g sampling). |
 | `LatAccel` | IRSDK | Lateral load for in-corner detection. |
 | `Speed` | IRSDK | Corner speed for apex loss tracker. |
@@ -390,6 +413,7 @@ Covers:
 - Mid-race join bootstrap and 22–40 field clamp
 - **Tactical state transitions under caution** (`tactical_caution_gate`)
 - **Caution suppresses offensive undercut** (yellow on undercut lap)
+- **Pace stability gate** (`undercut_pace_stable` vs `undercut_pace_unstable`)
 - **Defensive mode under synthetic pressure** (`defensive_pressure` L11)
 - **Green-restart target box stability** (`tactical_caution_gate` lap 4 → CHECKERED)
 - **`default` run-to-finish** — no L22 phantom box or rolling forecast stops

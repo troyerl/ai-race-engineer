@@ -54,11 +54,12 @@ def _run_one(
     log_dir: Path | None,
     include_packet: bool,
     verbose: bool,
+    follow_strategy: bool,
 ) -> RunResult:
     scenario = SCENARIOS[scenario_name]
     t0 = time.perf_counter()
     try:
-        sim = RaceSimulator(scenario, seed=seed)
+        sim = RaceSimulator(scenario, seed=seed, follow_strategy=follow_strategy)
         records = sim.run()
         expected = _expected_lap_count(scenario_name)
         if len(records) != expected:
@@ -116,6 +117,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Stop on the first failed scenario",
     )
+    parser.add_argument(
+        "--follow-strategy",
+        action="store_true",
+        help="Execute PIT/PIT NOW directives during each scenario run",
+    )
     return parser.parse_args(argv)
 
 
@@ -134,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
             log_dir=args.log_dir,
             include_packet=args.packet_json,
             verbose=args.verbose,
+            follow_strategy=args.follow_strategy,
         )
         results.append(result)
         if not result.ok and args.fail_fast:

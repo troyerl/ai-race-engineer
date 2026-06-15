@@ -180,6 +180,40 @@ class CleanLapGateTests(unittest.TestCase):
         )
         self.assertEqual(gate._stint_clean_baseline_s, 30.2)
 
+    def test_pace_stddev_stable_clean_laps(self) -> None:
+        gate = self._gate()
+        for lt in (30.0, 30.05, 30.1, 30.08, 30.12):
+            self._complete_clean(gate, lt)
+        self.assertAlmostEqual(gate.pace_stddev_s() or 0.0, 0.05, places=1)
+
+    def test_pace_stddev_unstable_clean_laps(self) -> None:
+        gate = self._gate()
+        for lt in (30.0, 30.8, 29.5, 31.0, 29.7):
+            self._complete_clean(gate, lt)
+        self.assertGreaterEqual(gate.pace_stddev_s() or 0.0, 0.4)
+
+    def test_dirty_lap_does_not_affect_stability_buffer(self) -> None:
+        gate = self._gate()
+        for lt in (30.0, 30.1, 30.0, 30.1, 30.0):
+            self._complete_clean(gate, lt)
+        gate.poll(
+            incident_count=1,
+            gap_ahead_s=0.5,
+            is_caution=False,
+            on_track=True,
+            session_time_s=10.0,
+        )
+        gate.on_lap_complete(35.0, is_caution=False, reference_lap_s=30.0, incident_count=1)
+        self.assertEqual(gate.clean_lap_count, 5)
+        self.assertLess(gate.pace_stddev_s() or 1.0, 0.15)
+
+
+class CleanLapPaceStddevTests(unittest.TestCase):
+    def test_requires_min_samples(self) -> None:
+        from engineer.telemetry import clean_lap_pace_stddev
+
+        self.assertIsNone(clean_lap_pace_stddev([30.0, 30.1, 30.2, 30.3]))
+
 
 if __name__ == "__main__":
     unittest.main()

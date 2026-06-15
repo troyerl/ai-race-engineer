@@ -381,36 +381,7 @@ def format_pre_race_plan(plan: dict[str, Any]) -> str:
 
 
 def run_pre_race_plan(telemetry: dict[str, Any], *, track_name: str | None = None) -> str:
-    """Evaluate telemetry + session YAML and return formatted pre-race strategy text."""
-    session_yaml = session_yaml_from_telemetry(telemetry, track_name=track_name)
-    baseline = baseline_from_telemetry(telemetry)
-    rules = rules_from_telemetry(telemetry)
-    s = telemetry.get("s", {}) if isinstance(telemetry.get("s"), dict) else {}
-    track_temp_c = None
-    track_temp_ref_c = None
-    try:
-        if s.get("ttc") is not None:
-            track_temp_c = float(s["ttc"])
-    except (TypeError, ValueError):
-        track_temp_c = None
-    tenv = s.get("tenv")
-    if isinstance(tenv, dict):
-        try:
-            if tenv.get("ref") is not None:
-                track_temp_ref_c = float(tenv["ref"])
-        except (TypeError, ValueError):
-            track_temp_ref_c = None
-        if track_temp_c is None:
-            try:
-                if tenv.get("cur") is not None:
-                    track_temp_c = float(tenv["cur"])
-            except (TypeError, ValueError):
-                pass
-    plan = generate_pre_race_green_plan(
-        session_yaml,
-        baseline,
-        rules,
-        track_temp_c=track_temp_c,
-        track_temp_ref_c=track_temp_ref_c,
-    )
-    return format_pre_race_plan(plan)
+    """Evaluate telemetry + session YAML and return multi-branch pre-race strategy."""
+    from .pre_race_sim import run_pre_race_sim_plan
+
+    return run_pre_race_sim_plan(telemetry, track_name=track_name)

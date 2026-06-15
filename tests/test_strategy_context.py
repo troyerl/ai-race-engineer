@@ -18,6 +18,8 @@ from engineer.strategy_engine import (
     _append_context_notes,
     _apply_context_directive_overrides,
     _can_run_to_finish,
+    _coast_to_checkered_ok,
+    _caution_stay_out_for_track_position,
     _fuel_context,
     _fuel_laps_for_pit_window,
     _post_pit_alert_quiet,
@@ -36,11 +38,22 @@ from tests.fixtures import base_live_telemetry, inside_window_telemetry
 
 
 class FuelContextTests(unittest.TestCase):
-    def test_inside_window_when_cannot_make_to_end(self) -> None:
-        tel = base_live_telemetry(m={"fl": 3.0, "mk": False, "pb": 2, "fcq": "hi"})
-        laps, inside, critical = _fuel_context(tel)
-        self.assertTrue(inside)
+    def test_not_inside_window_early_multi_stop_race(self) -> None:
+        tel = base_live_telemetry(
+            m={"l": 10, "lr": 80, "fl": 18.0, "mk": False, "pb": 2, "fcq": "hi"},
+            s={"lt": 90},
+        )
+        _, inside, critical = _fuel_context(tel)
+        self.assertFalse(inside)
         self.assertFalse(critical)
+
+    def test_inside_window_near_projected_fuel_stop(self) -> None:
+        tel = base_live_telemetry(
+            m={"l": 26, "lr": 64, "fl": 2.0, "mk": False, "pb": 2, "fcq": "hi"},
+            s={"lt": 90},
+        )
+        _, inside, _ = _fuel_context(tel)
+        self.assertTrue(inside)
 
     def test_inside_window_when_fuel_within_payback(self) -> None:
         tel = base_live_telemetry(m={"fl": 1.5, "mk": True, "pb": 2, "fcq": "hi"})
@@ -426,6 +439,120 @@ class RunToFinishTests(unittest.TestCase):
         dash = format_strategy_dashboard(result, tel)
         self.assertIn("TARGET PIT: CHECKERED", dash)
         self.assertNotIn("Target Box:", dash)
+
+
+class WhiteFlagCoastTests(unittest.TestCase):
+    def test_coast_ok_on_final_lap_with_fuel(self) -> None:
+        tel = inside_window_telemetry(m={"l": 60, "lr": 1, "fl": 3.0, "mk": False})
+        self.assertTrue(_coast_to_checkered_ok(tel, fuel_laps_left=3.0))
+
+    def test_coast_not_ok_with_insufficient_fuel(self) -> None:
+        tel = inside_window_telemetry(m={"l": 60, "lr": 1, "fl": 0.8, "mk": False})
+        self.assertFalse(_coast_to_checkered_ok(tel, fuel_laps_left=0.8))
+
+    def test_coast_not_ok_with_laps_remaining(self) -> None:
+        tel = inside_window_telemetry(m={"l": 58, "lr": 3, "fl": 3.0, "mk": False})
+        self.assertFalse(_coast_to_checkered_ok(tel, fuel_laps_left=3.0))
+
+
+class LeaderStretchTests(unittest.TestCase):
+    def test_leader_stretches_in_window_with_fuel(self) -> None:
+        tel = inside_window_telemetry(
+            m={
+                "p": 1,
+                "l": 30,
+                "lr": 30,
+                "sl": 15,
+                "lp": 10,
+                "fl": 3.0,
+                "mk": False,
+                "gb": 2.0,
+                "pb": 2,
+            },
+            r={"ftl": 18, "pl": 58, "ts": 3, "fc": 20.0},
+            s={"lt": 60, "flb": {}},
+            fi={"rej": {"v": "CLEAN"}, "hd": {"prb": 0.15}},
+        )
+        result = evaluate_and_forecast_strategy(tel)
+        imm = result["immediate_directive"]
+        self.assertEqual(imm["ACTION"], "STAY OUT")
+        self.assertIn("clean-air stretch", imm["WHY"].lower())
+
+    def test_leader_pits_at_hard_fuel_floor(self) -> None:
+        tel = inside_window_telemetry(
+            m={
+                "p": 1,
+                "l": 30,
+                "lr": 30,
+                "sl": 15,
+                "lp": 10,
+                "fl": 1.4,
+                "mk": False,
+                "gb": 2.0,
+                "pb": 2,
+            },
+            r={"ftl": 18, "pl": 58, "ts": 3, "fc": 20.0},
+            s={"lt": 60, "flb": {}},
+            fi={"rej": {"v": "CLEAN"}, "hd": {"prb": 0.6}},
+        )
+        result = evaluate_and_forecast_strategy(tel)
+        self.assertEqual(result["immediate_directive"]["ACTION"], "PIT NOW")
+
+    def test_undercut_yourself_from_p4(self) -> None:
+        tel = inside_window_telemetry(
+            m={"p": 4, "l": 22, "lr": 25, "fl": 3.5, "mk": False},
+            fi={"rej": {"v": "CLEAN"}},
+        )
+        result = evaluate_and_forecast_strategy(tel)
+        imm = result["immediate_directive"]
+        self.assertEqual(imm["ACTION"], "PIT NOW")
+        self.assertIn("undercut yourself", imm["WHY"].lower())
+
+
+class CautionStayOutHeuristicTests(unittest.TestCase):
+    def test_top_ten_high_position_cost_stays_out(self) -> None:
+        tel = base_live_telemetry(
+            m={"p": 8, "sl": 6, "fl": 18.0, "mk": True, "fcq": "hi"},
+            s={"flb": {"yel": True, "cau": True}},
+            fi={"cpi": {"ll": 3}},
+        )
+        self.assertTrue(_caution_stay_out_for_track_position(tel, fuel_laps_left=18.0))
+
+    def test_low_position_cost_allows_pit(self) -> None:
+        tel = base_live_telemetry(
+            m={"p": 8, "sl": 6, "fl": 18.0, "mk": True, "fcq": "hi"},
+            s={"flb": {"yel": True, "cau": True}},
+            fi={"cpi": {"ll": 1}},
+        )
+        self.assertFalse(_caution_stay_out_for_track_position(tel, fuel_laps_left=18.0))
+
+    def test_outside_top_ten_allows_pit(self) -> None:
+        tel = base_live_telemetry(
+            m={"p": 12, "sl": 6, "fl": 18.0, "mk": True, "fcq": "hi"},
+            s={"flb": {"yel": True, "cau": True}},
+            fi={"cpi": {"ll": 4}},
+        )
+        self.assertFalse(_caution_stay_out_for_track_position(tel, fuel_laps_left=18.0))
+
+
+class CautionImmediateTests(unittest.TestCase):
+    def test_podium_p2_stays_out(self) -> None:
+        tel = base_live_telemetry(
+            m={"p": 2, "fl": 20.0, "mk": True, "fcq": "hi"},
+            s={"flb": {"yel": True, "cau": True}},
+            fi={"hd": {"pra": 0.8}, "cpi": {"ll": 1}},
+        )
+        result = evaluate_and_forecast_strategy(tel)
+        self.assertEqual(result["immediate_directive"]["ACTION"], "STAY OUT")
+
+    def test_top_ten_p10_fuel_abundance_stays_out(self) -> None:
+        tel = base_live_telemetry(
+            m={"p": 10, "fl": 14.0, "mk": True, "fcq": "hi"},
+            s={"flb": {"yel": True, "cau": True}},
+            fi={"hd": {"pra": 0.75}, "cpi": {"ll": 1}},
+        )
+        result = evaluate_and_forecast_strategy(tel)
+        self.assertEqual(result["immediate_directive"]["ACTION"], "STAY OUT")
 
 
 if __name__ == "__main__":

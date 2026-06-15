@@ -21,6 +21,7 @@ from sim.race_simulator import (
 )
 from engineer.context_engine import StrategyMode
 from engineer.race_constants import THERMAL_GREASY_C
+from engineer.strategy_engine import OFFENSIVE_UNDERCUT_WHY
 from tests.advice_assertions import parse_advice
 
 
@@ -255,6 +256,91 @@ class LongRaceScenarioTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertIn("Bristol Motor Speedway", text)
             self.assertIn("LAP 120", text)
+
+    def test_long_medium_no_pit_now_early_lap(self) -> None:
+        scenario = SCENARIOS["long_medium_track"]
+        sim = RaceSimulator(scenario, seed=7)
+        records = sim.run()
+        lap10 = next(r for r in records if r.lap == 10)
+        self.assertNotIn("PIT NOW", lap10.advice)
+        self.assertNotIn(OFFENSIVE_UNDERCUT_WHY, lap10.advice)
+
+    def test_follow_strategy_executes_pit_stop(self) -> None:
+        scenario = SCENARIOS["race_full"]
+        sim = RaceSimulator(scenario, seed=1, follow_strategy=True)
+        records = sim.run()
+        refueled = [
+            r
+            for r in records
+            if r.lap > 10 and r.fuel_laps_left >= scenario.fuel_tank_laps - 1.0
+        ]
+        self.assertGreater(len(refueled), 0)
+
+    def test_passing_can_improve_position(self) -> None:
+        scenario = SCENARIOS["default"]
+        sim = RaceSimulator(scenario, seed=99)
+        sim.hero.base_pace_s -= 1.5
+        records = sim.run()
+        self.assertLess(records[-1].position, scenario.hero_position)
+
+    def test_opponents_pit_during_race(self) -> None:
+        scenario = SCENARIOS["long_medium_track"]
+        sim = RaceSimulator(scenario, seed=3)
+        records = sim.run()
+        opponent_pitted = any(
+            car.name != "HERO" and car.last_pit_lap is not None for car in sim.field
+        )
+        self.assertTrue(opponent_pitted)
+        final_pos = records[-1].position
+        self.assertGreater(final_pos, 1)
+
+    def test_long_large_final_lap_no_pit_now_when_fuel_ok(self) -> None:
+        scenario = SCENARIOS["long_large_track"]
+        sim = RaceSimulator(scenario, seed=7, follow_strategy=True)
+        records = sim.run()
+        final = records[-1]
+        self.assertNotIn("PIT NOW", final.advice)
+        self.assertEqual(final.immediate_directive.get("ACTION"), "STAY OUT")
+
+    def test_undercut_pace_stable_triggers_offensive_undercut(self) -> None:
+        scenario = SCENARIOS["undercut_pace_stable"]
+        sim = RaceSimulator(scenario, seed=42)
+        records = sim.run()
+        lap14 = next(r for r in records if r.lap == 14)
+        pc = lap14.packet.get("m", {}).get("pc", {})
+        self.assertTrue(lap14.tactical_summary.get("pace_stable_for_offense"))
+        self.assertLess(float(pc.get("std_clean_s", 99)), 0.4)
+        self.assertGreaterEqual(int(pc.get("n_clean", 0)), 5)
+        self.assertEqual(lap14.immediate_directive.get("ACTION"), "PIT NOW")
+        self.assertIn(OFFENSIVE_UNDERCUT_WHY, lap14.immediate_directive.get("WHY", ""))
+
+    def test_undercut_pace_unstable_suppresses_offensive_undercut(self) -> None:
+        scenario = SCENARIOS["undercut_pace_unstable"]
+        sim = RaceSimulator(scenario, seed=42)
+        records = sim.run()
+        lap14 = next(r for r in records if r.lap == 14)
+        pc = lap14.packet.get("m", {}).get("pc", {})
+        self.assertFalse(lap14.tactical_summary.get("pace_stable_for_offense"))
+        self.assertGreaterEqual(float(pc.get("std_clean_s", 0)), 0.4)
+        self.assertNotIn(OFFENSIVE_UNDERCUT_WHY, lap14.immediate_directive.get("WHY", ""))
+        self.assertNotIn("fi_odi_undercut", lap14.tactical_alerts)
+
+
+class PaceStabilitySimLogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _load_scenarios()
+
+    def test_log_includes_pace_stability_block(self) -> None:
+        scenario = SCENARIOS["undercut_pace_stable"]
+        sim = RaceSimulator(scenario, seed=42)
+        records = sim.run()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pace_stable.log"
+            write_sim_log(records, scenario=scenario, log_path=path)
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("PACE STABILITY:", text)
+            self.assertIn("offense_ok=True", text)
 
 
 if __name__ == "__main__":

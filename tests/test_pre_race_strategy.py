@@ -114,15 +114,23 @@ class BaselineFromTelemetryTests(unittest.TestCase):
 
 
 class RunPreRacePlanTests(unittest.TestCase):
-    def test_run_pre_race_plan_includes_track_temp_from_packet(self) -> None:
+    def test_run_pre_race_plan_includes_session_and_branches(self) -> None:
         tel = base_live_telemetry(
+            m={"p": 10, "t": [90.0, 91.0], "fpe": 0.11, "fo": 0.08},
+            r={"fc": 18.0, "ftl": 22.0, "pl": 46, "ts": 4, "tsl": 4},
             s={"ttc": 15.0, "tenv": {"ref": 30.0, "cur": 15.0, "dt": -15.0, "tsc": 24}},
-            sy=_sample_session_yaml(),
+            sy={
+                **_sample_session_yaml(),
+                "DriverInfo": {
+                    "Drivers": [{"CarIdx": 0, "CarIsPlayer": 1}]
+                    + [{"CarIdx": i, "CarIsPlayer": 0} for i in range(1, 24)]
+                },
+            },
         )
         text = run_pre_race_plan(tel, track_name="Test Raceway")
-        self.assertIn("FUEL:", text)
-        self.assertIn("TIRES:", text)
-        self.assertIn("STOPS:", text)
+        self.assertIn("SESSION:", text)
+        self.assertIn("GREEN BASELINE", text)
+        self.assertIn("LIGHT (0–3 cautions)", text)
         self.assertIn("Test Raceway", text)
 
     def test_rules_from_telemetry_reads_race_tire_limit(self) -> None:

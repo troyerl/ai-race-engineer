@@ -10,7 +10,7 @@ Key goals:
 
 import json
 from collections import deque
-from statistics import median
+from statistics import median, stdev
 from typing import Any
 
 import irsdk
@@ -20,6 +20,8 @@ from .race_constants import (
     CLEAN_LAP_DRAFT_FRAC_MAX,
     CLEAN_LAP_DRAFT_GAP_SEC,
     CLEAN_LAP_FALLOFF_MIN_SAMPLES,
+    PACE_STABILITY_MIN_SAMPLES,
+    PACE_STABILITY_WINDOW,
     DEFAULT_AVG_LAP_S,
     FUEL_EMA_ALPHA,
     FUEL_LAPS_CLAMP_MULTIPLIER,
@@ -604,6 +606,17 @@ def falloff_from_clean_paces(
     return 0.0
 
 
+def clean_lap_pace_stddev(
+    clean_times: list[float],
+    *,
+    min_samples: int = PACE_STABILITY_MIN_SAMPLES,
+) -> float | None:
+    """Sample stddev of clean lap times; None until min_samples admitted laps."""
+    if len(clean_times) < min_samples:
+        return None
+    return round(stdev(clean_times), 3)
+
+
 class CleanLapGate:
     """
     Telemetry-gated filter: only clean green-flag laps in clean air update m.fo.
@@ -614,6 +627,7 @@ class CleanLapGate:
 
     def __init__(self) -> None:
         self.buffer: deque[float] = deque(maxlen=CLEAN_LAP_BUFFER_DEPTH)
+        self._stability_buffer: deque[float] = deque(maxlen=PACE_STABILITY_WINDOW)
         self._stint_clean_baseline_s: float | None = None
         self._lap_dirty = False
         self._lap_had_caution = False
@@ -625,6 +639,7 @@ class CleanLapGate:
 
     def reset_stint(self) -> None:
         self.buffer.clear()
+        self._stability_buffer.clear()
         self._stint_clean_baseline_s = None
         self._falloff_s = None
         self._reset_mid_lap()
@@ -682,6 +697,7 @@ class CleanLapGate:
         if admitted:
             lap_t = round(float(lap_time_s), 3)
             self.buffer.append(lap_t)
+            self._stability_buffer.append(lap_t)
             if self._stint_clean_baseline_s is None or lap_t < self._stint_clean_baseline_s:
                 self._stint_clean_baseline_s = lap_t
         fo = falloff_from_clean_paces(
@@ -701,6 +717,21 @@ class CleanLapGate:
     @property
     def falloff_s(self) -> float | None:
         return self._falloff_s
+
+    def pace_stddev_s(
+        self,
+        *,
+        min_samples: int = PACE_STABILITY_MIN_SAMPLES,
+    ) -> float | None:
+        """Rolling stddev of admitted clean laps for offensive tactic gating."""
+        return clean_lap_pace_stddev(
+            list(self._stability_buffer),
+            min_samples=min_samples,
+        )
+
+    @property
+    def clean_lap_count(self) -> int:
+        return len(self._stability_buffer)
 
 
 class TelemetryTracker:
@@ -1572,6 +1603,10 @@ class TelemetryTracker:
 
         you_times = list(self.field_history.get(player_idx, []))
         you_pace = pace_stats(you_times)
+        pace_std = self._clean_lap_gate.pace_stddev_s()
+        if pace_std is not None:
+            you_pace["std_clean_s"] = pace_std
+            you_pace["n_clean"] = self._clean_lap_gate.clean_lap_count
 
         # Estimate fuel-per-lap: FuelUsePerHour is kg/h (SDK); FuelLevel is liters — convert via nominal density.
         avg_lap_s = None

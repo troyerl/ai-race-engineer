@@ -260,9 +260,12 @@ laps_until_window (pwu) = max(0, laps_remain − laps_of_fuel_left)
 The strategy engine’s **`inside_window`** (trusted fuel) is:
 
 ```
-inside_window = (mk is false)           # cannot make it to the end on fuel → must plan a stop
-             OR (fuel_laps_left ≤ pb)   # within tire payback range (m.pb)
+target_stop_lap = current_lap + floor(window_fuel_laps)   # from _fuel_laps_for_pit_window()
+inside_window   = current_lap ≥ (target_stop_lap − m.pb)  # open near the next projected stop
+               OR fuel_laps_left ≤ m.pb                    # always when within payback of empty
 ```
+
+When `m.mk` is true (run-to-finish on fuel): `inside_window = fuel_laps_left ≤ m.pb` only.
 
 Untrusted fuel (`x.fe = 0` or `fcq` low): `inside_window = fuel_laps_left ≤ 2`.
 
@@ -467,7 +470,9 @@ Entry: `evaluate_and_forecast_strategy(telemetry)` in `strategy_engine.py`.
 
 ```
 fuel_laps_left = m.fl
-inside_window  = (m.mk is false) OR (fuel_laps_left ≤ m.pb)
+target_stop    = m.l + floor(_fuel_laps_for_pit_window())
+inside_window  = (m.l ≥ target_stop − m.pb) OR (fuel_laps_left ≤ m.pb)
+                 # when m.mk: inside_window = fuel_laps_left ≤ m.pb only
 fuel_critical  = fuel_laps_left ≤ 1
 ```
 
@@ -1019,10 +1024,12 @@ fuel_runway (ftl − stint_laps) ≥ MIN_UNDERCUT_RUNWAY_LAPS
 stint_laps ≥ MIN_UNDERCUT_STINT_LAPS (5)
 ```
 
-**Immediate PIT NOW** (`_undercut_opportunity()`): `inside_window`, `rej == CLEAN`, not fuel critical, `0 < gap_ahead < UNDERCUT_GAP_AHEAD_MAX_SEC`, runway OK, and either:
+**Immediate PIT NOW** (`_undercut_opportunity()`): `inside_window`, `rej == CLEAN`, not fuel critical, `0 < gap_ahead < UNDERCUT_GAP_AHEAD_MAX_SEC`, runway OK, **`_undercut_net_gain_ok()`** (projected merge `fi.cpi.xp < m.p`, or rival degrading in draft with car ahead), and either:
 
 - `fi.odi.uc == true` in OFFENSIVE mode (draft undercut predictor), or
 - rival tire decay proxy: `pace_delta_ahead ≥ UNDERCUT_RIVAL_PACE_DELTA_MIN` (0.12 s)
+
+**Live advice priority** (`resolve_live_advice()`): fuel-critical **PIT NOW** → incident push → tactical undercut → tactical defensive → main strategy.
 
 **Draft undercut predictor** (`_tick_undercut_predictor()`), OFFENSIVE only:
 

@@ -31,6 +31,7 @@ from .auto_alert_engine import AutoMonitorState, evaluate_auto_alert_tick, reset
 from .race_constants import ALERT_LAP_HORIZON, get_default_pit_loss_seconds, resolve_track_length_miles
 from .strategy_engine import advice_call_line, run_strategy
 from .strategy_worker import StrategyWorker
+from .packet_snapshot import save_telemetry_packet
 from .hotkey import (
     DEFAULT_HOTKEY,
     HOTKEY_CHOICES,
@@ -54,6 +55,7 @@ STREAM_UI_THROTTLE_MS = 80
 REQUEST_WATCHDOG_MS = 30_000
 BTN_LIVE = "ANALYZE FIELD & ADVISE"
 BTN_STRATEGY = "GET RACE STRATEGY"
+BTN_SAVE_PACKET = "SAVE PACKET"
 BTN_DISCONNECTED = "ANALYZE FIELD & ADVISE"
 
 
@@ -129,6 +131,10 @@ class AIRaceEngineer(QWidget):
         self._auto_monitor = AutoMonitorState()
         self._auto_last_call_line = ""
         self._last_delivered_call_line = ""
+        self._baseline_strategy_text: str | None = None
+        self._last_request_mode = "live"
+        self._last_ui_mode: str | None = None
+        self._strategy_compare_active = False
         self._link_host_boot = (link_host or "").strip() or str(self._config.get("race_link_host", "")).strip()
         self._link_port_boot = int(link_port if link_port is not None else self._config.get("race_link_port", DEFAULT_RACE_LINK_PORT))
         if self._role == "receiver":
@@ -200,6 +206,43 @@ class AIRaceEngineer(QWidget):
                 background: transparent;
                 border: none;
                 padding: 0;
+            }
+            QLabel#adviceBaselineText {
+                color: rgba(190, 210, 195, 230);
+                font-family: "Menlo", "Consolas", "Courier New", monospace;
+                font-size: 9px;
+                font-weight: 500;
+                line-height: 145%;
+                background: transparent;
+                border: none;
+                padding: 0;
+            }
+            QLabel#adviceColumnHeader {
+                color: rgba(160, 185, 165, 255);
+                font-size: 10px;
+                font-weight: 800;
+                background: transparent;
+                border: none;
+                padding: 0 0 4px 0;
+                letter-spacing: 0.06em;
+            }
+            QLabel#adviceLiveHeader {
+                color: rgba(180, 220, 190, 255);
+                font-size: 10px;
+                font-weight: 800;
+                background: transparent;
+                border: none;
+                padding: 0 0 4px 0;
+                letter-spacing: 0.06em;
+            }
+            QWidget#baselineStrategyColumn {
+                background-color: rgb(14, 16, 22);
+                border: 1px solid rgb(42, 46, 58);
+                border-radius: 10px;
+            }
+            QWidget#liveStrategyColumn {
+                background: transparent;
+                border: none;
             }
             QLabel#subLabel {
                 color: #E8EEF2;
@@ -405,8 +448,49 @@ class AIRaceEngineer(QWidget):
         self.advice_label.setWordWrap(True)
         self.advice_label.setMinimumHeight(280 if self._is_receiver else 160)
         self.advice_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+
+        self.baseline_strategy_column: QWidget | None = None
+        self.baseline_strategy_label: QLabel | None = None
+        self.live_strategy_column: QWidget | None = None
+        self.advice_compare_row: QHBoxLayout | None = None
+
         if not self._is_receiver:
+            self.baseline_strategy_column = QWidget()
+            self.baseline_strategy_column.setObjectName("baselineStrategyColumn")
+            baseline_col_layout = QVBoxLayout(self.baseline_strategy_column)
+            baseline_col_layout.setContentsMargins(10, 10, 10, 10)
+            baseline_col_layout.setSpacing(6)
+            self.baseline_header = QLabel("BASE PLAN")
+            self.baseline_header.setObjectName("adviceColumnHeader")
+            self.baseline_strategy_label = QLabel("")
+            self.baseline_strategy_label.setObjectName("adviceBaselineText")
+            self.baseline_strategy_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            self.baseline_strategy_label.setWordWrap(True)
+            self.baseline_strategy_label.setMinimumHeight(140)
+            self.baseline_strategy_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+            baseline_col_layout.addWidget(self.baseline_header)
+            baseline_col_layout.addWidget(self.baseline_strategy_label, 1)
+            self.baseline_strategy_column.setVisible(False)
+
+            self.live_strategy_column = QWidget()
+            self.live_strategy_column.setObjectName("liveStrategyColumn")
+            live_col_layout = QVBoxLayout(self.live_strategy_column)
+            live_col_layout.setContentsMargins(0, 0, 0, 0)
+            live_col_layout.setSpacing(6)
+            self.live_header = QLabel("LIVE CALL")
+            self.live_header.setObjectName("adviceLiveHeader")
+            live_col_layout.addWidget(self.live_header)
+            live_col_layout.addWidget(self.advice_label, 1)
+
+            self.advice_compare_row = QHBoxLayout()
+            self.advice_compare_row.setContentsMargins(0, 0, 0, 0)
+            self.advice_compare_row.setSpacing(10)
+            self.advice_compare_row.addWidget(self.baseline_strategy_column, 1)
+            self.advice_compare_row.addWidget(self.live_strategy_column, 1)
+
             advice_layout.addWidget(self.advice_header)
+            advice_layout.addLayout(self.advice_compare_row, 1)
+        else:
             advice_layout.addWidget(self.advice_label)
 
         top_row = QHBoxLayout()
@@ -476,6 +560,14 @@ class AIRaceEngineer(QWidget):
         self.btn.setMinimumHeight(52 if self._is_receiver else 48)
         self.btn.clicked.connect(self.trigger_ai_request)
 
+        self.save_packet_btn = QPushButton(BTN_SAVE_PACKET)
+        self.save_packet_btn.setObjectName("ghostBtn")
+        self.save_packet_btn.setCursor(Qt.PointingHandCursor)
+        self.save_packet_btn.setToolTip(
+            "Dump the current telemetry JSON to sim_logs/packets/ (Ctrl+Shift+S)."
+        )
+        self.save_packet_btn.clicked.connect(self.save_packet_snapshot)
+
         self.hotkey_hint = QLabel("")
         self.hotkey_hint.setObjectName("settingsHint")
         self.hotkey_hint.setWordWrap(True)
@@ -485,6 +577,7 @@ class AIRaceEngineer(QWidget):
         action_col.setSpacing(4)
         if not self._is_receiver:
             action_col.addWidget(self.btn)
+            action_col.addWidget(self.save_packet_btn)
             action_col.addWidget(self.hotkey_hint)
 
         tire_row = QHBoxLayout()
@@ -901,6 +994,9 @@ class AIRaceEngineer(QWidget):
         self._local_hotkey.setContext(Qt.ApplicationShortcut)
         self._local_hotkey.activated.connect(self._hotkey_trigger_analyze)
         self._apply_analyze_hotkey()
+        self._packet_save_shortcut = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
+        self._packet_save_shortcut.setContext(Qt.ApplicationShortcut)
+        self._packet_save_shortcut.activated.connect(self.save_packet_snapshot)
 
         self.ai_worker = StrategyWorker()
         self.ai_worker.partial.connect(self.display_partial)
@@ -1169,6 +1265,46 @@ class AIRaceEngineer(QWidget):
             or text.startswith("Timed out")
         )
 
+    def _is_live_compare_mode(self) -> bool:
+        return (
+            not self._is_receiver
+            and bool(self._baseline_strategy_text)
+            and self.telemetry.ensure_connected()
+            and self.telemetry.ui_mode() != "strategy"
+        )
+
+    def _pin_baseline_strategy(self, text: str) -> None:
+        cleaned = str(text or "").strip()
+        if not cleaned or cleaned.startswith(("AI Error", "Error:")):
+            return
+        self._baseline_strategy_text = cleaned
+        if self.baseline_strategy_label is not None:
+            self.baseline_strategy_label.setText(cleaned)
+        self._apply_strategy_compare_layout()
+
+    def _clear_baseline_strategy(self) -> None:
+        self._baseline_strategy_text = None
+        if self.baseline_strategy_label is not None:
+            self.baseline_strategy_label.clear()
+        self._apply_strategy_compare_layout()
+
+    def _apply_strategy_compare_layout(self) -> None:
+        if self._is_receiver:
+            return
+        compare = self._is_live_compare_mode()
+        self._strategy_compare_active = compare
+        if self.baseline_strategy_column is not None:
+            self.baseline_strategy_column.setVisible(compare)
+        if compare:
+            self.advice_header.setText("STRATEGY COMPARE")
+            self.setMaximumWidth(980)
+            self.setMinimumWidth(680)
+        else:
+            self.advice_header.setText("RACE ENGINEER")
+            self.setMaximumWidth(720)
+            self.setMinimumWidth(520)
+        self._relayout_overlay()
+
     def _set_advice_text(self, text: str):
         self.advice_label.setText(text)
         if self._is_receiver:
@@ -1177,6 +1313,7 @@ class AIRaceEngineer(QWidget):
                 self.advice_label.setObjectName(name)
                 self.advice_label.style().unpolish(self.advice_label)
                 self.advice_label.style().polish(self.advice_label)
+        self._apply_strategy_compare_layout()
         self.layout.activate()
         self._relayout_overlay()
 
@@ -1332,6 +1469,7 @@ class AIRaceEngineer(QWidget):
 
         self._next_request_id += 1
         self._active_request_id = self._next_request_id
+        self._last_request_mode = mode
         self.ai_worker.set_active(self._active_request_id)
 
         packet_json = self.telemetry.build_packet(
@@ -1339,6 +1477,27 @@ class AIRaceEngineer(QWidget):
             pit_loss_sec=int(self.pit_spin.value()),
         )
         self.ai_worker.invoke_ai(self._active_request_id, packet_json, mode=mode)
+
+    def save_packet_snapshot(self) -> None:
+        """Write the current live telemetry packet to sim_logs/packets/."""
+        if self._is_receiver:
+            self._set_advice_text("Packet save is available on the sim PC (local mode).")
+            return
+        if not self.telemetry.ensure_connected():
+            self._set_advice_text("Connect to iRacing to save a packet snapshot.")
+            return
+        try:
+            packet_json = self.telemetry.build_packet(
+                tire_sets_remaining=int(self.tire_spin.value()),
+                pit_loss_sec=int(self.pit_spin.value()),
+            )
+            track = self.telemetry.track_name() if hasattr(self.telemetry, "track_name") else None
+            path = save_telemetry_packet(packet_json, track_name=track)
+        except Exception as exc:
+            self._set_advice_text(f"Packet save failed: {exc}")
+            return
+        self._set_ai_status("Saved")
+        self._set_advice_text(f"Packet saved → {path.resolve()}")
 
     def clear_and_cancel(self):
         self._request_watchdog.stop()
@@ -1389,6 +1548,8 @@ class AIRaceEngineer(QWidget):
             self._set_ai_status("Error")
             self.btn.setEnabled(True)
             return
+        if self._last_request_mode == "strategy":
+            self._pin_baseline_strategy(str(text))
         call_line = advice_call_line(str(text))
         if call_line:
             self._auto_last_call_line = call_line
@@ -1437,6 +1598,16 @@ class AIRaceEngineer(QWidget):
             return
 
         connected = self.telemetry.is_connected()
+        ui_mode = self.telemetry.ui_mode() if connected else None
+        if (
+            not self._is_receiver
+            and connected
+            and self._last_ui_mode == "strategy"
+            and ui_mode == "live"
+            and self._baseline_strategy_text
+        ):
+            self._set_advice_text(_standby_advice_text(False))
+        self._last_ui_mode = ui_mode
         if connected:
             self.conn_badge.setText("iRacing: Online")
             self.conn_badge.setStyleSheet(
@@ -1449,6 +1620,7 @@ class AIRaceEngineer(QWidget):
             )
             if self._last_sdk_connected:
                 self._reset_auto_monitor()
+                self._clear_baseline_strategy()
 
         # On initial connect or reconnect, set a sensible default pit-loss
         # (but only if the user hasn't overridden it).
@@ -1456,7 +1628,9 @@ class AIRaceEngineer(QWidget):
             self._maybe_set_default_pit_loss()
             self._maybe_sync_tire_sets_from_sdk()
             self._reset_auto_monitor()
+            self._clear_baseline_strategy()
         self._last_sdk_connected = connected
+        self._apply_strategy_compare_layout()
         self._update_action_button_text()
 
     def _update_action_button_text(self):

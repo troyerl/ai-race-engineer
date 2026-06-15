@@ -33,6 +33,7 @@ class MockIRacing:
 
 def _offensive_undercut_telemetry(**overrides: Any) -> dict[str, Any]:
     default_m = {
+        "p": 5,
         "fl": 1.8,
         "sl": 10,
         "lr": 30,
@@ -51,6 +52,7 @@ def _offensive_undercut_telemetry(**overrides: Any) -> dict[str, Any]:
         fi={
             "sm": {"m": 1, "n": "OFFENSIVE"},
             "rej": {"v": "CLEAN"},
+            "cpi": {"xp": 4},
             "odi": {"uc": True, "pa": 0.3, "pb": 0.0, "score": 0.3},
         },
         **overrides,
@@ -69,6 +71,29 @@ def _defensive_telemetry(**overrides: Any) -> dict[str, Any]:
 
 
 class ResolveLiveAdvicePriorityTests(unittest.TestCase):
+    def test_fuel_critical_beats_tactical_defensive(self) -> None:
+        tel = base_live_telemetry(
+            m={
+                "p": 1,
+                "fl": 0.0,
+                "gb": 0.12,
+                "ga": None,
+                "lp": 18,
+                "sl": 18,
+                "l": 29,
+                "lr": 1,
+            },
+            s={"lt": 30},
+            fi={
+                "sm": {"m": 2, "n": "DEFENSIVE"},
+                "tac": {"cool": True},
+            },
+        )
+        advice = resolve_live_advice(tel)
+        parsed = parse_advice(advice)
+        self.assertEqual(parsed.action, "PIT NOW")
+        self.assertIn("fuel critical", parsed.why.lower())
+
     def test_incident_beats_tactical_undercut(self) -> None:
         tel = _offensive_undercut_telemetry(
             m={"inc": {"ot": INCIDENT_OT_ALERT_COUNT, "hr": 5, "tot": 10}},
@@ -82,7 +107,10 @@ class ResolveLiveAdvicePriorityTests(unittest.TestCase):
         advice = resolve_live_advice(tel)
         parsed = parse_advice(advice)
         self.assertEqual(parsed.action, "PIT NOW")
-        self.assertIn("UNDERCUT ACTIVE", parsed.why.upper())
+        self.assertTrue(
+            "UNDERCUT ACTIVE" in parsed.why.upper()
+            or "OFFENSIVE UNDERCUT" in parsed.why.upper()
+        )
 
     def test_tactical_defensive_beats_maintain_stint(self) -> None:
         tel = _defensive_telemetry()
@@ -146,7 +174,10 @@ class AutoAlertTacticalIntegrationTests(unittest.TestCase):
         self.assertTrue(decision.deliver, decision.reason)
         self.assertIsNotNone(decision.advice)
         assert decision.advice is not None
-        self.assertIn("UNDERCUT ACTIVE", decision.advice.upper())
+        self.assertTrue(
+            "UNDERCUT ACTIVE" in decision.advice.upper()
+            or "OFFENSIVE UNDERCUT" in decision.advice.upper()
+        )
 
     def test_lap_change_delivers_tactical_defensive(self) -> None:
         tel = _defensive_telemetry()

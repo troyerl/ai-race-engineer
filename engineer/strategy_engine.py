@@ -13,19 +13,40 @@ from typing import Any
 
 from .race_constants import (
     ALERT_LAP_HORIZON,
+    CAUTION_GREEN_RUN_BUFFER_LAPS,
+    CAUTION_HERD_PIT_RATIO_MIN,
+    CAUTION_PODIUM_FUEL_BUFFER_LAPS,
+    CAUTION_PODIUM_MAX_POSITION,
+    CAUTION_STAY_OUT_MIN_SPOTS_LOST,
+    CAUTION_STAY_OUT_TOP_POSITION,
+    CAUTION_TOP10_FUEL_ABUNDANCE_LAPS,
+    CAUTION_TOP10_MAX_SPOTS_LOST,
     DEFAULT_CAUTION_BURN_L,
     INCIDENT_OT_ALERT_COUNT,
     LAPPED_DANGER_FUEL_MIN_LAPS,
+    LEADER_FORCED_PIT_GAP_BEHIND,
+    LEADER_STRETCH_FUEL_FLOOR,
+    LEADER_STRETCH_FUEL_FLOOR_NO_HERD,
+    LEADER_STRETCH_HERD_PIT_BELOW,
+    LEADER_STRETCH_MAX_POSITION,
+    LEADER_STRETCH_MIN_LAPS_REMAIN,
+    LEADER_UNDERCUT_SELF_FUEL_MAX,
+    LEADER_UNDERCUT_SELF_MAX_POSITION,
+    LEADER_UNDERCUT_SELF_MIN_LAPS_REMAIN,
+    LEADER_UNDERCUT_SELF_MIN_POSITION,
     MIN_UNDERCUT_RUNWAY_LAPS,
     MIN_UNDERCUT_STINT_LAPS,
     ODI_STAY_OUT_THRESHOLD,
     ODI_UNDERCUT_THRESHOLD,
+    PACE_STABILITY_MIN_SAMPLES,
+    PACE_STABILITY_STD_THRESHOLD_S,
     POST_PIT_ALERT_MIN_STINT_LAPS,
     STEER_STD_ELEVATED,
     STEER_STD_HIGH,
     TRACK_TEMP_SHIFT_THRESHOLD_C,
     UNDERCUT_GAP_AHEAD_MAX_SEC,
     UNDERCUT_RIVAL_PACE_DELTA_MIN,
+    WHITE_FLAG_LAPS_REMAINING,
     clamp_nonneg_liters,
     green_flag_fuel_laps_from_telemetry,
     triangular_payback_lap,
@@ -80,7 +101,7 @@ SCHEMA_DOCUMENTATION: dict[str, Any] = {
         "ls": "Laps short of finishing",
         "lp": "Last pit lap",
         "t": "Lap times history (seconds)",
-        "pc": "Current delta pace",
+        "pc": "Current delta pace {avg_last3_s, trend_s, std_clean_s, n_clean}",
         "fg": "Flags",
         "fs": "Flag state string",
         "pr": "Is on pit road (bool)",
@@ -245,6 +266,12 @@ LAPPED_DANGER_VOICE = (
 OFFENSIVE_UNDERCUT_WHY = (
     "Offensive undercut — car ahead on degrading tires; box this lap for clean merge."
 )
+LEADER_UNDERCUT_SELF_WHY = (
+    "Undercut yourself — box from mid-front before inheriting lead on worn fuel."
+)
+LEADER_CLEAN_AIR_STRETCH_WHY = (
+    "Leader clean-air stretch — defer pit while fuel carries; protect track position."
+)
 
 
 def _session_laps_remain(telemetry: dict[str, Any]) -> int:
@@ -277,10 +304,177 @@ def _can_run_to_finish(telemetry: dict[str, Any]) -> bool:
     m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
     if m.get("mk") is True:
         return True
-    fuel_laps_left, _, is_fuel_critical = _fuel_context(telemetry)
-    if is_fuel_critical:
+    fuel_laps_left = _safe_float(m.get("fl"), 0.0)
+    if fuel_laps_left <= 1.0:
         return False
     return fuel_laps_left >= float(_session_laps_remain(telemetry)) - 0.01
+
+
+def _coast_to_checkered_ok(telemetry: dict[str, Any], *, fuel_laps_left: float) -> bool:
+    """Suppress green-flag pit calls on the final lap when fuel reaches the line."""
+    if _under_caution(telemetry):
+        return False
+    laps_remain = _session_laps_remain(telemetry)
+    if laps_remain > WHITE_FLAG_LAPS_REMAINING:
+        return False
+    return fuel_laps_left >= float(laps_remain) - 0.01
+
+
+def _caution_stay_out_for_track_position(
+    telemetry: dict[str, Any],
+    *,
+    fuel_laps_left: float,
+) -> bool:
+    """Stay out under yellow when top-ten position loss outweighs a pit cycle."""
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
+    position = _safe_int(m.get("p"), 0)
+    if position < 1 or position > CAUTION_STAY_OUT_TOP_POSITION:
+        return False
+    cpi = fi.get("cpi", {}) if isinstance(fi.get("cpi"), dict) else {}
+    spots_lost = _safe_int(cpi.get("ll"), 0)
+    if spots_lost <= CAUTION_STAY_OUT_MIN_SPOTS_LOST:
+        return False
+    r = telemetry.get("r", {}) if isinstance(telemetry.get("r"), dict) else {}
+    ftl = max(1.0, _safe_float(r.get("ftl"), 25.0))
+    stint = _safe_int(m.get("sl"), 0)
+    min_fuel = float(CAUTION_GREEN_RUN_BUFFER_LAPS) + 1.0
+    if fuel_laps_left < min_fuel:
+        return False
+    tire_runway = ftl - float(stint)
+    if tire_runway < float(CAUTION_GREEN_RUN_BUFFER_LAPS):
+        return False
+    return True
+
+
+def _leader_in_pit_decision_zone(
+    telemetry: dict[str, Any],
+    *,
+    fuel_laps_left: float,
+    inside_window: bool,
+) -> bool:
+    """True when the leader is in the fuel-box decision band (not only inside_window)."""
+    if inside_window:
+        return True
+    if fuel_laps_left <= LEADER_UNDERCUT_SELF_FUEL_MAX:
+        m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+        current_lap = _safe_int(m.get("l"), 1)
+        pb_laps = _resolve_pit_payback_laps(telemetry)
+        box = _target_box_laps(telemetry, fuel_laps_left=fuel_laps_left, payback_laps=pb_laps)
+        if box is not None:
+            low, high = box
+            if (low - 1) <= current_lap <= high:
+                return True
+    return False
+
+
+def _leader_stretch_fuel_floor(telemetry: dict[str, Any]) -> float:
+    """
+    Hard floor when herd behind is pitting; softer floor when no cycling cars behind.
+
+    Hybrid: never stretch below LEADER_STRETCH_FUEL_FLOOR (1.5). When fi.hd.prb is
+    low, require more fuel reserve before deferring a window pit from the lead.
+    """
+    fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
+    hd = fi.get("hd", {}) if isinstance(fi.get("hd"), dict) else {}
+    prb = _safe_float(hd.get("prb"), 0.0)
+    if prb >= LEADER_STRETCH_HERD_PIT_BELOW:
+        return LEADER_STRETCH_FUEL_FLOOR
+    return max(LEADER_STRETCH_FUEL_FLOOR, LEADER_STRETCH_FUEL_FLOOR_NO_HERD)
+
+
+def _leader_forced_pit_by_behind(
+    telemetry: dict[str, Any],
+    *,
+    inside_window: bool,
+    laps_remain: int,
+) -> bool:
+    """Trailing undercut threat while leading — stretch ends when pressure is real."""
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    gap_behind = _safe_float(m.get("gb"), 99.0)
+    if gap_behind > LEADER_FORCED_PIT_GAP_BEHIND:
+        return False
+    fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
+    hd = fi.get("hd", {}) if isinstance(fi.get("hd"), dict) else {}
+    prb = _safe_float(hd.get("prb"), 0.0)
+    if prb >= LEADER_STRETCH_HERD_PIT_BELOW:
+        return False
+    odi = fi.get("odi", {}) if isinstance(fi.get("odi"), dict) else {}
+    odi_score = _safe_float(odi.get("score"), 0.0)
+    pace_behind = _safe_float(odi.get("pb"), 0.0)
+    return _defensive_undercut_threat(
+        telemetry,
+        inside_window=inside_window,
+        is_fuel_critical=False,
+        action="STAY OUT",
+        odi_score=odi_score,
+        pace_behind=pace_behind,
+        laps_remain=laps_remain,
+    )
+
+
+def _leader_clean_air_stretch_ok(
+    telemetry: dict[str, Any],
+    *,
+    fuel_laps_left: float,
+    inside_window: bool,
+    is_fuel_critical: bool,
+    laps_remain: int,
+) -> bool:
+    """Defer a window pit from P1–P3 while clean air and fuel/herd allow."""
+    if _under_caution(telemetry) or is_fuel_critical:
+        return False
+    if not _leader_in_pit_decision_zone(
+        telemetry,
+        fuel_laps_left=fuel_laps_left,
+        inside_window=inside_window,
+    ):
+        return False
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    position = _safe_int(m.get("p"), 0)
+    if position < 1 or position > LEADER_STRETCH_MAX_POSITION:
+        return False
+    if laps_remain <= LEADER_STRETCH_MIN_LAPS_REMAIN:
+        return False
+    fuel_floor = _leader_stretch_fuel_floor(telemetry)
+    if fuel_laps_left <= fuel_floor:
+        return False
+    if _leader_forced_pit_by_behind(
+        telemetry,
+        inside_window=inside_window,
+        laps_remain=laps_remain,
+    ):
+        return False
+    return True
+
+
+def _undercut_yourself_opportunity(
+    telemetry: dict[str, Any],
+    *,
+    inside_window: bool,
+    fuel_laps_left: float,
+    rej_v: str,
+    laps_remain: int,
+    is_fuel_critical: bool,
+) -> bool:
+    """Box from P3–P5 before inheriting the lead on a binding fuel stop."""
+    if not _pace_stable_for_offense(telemetry):
+        return False
+    if _under_caution(telemetry) or is_fuel_critical:
+        return False
+    if not inside_window and fuel_laps_left > LEADER_UNDERCUT_SELF_FUEL_MAX:
+        return False
+    if laps_remain < LEADER_UNDERCUT_SELF_MIN_LAPS_REMAIN:
+        return False
+    if rej_v != "CLEAN":
+        return False
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    position = _safe_int(m.get("p"), 0)
+    if position < LEADER_UNDERCUT_SELF_MIN_POSITION or position > LEADER_UNDERCUT_SELF_MAX_POSITION:
+        return False
+    if fuel_laps_left > LEADER_UNDERCUT_SELF_FUEL_MAX:
+        return False
+    return True
 
 
 def _pit_loss_seconds(telemetry: dict[str, Any]) -> float:
@@ -321,6 +515,44 @@ def _undercut_runway_ok(telemetry: dict[str, Any], *, laps_remain: int | None = 
     return True
 
 
+def _projected_merge_position(telemetry: dict[str, Any]) -> int | None:
+    """Best-effort on-track class position after a green-flag pit (fi.cpi.xp)."""
+    fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
+    cpi = fi.get("cpi") if isinstance(fi.get("cpi"), dict) else {}
+    xp = _safe_int(cpi.get("xp"), 0)
+    return xp if xp > 0 else None
+
+
+def _undercut_net_gain_ok(telemetry: dict[str, Any]) -> bool:
+    """
+    §16.4.2 — offensive pit only when merge gains track position or rival blocks pace.
+
+    Blocks P12→P12 'undercuts' that only burn pit-road time.
+    """
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    current = _safe_int(m.get("p"), 0)
+    projected = _projected_merge_position(telemetry)
+    if projected is not None and current > 0:
+        return projected < current
+
+    rv = telemetry.get("rv", {}) if isinstance(telemetry.get("rv"), dict) else {}
+    ahead = rv.get("ahead") if isinstance(rv.get("ahead"), dict) else {}
+    ahead_pos = _safe_int(ahead.get("pos"), 0)
+    if current <= 0 and ahead_pos > 0:
+        current = ahead_pos + 1
+
+    gap_ahead = m.get("ga")
+    if (
+        isinstance(gap_ahead, (int, float))
+        and 0 < float(gap_ahead) < UNDERCUT_GAP_AHEAD_MAX_SEC
+        and _rival_tires_decaying(telemetry)
+        and ahead_pos > 0
+        and ahead_pos < current
+    ):
+        return True
+    return False
+
+
 def _rival_tires_decaying(telemetry: dict[str, Any]) -> bool:
     """True when car ahead is slower — proxy for rival tire deg on long runs."""
     fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
@@ -341,6 +573,22 @@ def _rival_tires_decaying(telemetry: dict[str, Any]) -> bool:
     return False
 
 
+def _pace_stable_for_offense(telemetry: dict[str, Any]) -> bool:
+    """
+    True when clean-lap pace is consistent enough for offensive undercut gambles.
+
+    Insufficient clean-lap history does not block — only suppress when variance
+    is measured and exceeds PACE_STABILITY_STD_THRESHOLD_S.
+    """
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    pc = m.get("pc") if isinstance(m.get("pc"), dict) else {}
+    std = pc.get("std_clean_s")
+    n_clean = _safe_int(pc.get("n_clean"), 0)
+    if std is None or n_clean < PACE_STABILITY_MIN_SAMPLES:
+        return True
+    return float(std) < PACE_STABILITY_STD_THRESHOLD_S
+
+
 def _undercut_opportunity(
     telemetry: dict[str, Any],
     *,
@@ -350,6 +598,8 @@ def _undercut_opportunity(
     is_fuel_critical: bool,
 ) -> bool:
     """§16.4.2 offensive undercut matrix — all pacing, traffic, and runway gates."""
+    if not _pace_stable_for_offense(telemetry):
+        return False
     if not inside_window or is_fuel_critical:
         return False
     if rej_v != "CLEAN":
@@ -366,8 +616,10 @@ def _undercut_opportunity(
     fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
     odi = fi.get("odi") if isinstance(fi.get("odi"), dict) else {}
     if odi.get("uc") and _strategy_mode(telemetry) == "OFFENSIVE":
-        return True
-    return _rival_tires_decaying(telemetry)
+        return _undercut_net_gain_ok(telemetry)
+    if _rival_tires_decaying(telemetry):
+        return _undercut_net_gain_ok(telemetry)
+    return False
 
 
 def _defensive_undercut_threat(
@@ -439,12 +691,21 @@ def _fuel_context(telemetry: dict[str, Any]) -> tuple[float, bool, bool]:
     if x.get("fe", 0) == 1 and m.get("fcq") in ("hi", "med"):
         fuel_laps_left = _safe_float(m.get("fl"), 0.0)
         pb_laps = _resolve_pit_payback_laps(telemetry)
-        can_make_to_end = m.get("mk")
-        if can_make_to_end is False:
-            inside_window = True
-        else:
-            inside_window = fuel_laps_left <= pb_laps
         is_fuel_critical = fuel_laps_left <= 1.0
+
+        if _can_run_to_finish(telemetry) and not _under_caution(telemetry):
+            inside_window = fuel_laps_left <= pb_laps
+        else:
+            current_lap = _safe_int(m.get("l"), 1)
+            window_fuel = _fuel_laps_for_pit_window(telemetry, fuel_laps_left=fuel_laps_left)
+            if window_fuel <= 0:
+                inside_window = fuel_laps_left <= pb_laps
+            else:
+                target_stop_lap = current_lap + max(0, int(math.floor(window_fuel)))
+                window_margin = max(1, int(round(pb_laps)))
+                inside_window = current_lap >= (target_stop_lap - window_margin)
+                if fuel_laps_left <= pb_laps:
+                    inside_window = True
     else:
         fpl = _safe_float(m.get("fpl"), 0.2)
         ful = _safe_float(m.get("ful"), 0.0)
@@ -509,6 +770,16 @@ def _apply_context_directive_overrides(
 ) -> tuple[str, str, str]:
     fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
     m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    fuel_laps_left = _safe_float(m.get("fl"), 0.0)
+    if _coast_to_checkered_ok(telemetry, fuel_laps_left=fuel_laps_left):
+        return (
+            "STAY OUT",
+            "NONE",
+            _append_context_notes(
+                "Final lap — fuel covers checkered; pitting forfeits track position.",
+                telemetry,
+            ),
+        )
     odi = fi.get("odi") if isinstance(fi.get("odi"), dict) else {}
     odi_score = _safe_float(odi.get("score"), 0.0)
     pace_behind = _safe_float(odi.get("pb"), 0.0)
@@ -587,11 +858,15 @@ def tactical_undercut_advice(telemetry: dict[str, Any]) -> str | None:
     """§16.4 offensive — draft undercut predictor (fi.odi.uc) with runway guard."""
     if _under_caution(telemetry):
         return None
+    if not _pace_stable_for_offense(telemetry):
+        return None
     if _strategy_mode(telemetry) != "OFFENSIVE":
         return None
     fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
     odi = fi.get("odi") if isinstance(fi.get("odi"), dict) else {}
     if not odi.get("uc"):
+        return None
+    if not _undercut_net_gain_ok(telemetry):
         return None
     fuel_laps_left, inside_window, is_fuel_critical = _fuel_context(telemetry)
     if not inside_window or is_fuel_critical:
@@ -660,13 +935,113 @@ def tactical_defensive_advice(telemetry: dict[str, Any]) -> str | None:
     return None
 
 
+def _fuel_critical_live_advice(telemetry: dict[str, Any]) -> str | None:
+    """Force pit when tank is empty — suppresses tactical defensive/undercut overlays."""
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    if m.get("pr") or m.get("ps"):
+        return None
+    fuel_laps_left, _, is_fuel_critical = _fuel_context(telemetry)
+    if not (is_fuel_critical or fuel_laps_left <= 1.0):
+        return None
+    r = telemetry.get("r", {}) if isinstance(telemetry.get("r"), dict) else {}
+    tire_sets = _safe_int(r.get("ts"), 0)
+    service = "4 TIRES" if tire_sets > 0 else "FUEL ONLY"
+    return format_engineer_advice(
+        "PIT NOW",
+        "THIS LAP",
+        service,
+        "Fuel critical; absolute limit of current tank reached.",
+        trigger="FUEL",
+        conf="H",
+        telemetry=telemetry,
+    )
+
+
+def _white_flag_coast_live_advice(telemetry: dict[str, Any]) -> str | None:
+    """Suppress pit calls on the final lap when fuel covers the checkered."""
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    if m.get("pr") or m.get("ps"):
+        return None
+    fuel_laps_left, _, _ = _fuel_context(telemetry)
+    if not _coast_to_checkered_ok(telemetry, fuel_laps_left=fuel_laps_left):
+        return None
+    return format_engineer_advice(
+        "STAY OUT",
+        "THIS LAP",
+        "NONE",
+        "Final lap — fuel covers checkered; pitting forfeits track position.",
+        trigger="FUEL",
+        conf="H",
+        telemetry=telemetry,
+    )
+
+
+def _macro_strategy_pit_live_advice(telemetry: dict[str, Any]) -> str | None:
+    """Strategy PIT/PIT NOW beats tactical overlays — fuel window, undercut yourself, etc."""
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    if m.get("pr") or m.get("ps"):
+        return None
+    if _under_caution(telemetry):
+        return None
+    result = evaluate_and_forecast_strategy(telemetry)
+    imm = result.get("immediate_directive", {})
+    if not isinstance(imm, dict):
+        return None
+    action = str(imm.get("ACTION", "") or "").upper()
+    if action not in ("PIT", "PIT NOW"):
+        return None
+    service = str(imm.get("SERVICE", "NONE") or "NONE")
+    why = str(imm.get("WHY", "") or "")
+    trigger = "FUEL"
+    if "undercut yourself" in why.lower():
+        trigger = "OVERTAKE"
+    elif "undercut" in why.lower():
+        trigger = "OVERTAKE"
+    return format_engineer_advice(
+        action,
+        "THIS LAP",
+        service,
+        why,
+        trigger=trigger,
+        conf="H",
+        telemetry=telemetry,
+    )
+
+
 def resolve_live_advice(telemetry: dict[str, Any], *, mode: str = "live", track_name: str | None = None) -> str:
-    """Priority chain: incident → tactical undercut → tactical defensive → strategy."""
-    for producer in (incident_push_advice, tactical_undercut_advice, tactical_defensive_advice):
+    """Priority chain: fuel-critical → white-flag coast → incident → macro pit → tactical → strategy."""
+    fuel_advice = _fuel_critical_live_advice(telemetry)
+    if fuel_advice:
+        return fuel_advice
+    coast_advice = _white_flag_coast_live_advice(telemetry)
+    if coast_advice:
+        return coast_advice
+    incident = incident_push_advice(telemetry)
+    if incident:
+        return incident
+    macro_pit = _macro_strategy_pit_live_advice(telemetry)
+    if macro_pit:
+        return macro_pit
+    for producer in (tactical_undercut_advice, tactical_defensive_advice):
         advice = producer(telemetry)
         if advice:
             return advice
     return run_strategy(telemetry, mode=mode, track_name=track_name)
+
+
+def _caution_podium_stay_out(telemetry: dict[str, Any], *, fuel_laps_left: float) -> bool:
+    """P1–P3 stay out on yellow when fuel comfortably covers restart + green run."""
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    position = _safe_int(m.get("p"), 0)
+    if position < 1 or position > CAUTION_PODIUM_MAX_POSITION:
+        return False
+    min_fuel = float(CAUTION_GREEN_RUN_BUFFER_LAPS + CAUTION_PODIUM_FUEL_BUFFER_LAPS)
+    return fuel_laps_left >= min_fuel
+
+
+def _caution_top_ten_fuel_abundant(fuel_laps_left: float) -> bool:
+    """Top ten should not burn track position on early yellow with a full tank."""
+    return fuel_laps_left >= float(CAUTION_TOP10_FUEL_ABUNDANCE_LAPS)
 
 
 def _caution_immediate(
@@ -679,6 +1054,7 @@ def _caution_immediate(
     s = telemetry.get("s", {})
     r = telemetry.get("r", {})
     fi = telemetry.get("fi", {})
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
     flags = s.get("flb", {}) if isinstance(s.get("flb"), dict) else {}
     if not (flags.get("yel") or flags.get("cau")):
         return None
@@ -690,12 +1066,52 @@ def _caution_immediate(
             "WHY": "Fuel range critical under caution; servicing full tank and fresh tires.",
         }
 
+    if _caution_podium_stay_out(telemetry, fuel_laps_left=fuel_laps_left):
+        return {
+            "ACTION": "STAY OUT",
+            "SERVICE": "NONE",
+            "WHY": "Staying out under caution — podium track position; fuel covers restart.",
+        }
+
+    if _caution_stay_out_for_track_position(telemetry, fuel_laps_left=fuel_laps_left):
+        return {
+            "ACTION": "STAY OUT",
+            "SERVICE": "NONE",
+            "WHY": "Staying out under caution — top-ten track position outweighs pit cycle.",
+        }
+
+    position = _safe_int(m.get("p"), 0)
     cpi = fi.get("cpi") if isinstance(fi.get("cpi"), dict) else {}
     spots_lost = _safe_int(cpi.get("ll"), 99)
     herd = fi.get("hd") if isinstance(fi.get("hd"), dict) else {}
     herd_pit_ratio = _safe_float(herd.get("pra"), 0.0)
 
-    if spots_lost <= 3 or herd_pit_ratio > 0.6:
+    if 1 <= position <= CAUTION_STAY_OUT_TOP_POSITION:
+        if _caution_top_ten_fuel_abundant(fuel_laps_left):
+            return {
+                "ACTION": "STAY OUT",
+                "SERVICE": "NONE",
+                "WHY": "Staying out under caution — top-ten fuel abundance protects track position.",
+            }
+        if herd_pit_ratio < CAUTION_HERD_PIT_RATIO_MIN:
+            return {
+                "ACTION": "STAY OUT",
+                "SERVICE": "NONE",
+                "WHY": "Staying out under caution — field not boxing; protect top-ten position.",
+            }
+        if spots_lost > CAUTION_TOP10_MAX_SPOTS_LOST:
+            return {
+                "ACTION": "STAY OUT",
+                "SERVICE": "NONE",
+                "WHY": "Staying out under caution to secure critical track position.",
+            }
+        return {
+            "ACTION": "PIT",
+            "SERVICE": "4 TIRES",
+            "WHY": "Caution window viable; field is boxing with low track position penalty.",
+        }
+
+    if herd_pit_ratio >= CAUTION_HERD_PIT_RATIO_MIN and spots_lost <= 3:
         return {
             "ACTION": "PIT",
             "SERVICE": "4 TIRES",
@@ -767,6 +1183,10 @@ def evaluate_and_forecast_strategy(telemetry: dict[str, Any]) -> dict[str, Any]:
         immediate_action = "PIT NOW"
         immediate_service = "4 TIRES" if tire_sets > 0 else "FUEL ONLY"
         why_reason = "Fuel critical; absolute limit of current tank reached."
+    elif _coast_to_checkered_ok(telemetry, fuel_laps_left=fuel_laps_left):
+        immediate_action = "STAY OUT"
+        immediate_service = "NONE"
+        why_reason = "Final lap — fuel covers checkered; pitting forfeits track position."
     elif _undercut_opportunity(
         telemetry,
         inside_window=inside_window,
@@ -777,8 +1197,39 @@ def evaluate_and_forecast_strategy(telemetry: dict[str, Any]) -> dict[str, Any]:
         immediate_action = "PIT NOW"
         immediate_service = "4 TIRES" if tire_sets > 0 else "FUEL ONLY"
         why_reason = OFFENSIVE_UNDERCUT_WHY
+    elif _undercut_yourself_opportunity(
+        telemetry,
+        inside_window=inside_window,
+        fuel_laps_left=fuel_laps_left,
+        rej_v=rej_v,
+        laps_remain=laps_remain,
+        is_fuel_critical=is_fuel_critical,
+    ):
+        immediate_action = "PIT NOW"
+        immediate_service = "4 TIRES" if tire_sets > 0 else "FUEL ONLY"
+        why_reason = LEADER_UNDERCUT_SELF_WHY
+    elif _leader_clean_air_stretch_ok(
+        telemetry,
+        fuel_laps_left=fuel_laps_left,
+        inside_window=inside_window,
+        is_fuel_critical=is_fuel_critical,
+        laps_remain=laps_remain,
+    ):
+        immediate_action = "STAY OUT"
+        immediate_service = "NONE"
+        why_reason = LEADER_CLEAN_AIR_STRETCH_WHY
     elif inside_window and rej_v == "CLEAN":
-        if _post_pit_alert_quiet(telemetry) and not is_fuel_critical:
+        position = _safe_int(m.get("p"), 0)
+        leader_bind = (
+            1 <= position <= LEADER_STRETCH_MAX_POSITION
+            and fuel_laps_left <= _leader_stretch_fuel_floor(telemetry)
+        )
+        binding_fuel = is_fuel_critical or fuel_laps_left <= 1.0 or leader_bind
+        if (
+            _post_pit_alert_quiet(telemetry)
+            and not is_fuel_critical
+            and not binding_fuel
+        ):
             immediate_action = "STAY OUT"
             immediate_service = "NONE"
             why_reason = "Fresh stint after pit stop; holding position before next window."
@@ -984,6 +1435,20 @@ def _why_headline(why: str) -> str:
         return "FUEL CRITICAL — PIT THIS LAP"
     if "fuel range critical" in wl:
         return "FUEL CRITICAL UNDER CAUTION — BOX NOW"
+    if "top-ten track position" in wl:
+        return "CAUTION — STAY OUT FOR TOP-TEN POSITION"
+    if "podium track position" in wl:
+        return "CAUTION — STAY OUT FOR PODIUM POSITION"
+    if "top-ten fuel abundance" in wl:
+        return "CAUTION — STAY OUT (TOP 10 FUEL)"
+    if "field not boxing" in wl:
+        return "CAUTION — STAY OUT (FIELD NOT BOXING)"
+    if "final lap" in wl and "checkered" in wl:
+        return "WHITE FLAG — COAST TO CHECKERED ON FUEL"
+    if "undercut yourself" in wl:
+        return "UNDERCUT YOURSELF — BOX BEFORE INHERITING LEAD"
+    if "leader clean-air stretch" in wl or "clean-air stretch" in wl:
+        return "LEADER STRETCH — PROTECT CLEAN AIR"
     if "caution window viable" in wl or "field is boxing" in wl:
         return "CAUTION WINDOW — FIELD BOXING, LOW POSITION COST"
     if "staying out under caution" in wl:

@@ -206,12 +206,13 @@ class DivebombTests(unittest.TestCase):
 class TacticalAdviceTests(unittest.TestCase):
     def test_tactical_undercut_advice_from_packet(self) -> None:
         tel = inside_window_telemetry(
-            m={"fl": 1.8, "sl": 10, "lr": 30, "lp": 1, "l": 20},
+            m={"p": 5, "fl": 1.8, "sl": 10, "lr": 30, "lp": 1, "l": 20, "ga": 0.5},
             r={"ftl": 25},
             rv={"ahead": {"pos": 4}},
             fi={
                 "sm": {"m": 1, "n": "OFFENSIVE"},
                 "rej": {"v": "CLEAN"},
+                "cpi": {"xp": 4},
                 "odi": {"uc": True, "pa": 0.3, "pb": 0.0, "score": 0.3},
             },
         )

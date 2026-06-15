@@ -35,10 +35,17 @@ from engineer.race_constants import (
     LONG_RACE_LARGE_TRACK_LENGTH_MI,
     LONG_RACE_MEDIUM_TRACK_LENGTH_MI,
     LONG_RACE_SHORT_TRACK_LENGTH_MI,
+    PACE_STABILITY_STD_THRESHOLD_S,
+    SIM_FRESH_TIRE_BONUS_S,
+    SIM_OPPONENT_PIT_FUEL_THRESHOLD,
+    SIM_PASS_BLOCKED_HERO_STINT,
+    SIM_PASS_FROM_BEHIND_STREAK,
+    SIM_STINT_PACE_PENALTY_PER_LAP,
     THERMAL_GREASY_C,
     THERMAL_WARM_C,
     get_default_pit_loss_seconds,
 )
+from engineer.telemetry import CleanLapGate
 from engineer.speech import _speech_lines
 from engineer.strategy_engine import (
     evaluate_and_forecast_strategy,
@@ -89,10 +96,13 @@ class SimCar:
     gap_to_ahead_s: float = 1.0
     gap_to_behind_s: float = 1.0
     in_draft: bool = False
+    fuel_laps_left: float = 22.0
 
     @property
     def current_lap_time_s(self) -> float:
-        return self.base_pace_s + self.tire_wear
+        stint_penalty = self.stint_laps * SIM_STINT_PACE_PENALTY_PER_LAP
+        fresh_bonus = -SIM_FRESH_TIRE_BONUS_S if self.stint_laps <= 2 else 0.0
+        return self.base_pace_s + self.tire_wear + stint_penalty + fresh_bonus
 
     def record_lap(self, lap_time_s: float) -> None:
         self.lap_times.append(lap_time_s)
@@ -180,6 +190,19 @@ class RaceScenario:
     irsdk_overrides: dict[int, dict[str, Any]] = field(default_factory=dict)
     force_pit_laps: set[int] = field(default_factory=set)
     field_size: int = DEFAULT_FIELD_SIZE
+    # Lap-time jitter for hero/field physics: "uniform" (default) or "swing" (alternating ±span).
+    pace_jitter_mode: str = "uniform"
+    pace_jitter_half_span: float = 0.05
+    # When set, join / field bootstrap lap history uses alternating ±span instead of wear ramp.
+    pace_seed_swing_span: float | None = None
+    # Class position → best lap seconds (quali / practice seeding).
+    field_pace_by_position: dict[int, float] | None = None
+    # Live-session bootstrap (pre-race sim from telemetry).
+    hero_base_pace_s: float | None = None
+    hero_tire_wear_per_lap: float | None = None
+    hero_lap_times_seed: list[float] | None = None
+    pace_spread_per_position_s: float = 0.12
+    track_temp_c: float | None = None
 
 
 def resolve_field_size(scenario: RaceScenario) -> int:
@@ -412,13 +435,117 @@ def _scenario_fuel_window() -> RaceScenario:
     )
 
 
-def _seed_lap_history(car: SimCar, *, count: int, wear_ramp: float = 0.04) -> None:
+def _seed_lap_history(
+    car: SimCar,
+    *,
+    count: int,
+    wear_ramp: float = 0.04,
+    swing_span: float | None = None,
+) -> None:
     """Pre-fill lap-time ring buffer as if `count` laps already completed."""
     car.lap_times.clear()
     for i in range(count):
-        car.lap_times.append(round(car.base_pace_s + car.tire_wear + i * wear_ramp, 3))
+        if swing_span is not None:
+            sign = 1.0 if i % 2 == 0 else -1.0
+            lap_t = car.base_pace_s + car.tire_wear + sign * swing_span
+        else:
+            lap_t = car.base_pace_s + car.tire_wear + i * wear_ramp
+        car.lap_times.append(round(lap_t, 3))
     if count > 0:
         car.tire_wear = max(car.tire_wear, car.tire_wear_per_lap * count)
+
+
+def _seed_clean_lap_gate(gate: CleanLapGate, lap_times: list[float]) -> None:
+    """Backfill CleanLapGate stability buffer from pre-race / join stint history."""
+    gate.sync_incident_baseline(0)
+    for lap_t in lap_times:
+        gate.on_lap_complete(
+            float(lap_t),
+            is_caution=False,
+            reference_lap_s=max(float(lap_t), DEFAULT_AVG_LAP_S),
+            incident_count=0,
+        )
+
+
+def _pace_stability_undercut_hook(lap: int, field: list[SimCar], hero: SimCar) -> None:
+    """Offensive undercut window: close draft gap, degraded rival, projected merge gain."""
+    ahead = next((c for c in field if c.position == hero.position - 1), None)
+    if ahead is not None:
+        ahead.tire_wear = 3.5
+        ahead.base_pace_s = max(ahead.base_pace_s, hero.base_pace_s + 2.8)
+        ahead.lap_times = [93.0, 93.3, 93.2]
+    hero.gap_to_ahead_s = 0.35
+    hero.gap_to_behind_s = 1.8
+    hero.in_draft = True
+
+
+def _pace_stability_undercut_scenario(
+    *,
+    name: str,
+    description: str,
+    pace_jitter_mode: str,
+    pace_jitter_half_span: float,
+    pace_seed_swing_span: float | None,
+) -> RaceScenario:
+    undercut_laps = {14, 15, 16}
+    return _register_scenario(
+        RaceScenario(
+            name=name,
+            description=description,
+            total_laps=30,
+            hero_position=6,
+            field_size=32,
+            fuel_tank_laps=25.0,
+            pit_payback_laps=2,
+            pace_jitter_mode=pace_jitter_mode,
+            pace_jitter_half_span=pace_jitter_half_span,
+            pace_seed_swing_span=pace_seed_swing_span,
+            on_lap_start=_pace_stability_undercut_hook,
+            start=RaceStartState(
+                start_lap=14,
+                fuel_laps_left=2.2,
+                stint_laps=12,
+                laps_since_pit=12,
+                tire_wear=0.65,
+                gap_to_ahead_s=0.35,
+                gap_to_behind_s=1.8,
+                in_draft=True,
+            ),
+            irsdk_overrides={
+                lap: {
+                    "cpi_xp": 5,
+                    "LapDistPct": 0.12,
+                    "LatAccel": 12.0,
+                    "Speed": 55.0,
+                }
+                for lap in undercut_laps
+            },
+        )
+    )
+
+
+def _scenario_undercut_pace_stable() -> RaceScenario:
+    return _pace_stability_undercut_scenario(
+        name="undercut_pace_stable",
+        description=(
+            "Join lap 14/30 at P6 in fuel window with stable clean pace — offensive undercut PIT NOW."
+        ),
+        pace_jitter_mode="uniform",
+        pace_jitter_half_span=0.03,
+        pace_seed_swing_span=None,
+    )
+
+
+def _scenario_undercut_pace_unstable() -> RaceScenario:
+    return _pace_stability_undercut_scenario(
+        name="undercut_pace_unstable",
+        description=(
+            "Same undercut window as stable variant but erratic clean-lap variance — undercut suppressed."
+        ),
+        pace_jitter_mode="swing",
+        pace_jitter_half_span=0.50,
+        pace_seed_swing_span=0.50,
+    )
 
 
 def _scenario_race_full() -> RaceScenario:
@@ -556,6 +683,8 @@ def _load_scenarios() -> None:
     _scenario_caution_lap8()
     _scenario_tactical_caution_gate()
     _scenario_undercut()
+    _scenario_undercut_pace_stable()
+    _scenario_undercut_pace_unstable()
     _scenario_defensive_pressure()
     _scenario_lapped_danger()
     _scenario_fuel_window()
@@ -710,6 +839,8 @@ def generate_simulated_packet_extras(
         fi_patch.setdefault("hd", {})["pra"] = lap_overrides["pra"]
     if "cpi_ll" in lap_overrides:
         fi_patch.setdefault("cpi", {})["ll"] = lap_overrides["cpi_ll"]
+    if "cpi_xp" in lap_overrides:
+        fi_patch.setdefault("cpi", {})["xp"] = lap_overrides["cpi_xp"]
 
     tactical_meta = {
         "apex_loss": sim_apex_loss,
@@ -733,6 +864,12 @@ def _extract_tactical_snapshot(packet: dict[str, Any], context: DriverContextTra
     tac = fi.get("tac", {}) if isinstance(fi.get("tac"), dict) else {}
     m = packet.get("m", {}) if isinstance(packet.get("m"), dict) else {}
     drv = m.get("drv", {}) if isinstance(m.get("drv"), dict) else {}
+    pc = m.get("pc", {}) if isinstance(m.get("pc"), dict) else {}
+    std_clean = pc.get("std_clean_s")
+    n_clean = pc.get("n_clean")
+    pace_stable = True
+    if isinstance(std_clean, (int, float)) and isinstance(n_clean, int) and n_clean >= 5:
+        pace_stable = float(std_clean) < PACE_STABILITY_STD_THRESHOLD_S
     return {
         "context_mode": context.current_mode.name,
         "odi_uc": bool(odi.get("uc")),
@@ -740,6 +877,9 @@ def _extract_tactical_snapshot(packet: dict[str, Any], context: DriverContextTra
         "tac": dict(tac),
         "apex_al": drv.get("al"),
         "therm": drv.get("tsn"),
+        "pace_std_clean_s": std_clean,
+        "pace_n_clean": n_clean,
+        "pace_stable_for_offense": pace_stable,
     }
 
 
@@ -767,6 +907,7 @@ def build_telemetry_packet(
     fuel_laps_left: float,
     can_make_to_end: bool,
     caution_pit_complete: bool = False,
+    clean_lap_gate: CleanLapGate | None = None,
 ) -> dict[str, Any]:
     """Assemble a strategy-engine-ready telemetry dict from sim state."""
     avg_lap = hero.avg_last3_s() or DEFAULT_AVG_LAP_S
@@ -792,6 +933,8 @@ def build_telemetry_packet(
         flags = {"yel": True, "cau": True}
 
     fi: dict[str, Any] = {"rej": rej}
+    if not is_caution:
+        fi["cpi"] = {"xp": hero.position}
     if is_caution and caution is not None:
         pra = 0.2 if caution_pit_complete else caution.herd_pit_ratio
         ll = 8 if caution_pit_complete else caution.lead_spots_lost
@@ -829,6 +972,11 @@ def build_telemetry_packet(
         "ps": hero.in_stall,
         "pc": {"avg_last3_s": round(avg_lap, 3), "n": len(hero.lap_times)},
     }
+    if clean_lap_gate is not None:
+        pace_std = clean_lap_gate.pace_stddev_s()
+        if pace_std is not None:
+            m["pc"]["std_clean_s"] = pace_std
+            m["pc"]["n_clean"] = clean_lap_gate.clean_lap_count
     m.update(context_extras.get("m", {}))
 
     s: dict[str, Any] = {
@@ -869,6 +1017,33 @@ def build_telemetry_packet(
 # =====================================================================
 
 
+def _interpolate_field_pace_from_map(
+    position: int,
+    pace_map: dict[int, float],
+    *,
+    hero_position: int,
+    hero_anchor: float,
+    spread: float,
+) -> float:
+    if position in pace_map:
+        return float(pace_map[position])
+    known = sorted(pace_map.keys())
+    if not known:
+        return hero_anchor + (position - hero_position) * spread
+    if position <= known[0]:
+        return float(pace_map[known[0]]) + (position - known[0]) * spread
+    if position >= known[-1]:
+        return float(pace_map[known[-1]]) + (position - known[-1]) * spread
+    for i in range(len(known) - 1):
+        lo, hi = known[i], known[i + 1]
+        if lo <= position <= hi:
+            if hi == lo:
+                return float(pace_map[lo])
+            frac = (position - lo) / float(hi - lo)
+            return float(pace_map[lo]) + frac * (float(pace_map[hi]) - float(pace_map[lo]))
+    return hero_anchor + (position - hero_position) * spread
+
+
 @dataclass
 class LapLogRecord:
     lap: int
@@ -896,9 +1071,19 @@ class RaceSimulator:
     """Step a synthetic race and evaluate real strategy output each lap."""
 
     CAUTION_LAP_TIME_S = 105.0
+    PASS_GAP_MAX_S = 0.15
+    PASS_STREAK_LAPS = 3
+    PASS_PACE_MARGIN_S = 0.05
 
-    def __init__(self, scenario: RaceScenario, *, seed: int | None = None) -> None:
+    def __init__(
+        self,
+        scenario: RaceScenario,
+        *,
+        seed: int | None = None,
+        follow_strategy: bool = False,
+    ) -> None:
         self.scenario = scenario
+        self.follow_strategy = follow_strategy
         self.rng = __import__("random").Random(seed)
         self.field = self._init_field()
         self.hero = next(c for c in self.field if c.name == "HERO")
@@ -910,7 +1095,11 @@ class RaceSimulator:
         self._caution_pit_complete = False
         self._pit_service_lap: int | None = None
         self.tire_sets_remaining = scenario.tire_sets
+        self._pass_streak = 0
+        self._passed_from_behind_streak = 0
+        self._clean_lap_gate = CleanLapGate()
         self._apply_start_state()
+        self._apply_hero_lap_seed()
 
     @property
     def current_strategy_mode(self) -> StrategyMode:
@@ -932,7 +1121,12 @@ class RaceSimulator:
             car.lap = lap
             offset = car.position - hero.position
             stint = max(1, st.stint_laps + (offset // 2))
-            _seed_lap_history(car, count=min(LAP_HISTORY_DEPTH, stint))
+            swing = self.scenario.pace_seed_swing_span if car is hero else None
+            _seed_lap_history(
+                car,
+                count=min(LAP_HISTORY_DEPTH, stint),
+                swing_span=swing,
+            )
             car.stint_laps = stint
             car.laps_since_pit = stint
             car.total_time_s = stint * car.avg_last3_s()
@@ -967,7 +1161,52 @@ class RaceSimulator:
         self._spread_on_track()
 
         if st.stint_laps >= 3:
-            self.context.reset_stint(track_temp_c=32.0)
+            tt = self.scenario.track_temp_c if self.scenario.track_temp_c is not None else 32.0
+            self.context.reset_stint(track_temp_c=tt)
+
+        _seed_clean_lap_gate(self._clean_lap_gate, list(hero.lap_times))
+
+    def _apply_hero_lap_seed(self) -> None:
+        seed = self.scenario.hero_lap_times_seed
+        if not seed:
+            return
+        times = [round(float(t), 3) for t in seed if isinstance(t, (int, float)) and float(t) > 0]
+        if not times:
+            return
+        self.hero.lap_times = times[-LAP_HISTORY_DEPTH:]
+        _seed_clean_lap_gate(self._clean_lap_gate, list(self.hero.lap_times))
+
+    def _lap_time_jitter(self, lap: int) -> float:
+        span = self.scenario.pace_jitter_half_span
+        mode = self.scenario.pace_jitter_mode
+        if mode == "swing":
+            sign = 1.0 if lap % 2 == 0 else -1.0
+            return sign * span + self.rng.uniform(-0.04, 0.04)
+        if mode == "uniform":
+            return self.rng.uniform(-span, span)
+        return 0.0
+
+    def _commit_hero_clean_lap(self, *, lap: int, is_caution: bool) -> None:
+        hero = self.hero
+        if hero.on_pit_road or hero.in_stall or not hero.lap_times:
+            return
+        gate = self._clean_lap_gate
+        if not gate._incident_baseline_set:
+            gate.sync_incident_baseline(0)
+        lap_time = hero.lap_times[-1]
+        gate.poll(
+            incident_count=0,
+            gap_ahead_s=hero.gap_to_ahead_s if hero.gap_to_ahead_s else None,
+            is_caution=is_caution,
+            on_track=True,
+            session_time_s=float(lap),
+        )
+        gate.on_lap_complete(
+            lap_time,
+            is_caution=is_caution,
+            reference_lap_s=max(lap_time, DEFAULT_AVG_LAP_S),
+            incident_count=0,
+        )
 
     def _rebuild_hero_gaps(self, *, under_caution: bool = False) -> None:
         """Recompute hero gaps from position neighbors after a position change."""
@@ -1006,6 +1245,7 @@ class RaceSimulator:
         self.fuel_laps_left = self.scenario.fuel_tank_laps
         self.tire_sets_remaining = max(0, self.tire_sets_remaining - 1)
         self.context.reset_stint(track_temp_c=32.0)
+        self._clean_lap_gate.reset_stint()
         if caution is not None:
             self._caution_pit_complete = True
         self._pit_service_lap = None
@@ -1013,11 +1253,35 @@ class RaceSimulator:
     def _init_field(self) -> list[SimCar]:
         n = resolve_field_size(self.scenario)
         hero_pos = self.scenario.hero_position
+        hero_anchor = self.scenario.hero_base_pace_s or DEFAULT_AVG_LAP_S
+        spread = self.scenario.pace_spread_per_position_s
+        pace_map = self.scenario.field_pace_by_position or {}
         cars: list[SimCar] = []
         for pos in range(1, n + 1):
-            base = DEFAULT_AVG_LAP_S + (pos - hero_pos) * 0.12 + self.rng.uniform(-0.2, 0.2)
-            wear = 0.04 + (pos % 3) * 0.02
+            if pos == hero_pos and self.scenario.hero_base_pace_s is not None:
+                base = float(self.scenario.hero_base_pace_s)
+            elif pace_map:
+                base = _interpolate_field_pace_from_map(
+                    pos,
+                    pace_map,
+                    hero_position=hero_pos,
+                    hero_anchor=hero_anchor,
+                    spread=spread,
+                )
+                base += self.rng.uniform(-0.06, 0.06)
+            else:
+                base = hero_anchor + (pos - hero_pos) * spread + self.rng.uniform(-0.2, 0.2)
+            if pos == hero_pos and self.scenario.hero_tire_wear_per_lap is not None:
+                wear = float(self.scenario.hero_tire_wear_per_lap)
+            else:
+                wear = 0.04 + (pos % 3) * 0.02
             name = "HERO" if pos == hero_pos else f"#{pos:02d}"
+            seed_time = pace_map.get(pos) if pace_map else None
+            lap_seed = (
+                [round(float(seed_time), 3)] * min(3, LAP_HISTORY_DEPTH)
+                if isinstance(seed_time, (int, float)) and float(seed_time) > 0
+                else []
+            )
             cars.append(
                 SimCar(
                     name=name,
@@ -1026,6 +1290,8 @@ class RaceSimulator:
                     tire_wear_per_lap=wear,
                     gap_to_ahead_s=0.5 if pos > 1 else 0.0,
                     gap_to_behind_s=0.8 if pos < n else 0.0,
+                    fuel_laps_left=self.scenario.fuel_tank_laps - (pos % 6) * 0.4,
+                    lap_times=lap_seed,
                 )
             )
         return cars
@@ -1055,12 +1321,45 @@ class RaceSimulator:
                 offset = gap_s / avg
             car.lap_dist_pct = (hero.lap_dist_pct + offset) % 1.0
 
+    def _schedule_opponent_pits(self) -> None:
+        """Send opponents to pit road when their fuel cycle expires."""
+        for car in self.field:
+            if car is self.hero:
+                continue
+            if car.on_pit_road or car.in_stall:
+                continue
+            if car.fuel_laps_left <= SIM_OPPONENT_PIT_FUEL_THRESHOLD:
+                car.begin_pit_service()
+
+    def _complete_opponent_pit_services(self, lap: int) -> None:
+        for car in self.field:
+            if car is self.hero:
+                continue
+            if not (car.on_pit_road or car.in_stall):
+                continue
+            old_pos = car.position
+            car.exit_pit()
+            car.pit(lap=lap)
+            car.fuel_laps_left = self.scenario.fuel_tank_laps
+            n = len(self.field)
+            for other in self.field:
+                if other is car:
+                    continue
+                if other.position > old_pos:
+                    other.position -= 1
+            car.position = n
+        self._rebuild_hero_gaps()
+
     def _step_green_physics(self, lap: int) -> None:
+        self._schedule_opponent_pits()
         for car in self.field:
             if car.on_pit_road:
                 continue
-            lap_time = car.current_lap_time_s + self.rng.uniform(-0.05, 0.05)
+            jitter = self._lap_time_jitter(lap) if car is self.hero else self.rng.uniform(-0.05, 0.05)
+            lap_time = car.current_lap_time_s + jitter
             car.record_lap(lap_time)
+            if car is not self.hero:
+                car.fuel_laps_left = max(0.0, car.fuel_laps_left - 1.0)
 
         hero = self.hero
         ahead = _car_ahead(self.field, hero)
@@ -1074,8 +1373,75 @@ class RaceSimulator:
             delta = behind.lap_times[-1] - hero.lap_times[-1]
             hero.gap_to_behind_s = max(0.12, hero.gap_to_behind_s + delta)
 
+        self._maybe_pass_car_ahead()
+        self._maybe_passed_from_behind()
         self.fuel_laps_left = max(0.0, self.fuel_laps_left - 1.0)
         self._spread_on_track()
+
+    def _maybe_pass_car_ahead(self) -> None:
+        """Swap with car ahead when stuck in draft but consistently faster."""
+        hero = self.hero
+        if hero.on_pit_road or hero.in_stall:
+            self._pass_streak = 0
+            return
+        if hero.stint_laps >= SIM_PASS_BLOCKED_HERO_STINT:
+            self._pass_streak = 0
+            return
+        ahead = _car_ahead(self.field, hero)
+        if ahead is None or ahead.on_pit_road or ahead.in_stall:
+            self._pass_streak = 0
+            return
+        if hero.gap_to_ahead_s > self.PASS_GAP_MAX_S:
+            self._pass_streak = 0
+            return
+        if not hero.lap_times or not ahead.lap_times:
+            return
+        if hero.lap_times[-1] + self.PASS_PACE_MARGIN_S < ahead.lap_times[-1]:
+            self._pass_streak += 1
+        else:
+            self._pass_streak = 0
+        if self._pass_streak < self.PASS_STREAK_LAPS:
+            return
+        old_pos = hero.position
+        new_pos = ahead.position
+        hero.position = new_pos
+        ahead.position = old_pos
+        self._pass_streak = 0
+        self._rebuild_hero_gaps()
+
+    def _maybe_passed_from_behind(self) -> None:
+        """Fresh-tire cars behind pick off a worn hero when pace delta holds."""
+        hero = self.hero
+        if hero.on_pit_road or hero.in_stall:
+            self._passed_from_behind_streak = 0
+            return
+        behind = _car_behind(self.field, hero)
+        if behind is None or behind.on_pit_road or behind.in_stall:
+            self._passed_from_behind_streak = 0
+            return
+        if hero.gap_to_behind_s > self.PASS_GAP_MAX_S:
+            self._passed_from_behind_streak = 0
+            return
+        if not hero.lap_times or not behind.lap_times:
+            return
+        worn_hero = hero.stint_laps >= SIM_PASS_BLOCKED_HERO_STINT // 2
+        fresh_behind = behind.stint_laps <= 3
+        margin = self.PASS_PACE_MARGIN_S
+        if worn_hero and fresh_behind:
+            margin *= 0.5
+        if behind.lap_times[-1] + margin < hero.lap_times[-1]:
+            self._passed_from_behind_streak += 1
+        else:
+            self._passed_from_behind_streak = 0
+        streak = SIM_PASS_FROM_BEHIND_STREAK if (worn_hero and fresh_behind) else self.PASS_STREAK_LAPS
+        if self._passed_from_behind_streak < streak:
+            return
+        old_pos = hero.position
+        new_pos = behind.position
+        hero.position = new_pos
+        behind.position = old_pos
+        self._passed_from_behind_streak = 0
+        self._rebuild_hero_gaps()
 
     def _step_caution_physics(self, caution: CautionWindow) -> None:
         pace = self.CAUTION_LAP_TIME_S
@@ -1133,8 +1499,9 @@ class RaceSimulator:
 
         fi = telemetry.get("fi", {})
         rej = fi.get("rej", {}) if isinstance(fi.get("rej"), dict) else {}
+        track_temp = self.scenario.track_temp_c if self.scenario.track_temp_c is not None else 32.0
         return self.context.build_packet_extras(
-            track_temp_c=32.0,
+            track_temp_c=track_temp,
             tire_wear_rate_est=None,
             pit_loss_sec=float((telemetry.get("r") or {}).get("pl", 46)),
             tire_falloff_s=float(m.get("fo", 0)),
@@ -1174,6 +1541,9 @@ class RaceSimulator:
         else:
             self._step_green_physics(lap)
 
+        if not (self.hero.on_pit_road or self.hero.in_stall):
+            self._commit_hero_clean_lap(lap=lap, is_caution=is_caution)
+
         laps_total = self.scenario.total_laps
         can_make = self.fuel_laps_left >= max(0, laps_total - lap)
 
@@ -1189,6 +1559,7 @@ class RaceSimulator:
             fuel_laps_left=self.fuel_laps_left,
             can_make_to_end=can_make,
             caution_pit_complete=self._caution_pit_complete,
+            clean_lap_gate=self._clean_lap_gate,
         )
 
         sim_extras = generate_simulated_packet_extras(
@@ -1223,6 +1594,17 @@ class RaceSimulator:
         immediate = eval_result.get("immediate_directive", {})
         if not isinstance(immediate, dict):
             immediate = {}
+
+        if (
+            self.follow_strategy
+            and self._pit_service_lap is None
+            and not (self.hero.on_pit_road or self.hero.in_stall)
+        ):
+            directive_act = str(immediate.get("ACTION", "") or "").upper()
+            if directive_act in ("PIT", "PIT NOW"):
+                self.hero.begin_pit_service()
+                self._pit_service_lap = lap
+
         gfc = eval_result.get("green_flag_rest_of_race_forecast", {})
         forecast = gfc.get("projected_pit_schedule", []) if isinstance(gfc, dict) else []
         if not isinstance(forecast, list):
@@ -1272,6 +1654,9 @@ class RaceSimulator:
         # Complete pit service at end of the service lap.
         if self._pit_service_lap == lap and (self.hero.on_pit_road or self.hero.in_stall):
             self._complete_hero_pit(lap, caution=caution)
+
+        if not is_caution:
+            self._complete_opponent_pit_services(lap)
 
         self.hero.lap = lap
         return record
@@ -1344,6 +1729,12 @@ def write_sim_log(
                 f"therm={tac.get('therm')} tac={json.dumps(tac_flags)} "
                 f"alerts={rec.tactical_alerts or []}"
             )
+            if tac.get("pace_std_clean_s") is not None:
+                lines.append(
+                    f"PACE STABILITY: std={tac.get('pace_std_clean_s')} "
+                    f"n_clean={tac.get('pace_n_clean')} "
+                    f"offense_ok={tac.get('pace_stable_for_offense')}"
+                )
             if rec.sim_extras:
                 lines.append(
                     f"SIM TELEMETRY: apex_loss={rec.sim_extras.get('apex_loss')} "
@@ -1407,6 +1798,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log", type=Path, default=None, help="Log file path (default: sim_logs/<scenario>_<ts>.log)")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed for pace jitter")
     parser.add_argument("--packet-json", action="store_true", help="Include full packet JSON per lap in log")
+    parser.add_argument(
+        "--follow-strategy",
+        action="store_true",
+        help="Execute PIT/PIT NOW immediate directives (models position loss from stops)",
+    )
     parser.add_argument("--list-scenarios", action="store_true", help="Print scenarios and exit")
     parser.add_argument("-v", "--verbose", action="store_true", help="Echo log lines to stdout")
     return parser.parse_args(argv)
@@ -1460,7 +1856,7 @@ def main(argv: list[str] | None = None) -> int:
             field_size=fs,
         )
 
-    sim = RaceSimulator(scenario, seed=args.seed)
+    sim = RaceSimulator(scenario, seed=args.seed, follow_strategy=args.follow_strategy)
     records = sim.run()
 
     log_path = args.log or _default_log_path(scenario.name)

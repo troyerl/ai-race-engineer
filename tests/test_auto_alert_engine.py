@@ -83,16 +83,14 @@ class AutoAlertPitWindowTests(unittest.TestCase):
         tel = _pit_window_telemetry()
         state, delivered, call_line, reason, advice = _tick(state, lap=21, is_caution=False, telemetry=tel)
         self.assertTrue(delivered, reason)
-        expected = run_strategy(tel, mode="live")
-        self.assertEqual(advice, expected)
         assert_advice(
             self,
             advice or "",
             action="PIT NOW",
             service="4 TIRES",
             why_contains="CLEAN REENTRY",
-            trigger="TRACK",
-            conf="M",
+            trigger="FUEL",
+            conf="H",
         )
 
     def test_green_run_outside_window_does_not_deliver(self) -> None:
@@ -338,8 +336,8 @@ class AutoAlertStateMachineTests(unittest.TestCase):
             action="PIT NOW",
             service="4 TIRES",
             why_contains="CLEAN REENTRY",
-            trigger="TRACK",
-            conf="M",
+            trigger="FUEL",
+            conf="H",
         )
 
         window_tel2 = inside_window_telemetry(

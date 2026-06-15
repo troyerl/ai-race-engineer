@@ -16,6 +16,7 @@ from tests.fixtures import inside_window_telemetry
 def _long_run_telemetry(**overrides):
     return inside_window_telemetry(
         m={
+            "p": 5,
             "fl": 1.8,
             "sl": 10,
             "lr": 30,
@@ -25,8 +26,10 @@ def _long_run_telemetry(**overrides):
             **(overrides.pop("m", None) or {}),
         },
         r={"ftl": 25, "pl": 45, "ts": 3, **(overrides.pop("r", None) or {})},
+        rv={"ahead": {"pos": 4, "pace": {"avg_last3_s": 90.5, "n": 5}}},
         fi={
             "rej": {"v": "CLEAN", "n": 0},
+            "cpi": {"xp": 4},
             "odi": {"pa": 0.35, "pb": 0.0, "score": 0.35},
             **(overrides.pop("fi", None) or {}),
         },
@@ -89,6 +92,66 @@ class TestOffensiveUndercutOpportunity(unittest.TestCase):
         result = evaluate_and_forecast_strategy(tel)
         imm = result["immediate_directive"]
         self.assertNotEqual(imm["WHY"], OFFENSIVE_UNDERCUT_WHY)
+
+    def test_offensive_undercut_blocked_without_merge_gain(self) -> None:
+        base = _long_run_telemetry()
+        tel = inside_window_telemetry(
+            m={**base["m"], "p": 12, "ga": 0.5},
+            r=base["r"],
+            rv={"ahead": {"pos": 11}},
+            fi={
+                **base["fi"],
+                "cpi": {"xp": 12},
+                "odi": {"uc": True, "pa": 0.35, "pb": 0.0, "score": 0.35},
+            },
+            s=base["s"],
+            x=base["x"],
+        )
+        self.assertFalse(
+            _undercut_opportunity(
+                tel,
+                inside_window=True,
+                rej_v="CLEAN",
+                laps_remain=30,
+                is_fuel_critical=False,
+            )
+        )
+
+    def test_opportunity_blocked_when_pace_unstable(self) -> None:
+        tel = _long_run_telemetry()
+        tel["m"]["pc"] = {
+            "avg_last3_s": 90.0,
+            "n": 8,
+            "n_clean": 6,
+            "std_clean_s": 0.55,
+        }
+        self.assertFalse(
+            _undercut_opportunity(
+                tel,
+                inside_window=True,
+                rej_v="CLEAN",
+                laps_remain=30,
+                is_fuel_critical=False,
+            )
+        )
+
+    def test_opportunity_allowed_when_pace_stable(self) -> None:
+        tel = _long_run_telemetry()
+        tel["m"]["pc"] = {
+            "avg_last3_s": 90.0,
+            "n": 8,
+            "n_clean": 6,
+            "std_clean_s": 0.12,
+        }
+        self.assertTrue(
+            _undercut_opportunity(
+                tel,
+                inside_window=True,
+                rej_v="CLEAN",
+                laps_remain=30,
+                is_fuel_critical=False,
+            )
+        )
 
 
 if __name__ == "__main__":
