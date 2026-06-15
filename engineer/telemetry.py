@@ -10,11 +10,16 @@ Key goals:
 
 import json
 from collections import deque
+from statistics import median
 from typing import Any
 
 import irsdk
 
 from .race_constants import (
+    CLEAN_LAP_BUFFER_DEPTH,
+    CLEAN_LAP_DRAFT_FRAC_MAX,
+    CLEAN_LAP_DRAFT_GAP_SEC,
+    CLEAN_LAP_FALLOFF_MIN_SAMPLES,
     DEFAULT_AVG_LAP_S,
     FUEL_EMA_ALPHA,
     FUEL_LAPS_CLAMP_MULTIPLIER,
@@ -23,6 +28,7 @@ from .race_constants import (
     IRSDK_TIRE_SETS_UNLIMITED,
     LAP_HISTORY_DEPTH,
     REENTRY_WINDOW_PCT,
+    TELEMETRY_POLL_INTERVAL_S,
     _L_TO_US_GAL,
     clamp_avg_lap_seconds,
     clamp_lap_distance_pct,
@@ -556,6 +562,147 @@ def _compact_caution_pit_intel(impact: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _player_incident_count(ir_get) -> int:
+    """Best-effort total incident count for the player car."""
+    raw = ir_get("PlayerCarMyIncidentCount", None)
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            pass
+    comps = ir_get("PlayerCarInComponentIncidentCount", None) or []
+    total = 0
+    for x in comps:
+        try:
+            total += max(0, int(x))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def falloff_from_clean_paces(
+    clean_times: list[float],
+    *,
+    stint_baseline_s: float | None,
+    min_samples: int = CLEAN_LAP_FALLOFF_MIN_SAMPLES,
+) -> float | None:
+    """
+    Median-of-clean-laps tire falloff proxy vs stint anchor (§3.4 telemetry gate).
+
+    Uses rolling median for noise rejection and subtracts the fastest clean lap
+    of the entire stint (not min of the rolling window) so macro wear accumulates.
+
+    Returns None when fewer than min_samples clean laps are buffered or baseline
+    is unset.
+    """
+    if len(clean_times) < min_samples or stint_baseline_s is None:
+        return None
+    rep = median(clean_times)
+    raw = float(rep) - float(stint_baseline_s)
+    if raw > 0:
+        return round(raw, 3)
+    return 0.0
+
+
+class CleanLapGate:
+    """
+    Telemetry-gated filter: only clean green-flag laps in clean air update m.fo.
+
+    Mid-lap polls track incidents, caution exposure, and draft time; on lap
+    complete the lap time is admitted to a rolling buffer when all gates pass.
+    """
+
+    def __init__(self) -> None:
+        self.buffer: deque[float] = deque(maxlen=CLEAN_LAP_BUFFER_DEPTH)
+        self._stint_clean_baseline_s: float | None = None
+        self._lap_dirty = False
+        self._lap_had_caution = False
+        self._draft_time_s = 0.0
+        self._last_incident_count = 0
+        self._last_session_t: float | None = None
+        self._falloff_s: float | None = None
+        self._incident_baseline_set = False
+
+    def reset_stint(self) -> None:
+        self.buffer.clear()
+        self._stint_clean_baseline_s = None
+        self._falloff_s = None
+        self._reset_mid_lap()
+        self._last_session_t = None
+
+    def sync_incident_baseline(self, incident_count: int) -> None:
+        self._last_incident_count = max(0, int(incident_count))
+        self._incident_baseline_set = True
+
+    def poll(
+        self,
+        *,
+        incident_count: int,
+        gap_ahead_s: float | None,
+        is_caution: bool,
+        on_track: bool,
+        session_time_s: float | None,
+    ) -> None:
+        if not on_track:
+            return
+        if not self._incident_baseline_set:
+            self.sync_incident_baseline(incident_count)
+        if incident_count > self._last_incident_count:
+            self._lap_dirty = True
+        if is_caution:
+            self._lap_had_caution = True
+        if gap_ahead_s is not None and 0 < float(gap_ahead_s) < CLEAN_LAP_DRAFT_GAP_SEC:
+            dt = TELEMETRY_POLL_INTERVAL_S
+            if session_time_s is not None and self._last_session_t is not None:
+                dt = max(0.0, float(session_time_s) - self._last_session_t)
+                if dt > 2.0:
+                    dt = TELEMETRY_POLL_INTERVAL_S
+            self._draft_time_s += dt
+        if session_time_s is not None:
+            self._last_session_t = float(session_time_s)
+
+    def on_lap_complete(
+        self,
+        lap_time_s: float,
+        *,
+        is_caution: bool,
+        reference_lap_s: float,
+        incident_count: int,
+    ) -> bool:
+        """Commit lap time when clean; refresh cached falloff. Returns admission."""
+        draft_limit = max(4.0, CLEAN_LAP_DRAFT_FRAC_MAX * max(reference_lap_s, 1.0))
+        is_draft_skewed = self._draft_time_s > draft_limit
+        lap_caution = bool(is_caution or self._lap_had_caution)
+        admitted = (
+            not self._lap_dirty
+            and not lap_caution
+            and not is_draft_skewed
+            and lap_time_s > 0
+        )
+        if admitted:
+            lap_t = round(float(lap_time_s), 3)
+            self.buffer.append(lap_t)
+            if self._stint_clean_baseline_s is None or lap_t < self._stint_clean_baseline_s:
+                self._stint_clean_baseline_s = lap_t
+        fo = falloff_from_clean_paces(
+            list(self.buffer),
+            stint_baseline_s=self._stint_clean_baseline_s,
+        )
+        self._falloff_s = fo if fo is not None else 0.0
+        self._last_incident_count = max(0, int(incident_count))
+        self._reset_mid_lap()
+        return admitted
+
+    def _reset_mid_lap(self) -> None:
+        self._lap_dirty = False
+        self._lap_had_caution = False
+        self._draft_time_s = 0.0
+
+    @property
+    def falloff_s(self) -> float | None:
+        return self._falloff_s
+
+
 class TelemetryTracker:
     def __init__(self):
         self.ir = irsdk.IRSDK()
@@ -594,6 +741,7 @@ class TelemetryTracker:
 
         self._ctx = DriverContextTracker()
         self._incident_limit_loaded = False
+        self._clean_lap_gate = CleanLapGate()
 
     def ensure_connected(self) -> bool:
         if not self.ir.is_connected:
@@ -1196,6 +1344,7 @@ class TelemetryTracker:
                 except (TypeError, ValueError):
                     tt_f = None
                 self._ctx.reset_stint(track_temp_c=tt_f)
+                self._clean_lap_gate.reset_stint()
             self._last_on_pit_road = on_pit_road
 
         laps = self.ir["CarIdxLap"] or []
@@ -1279,6 +1428,14 @@ class TelemetryTracker:
             best_lap_s=best_lap,
             pace_delta_ahead=pa_early,
         )
+        incident_count = _player_incident_count(self._ir_get)
+        self._clean_lap_gate.poll(
+            incident_count=incident_count,
+            gap_ahead_s=gap_ahead_s,
+            is_caution=is_caution,
+            on_track=on_track,
+            session_time_s=session_te_f,
+        )
 
         if isinstance(lap_now, int):
             self._tick_fuel_per_lap_ema(
@@ -1301,6 +1458,13 @@ class TelemetryTracker:
                 t = last_lap_times[i]
                 if t > 0:
                     self.field_history[i].append(round(t, 3))
+                    if i == player_idx:
+                        self._clean_lap_gate.on_lap_complete(
+                            float(t),
+                            is_caution=is_caution,
+                            reference_lap_s=avg_lap_s,
+                            incident_count=incident_count,
+                        )
                 self.last_recorded_lap[i] = curr_lap
 
     def build_packet(self, tire_sets_remaining: int, pit_loss_sec: int) -> str:
@@ -1482,18 +1646,24 @@ class TelemetryTracker:
         gap_ahead_s = self._gap_est_s(player_idx, ahead_idx if player_pos else None, lap_s_fallback=float(avg_lap_s))
         gap_behind_s = self._gap_est_s(player_idx, behind_idx if player_pos else None, lap_s_fallback=float(avg_lap_s))
 
-        # --- Degradation + pit payback ---
+        # --- Degradation + pit payback (telemetry-gated m.fo) ---
         best_lap_s = min(you_times) if you_times else None
         avg3_s = you_pace.get("avg_last3_s") if isinstance(you_pace, dict) else None
-        falloff_s = None
-        if isinstance(best_lap_s, (int, float)) and isinstance(avg3_s, (int, float)):
+        gated_fo = self._clean_lap_gate.falloff_s
+        if gated_fo is not None:
+            falloff_s = gated_fo
+        elif isinstance(best_lap_s, (int, float)) and isinstance(avg3_s, (int, float)):
             raw_falloff = float(avg3_s) - float(best_lap_s)
             if raw_falloff > 0:
                 falloff_s = round(raw_falloff, 3)
+            else:
+                falloff_s = None
+        else:
+            falloff_s = None
 
         pit_payback_laps = None
         try:
-            if falloff_s is not None and pit_loss_sec:
+            if falloff_s is not None and float(falloff_s) > 0 and pit_loss_sec:
                 payback_lap = triangular_payback_lap(
                     float(pit_loss_sec),
                     clamp_positive_rate(falloff_s, minimum=0.01, default=0.01),

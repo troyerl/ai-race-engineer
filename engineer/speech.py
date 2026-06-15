@@ -75,11 +75,13 @@ def _speech_lines(full: str, *, include_why: bool) -> list[str]:
             bracket = re.search(r"\[\s*([^\]]+)\s*\]", s)
             if bracket:
                 action = _tts_phrase(bracket.group(1).strip())
-                pit_m = re.search(r"TARGET PIT:\s*LAP\s*(\d+)", s, re.I)
+                pit_m = re.search(r"TARGET PIT:\s*(?:LAP\s*)?(\S+)", s, re.I)
                 svc_m = re.search(r"SERVICE TYPE:\s*([^·\n]+)", s, re.I)
                 bits = [action]
                 if pit_m:
-                    bits.append(f"target pit lap {pit_m.group(1)}")
+                    pit_val = pit_m.group(1).strip().upper()
+                    if pit_val not in ("CHECKERED", "NONE"):
+                        bits.append(f"target pit lap {pit_m.group(1).strip()}")
                 if svc_m:
                     bits.append(_tts_phrase(svc_m.group(1).strip()))
                 out.append(". ".join(bits))
@@ -96,7 +98,7 @@ def _speech_lines(full: str, *, include_why: bool) -> list[str]:
                 if why:
                     out.append(_tts_phrase(why))
             continue
-        if s.startswith("[") and "Reentry" in s:
+        if s.startswith("[") and ("Target Box" in s or "Reentry" in s):
             continue
         out.append(_tts_phrase(s))
     return out

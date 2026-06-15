@@ -29,8 +29,15 @@ from engineer.race_constants import (
     HIGH_LAT_SECTOR_END,
     HIGH_LAT_SECTOR_START,
     LAP_HISTORY_DEPTH,
+    LONG_RACE_LAPS_LARGE_TRACK,
+    LONG_RACE_LAPS_MEDIUM_TRACK,
+    LONG_RACE_LAPS_SHORT_TRACK,
+    LONG_RACE_LARGE_TRACK_LENGTH_MI,
+    LONG_RACE_MEDIUM_TRACK_LENGTH_MI,
+    LONG_RACE_SHORT_TRACK_LENGTH_MI,
     THERMAL_GREASY_C,
     THERMAL_WARM_C,
+    get_default_pit_loss_seconds,
 )
 from engineer.speech import _speech_lines
 from engineer.strategy_engine import (
@@ -165,6 +172,8 @@ class RaceScenario:
     fuel_tank_laps: float = 22.0
     pit_payback_laps: int = 2
     tire_sets: int = 3
+    track_name: str = ""
+    track_length_miles: float | None = None
     cautions: list[CautionWindow] = field(default_factory=list)
     start: RaceStartState | None = None
     on_lap_start: Callable[[int, list[SimCar], SimCar], None] | None = None
@@ -205,8 +214,86 @@ def _register_scenario(scenario: RaceScenario) -> RaceScenario:
     hp = max(1, min(scenario.hero_position, fs))
     scenario.field_size = fs
     scenario.hero_position = hp
+    if scenario.track_length_miles is not None:
+        scenario.pit_loss_sec = get_default_pit_loss_seconds(
+            scenario.track_name,
+            float(scenario.track_length_miles),
+        )
     SCENARIOS[scenario.name] = scenario
     return scenario
+
+
+def _long_race_scenario(
+    *,
+    name: str,
+    description: str,
+    track_name: str,
+    track_length_miles: float,
+    total_laps: int,
+    fuel_tank_laps: float,
+    tire_sets: int = 5,
+    pit_payback_laps: int = 3,
+    hero_position: int = 12,
+    field_size: int = 32,
+) -> RaceScenario:
+    """Green-flag long race from lap 1 with track-class pit loss and fuel cycling."""
+    return _register_scenario(
+        RaceScenario(
+            name=name,
+            description=description,
+            total_laps=total_laps,
+            hero_position=hero_position,
+            field_size=field_size,
+            track_name=track_name,
+            track_length_miles=track_length_miles,
+            fuel_tank_laps=fuel_tank_laps,
+            tire_sets=tire_sets,
+            pit_payback_laps=pit_payback_laps,
+            start=RaceStartState(start_lap=1),
+        )
+    )
+
+
+def _scenario_long_short_track() -> RaceScenario:
+    return _long_race_scenario(
+        name="long_short_track",
+        description=(
+            f"Long short-track race ({LONG_RACE_LAPS_SHORT_TRACK} laps) — Bristol-style "
+            f"0.53 mi; multi-stop fuel and tire strategy."
+        ),
+        track_name="Bristol Motor Speedway",
+        track_length_miles=LONG_RACE_SHORT_TRACK_LENGTH_MI,
+        total_laps=LONG_RACE_LAPS_SHORT_TRACK,
+        fuel_tank_laps=35.0,
+    )
+
+
+def _scenario_long_medium_track() -> RaceScenario:
+    return _long_race_scenario(
+        name="long_medium_track",
+        description=(
+            f"Long intermediate race ({LONG_RACE_LAPS_MEDIUM_TRACK} laps) — Charlotte-style "
+            f"1.5 mi; green-flag stint wear and pit windows."
+        ),
+        track_name="Charlotte Motor Speedway",
+        track_length_miles=LONG_RACE_MEDIUM_TRACK_LENGTH_MI,
+        total_laps=LONG_RACE_LAPS_MEDIUM_TRACK,
+        fuel_tank_laps=28.0,
+    )
+
+
+def _scenario_long_large_track() -> RaceScenario:
+    return _long_race_scenario(
+        name="long_large_track",
+        description=(
+            f"Long superspeedway race ({LONG_RACE_LAPS_LARGE_TRACK} laps) — Daytona-style "
+            f"2.5 mi; draft traffic and extended green runs."
+        ),
+        track_name="Daytona International Speedway",
+        track_length_miles=LONG_RACE_LARGE_TRACK_LENGTH_MI,
+        total_laps=LONG_RACE_LAPS_LARGE_TRACK,
+        fuel_tank_laps=18.0,
+    )
 
 
 def _scenario_default() -> RaceScenario:
@@ -459,6 +546,9 @@ def _scenario_tactical_caution_gate() -> RaceScenario:
 def _load_scenarios() -> None:
     _scenario_default()
     _scenario_race_full()
+    _scenario_long_short_track()
+    _scenario_long_medium_track()
+    _scenario_long_large_track()
     _scenario_join_leader_lap12()
     _scenario_join_traffic_p5_lap22()
     _scenario_join_traffic_p8_lap30()
@@ -1215,6 +1305,10 @@ def write_sim_log(
     lines.append("=" * 80)
     lines.append(f"AI Race Engineer — simulation log")
     lines.append(f"Scenario: {scenario.name} — {scenario.description}")
+    if scenario.track_name:
+        mi = scenario.track_length_miles
+        mi_s = f" ({mi:g} mi)" if isinstance(mi, (int, float)) else ""
+        lines.append(f"Track: {scenario.track_name}{mi_s}")
     fs = resolve_field_size(scenario)
     if scenario.start and scenario.start.start_lap > 1:
         st = scenario.start

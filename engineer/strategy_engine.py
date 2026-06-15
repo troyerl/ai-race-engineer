@@ -194,10 +194,16 @@ def _post_pit_alert_quiet(telemetry: dict[str, Any], *, alert_horizon: int = ALE
 
 def _forecast_fuel_laps_seed(telemetry: dict[str, Any], *, max_tank_stint: float) -> float:
     """Green-flag forecast fuel seed; full tank after a recent pit stop."""
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    live_fl = _safe_float(m.get("fl"), 0.0)
     green = green_flag_fuel_laps_from_telemetry(
         telemetry,
         fallback_l_per_lap=DEFAULT_CAUTION_BURN_L,
     )
+    if green <= 0 and live_fl > 0:
+        green = live_fl
+    elif live_fl > 0 and m.get("mk") is True:
+        green = max(green, live_fl)
     since = _laps_since_pit_stop(telemetry)
     if since is not None and since <= 3:
         return max(0.0, max(max_tank_stint, green) - 1.0)
@@ -214,6 +220,9 @@ def _fuel_laps_for_pit_window(telemetry: dict[str, Any], *, fuel_laps_left: floa
     """
     if _under_caution(telemetry):
         return fuel_laps_left
+
+    if _can_run_to_finish(telemetry) and not _under_caution(telemetry):
+        return 0.0
 
     m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
     if m.get("ful") is not None:
@@ -251,6 +260,47 @@ def _session_laps_remain(telemetry: dict[str, Any]) -> int:
         else:
             laps_remain = 0
     return max(0, _safe_int(laps_remain, 0))
+
+
+def _session_total_laps(telemetry: dict[str, Any]) -> int:
+    """Scheduled race distance (s.lt, else current + laps remain)."""
+    s = telemetry.get("s", {}) if isinstance(telemetry.get("s"), dict) else {}
+    s_lt = s.get("lt")
+    if isinstance(s_lt, int) and s_lt > 0:
+        return int(s_lt)
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    return _safe_int(m.get("l"), 1) + _session_laps_remain(telemetry)
+
+
+def _can_run_to_finish(telemetry: dict[str, Any]) -> bool:
+    """True when fuel range covers the remaining race distance (no mandatory fuel stop)."""
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    if m.get("mk") is True:
+        return True
+    fuel_laps_left, _, is_fuel_critical = _fuel_context(telemetry)
+    if is_fuel_critical:
+        return False
+    return fuel_laps_left >= float(_session_laps_remain(telemetry)) - 0.01
+
+
+def _pit_loss_seconds(telemetry: dict[str, Any]) -> float:
+    r = telemetry.get("r", {}) if isinstance(telemetry.get("r"), dict) else {}
+    return max(0.0, _safe_float(r.get("pl"), 46.0))
+
+
+def _tire_pit_worth_it(telemetry: dict[str, Any], *, laps_remaining: int) -> bool:
+    """
+    Schedule a tire stop only when projected pace loss from wear exceeds pit-road cost.
+
+    projected_loss ≈ tire_falloff_s × laps_remaining (§3 wear proxy in m.fo).
+    """
+    if laps_remaining <= 0:
+        return False
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    falloff_s = _safe_float(m.get("fo"), 0.0)
+    if falloff_s <= 0:
+        return False
+    return falloff_s * float(laps_remaining) >= _pit_loss_seconds(telemetry)
 
 
 def _undercut_runway_ok(telemetry: dict[str, Any], *, laps_remain: int | None = None) -> bool:
@@ -783,10 +833,18 @@ def evaluate_and_forecast_strategy(telemetry: dict[str, Any]) -> dict[str, Any]:
             sim_fuel_laps_remaining = _forecast_fuel_laps_seed(telemetry, max_tank_stint=max_tank_stint)
 
         stop_counter = 1
+        run_to_finish = _can_run_to_finish(telemetry)
+        session_end = _session_total_laps(telemetry)
         while sim_laps_remaining > 0:
             tire_limited = sim_stint_laps >= effective_tire_cap
             fuel_limited = sim_fuel_laps_remaining <= 1.0
+            if fuel_limited and run_to_finish:
+                fuel_limited = False
+            if tire_limited and not _tire_pit_worth_it(telemetry, laps_remaining=sim_laps_remaining):
+                tire_limited = False
             if tire_limited or fuel_limited:
+                if sim_current_lap > session_end:
+                    break
                 tires_available = tire_sets - stop_counter
                 if tire_limited and fuel_limited:
                     service_call = "4 TIRES" if tires_available > 0 else "FUEL ONLY"
@@ -800,7 +858,7 @@ def evaluate_and_forecast_strategy(telemetry: dict[str, Any]) -> dict[str, Any]:
                 future_stops.append(
                     {
                         "forecast_stop_number": stop_counter,
-                        "estimated_pit_lap": sim_current_lap,
+                        "estimated_pit_lap": min(sim_current_lap, session_end),
                         "laps_from_now": sim_current_lap - current_lap,
                         "service_required": service_call,
                         "context": context,
@@ -974,28 +1032,37 @@ def _display_service_type(service: str, *, action: str, inside_window: bool) -> 
     return s
 
 
-def _target_pit_lap(
+def _target_pit_label(
     result: dict[str, Any],
     telemetry: dict[str, Any],
     *,
     action: str,
     fuel_laps_left: float,
-) -> int:
+) -> str:
     m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
     current = _safe_int(m.get("l"), 1)
+    session_end = _session_total_laps(telemetry)
     act = (action or "").upper()
     if act in ("PIT", "PIT NOW"):
-        return current
+        return str(current)
+    if _can_run_to_finish(telemetry) and not _under_caution(telemetry):
+        return "CHECKERED"
     window_fuel = _fuel_laps_for_pit_window(telemetry, fuel_laps_left=fuel_laps_left)
     if window_fuel > 0:
-        return current + max(0, int(math.floor(window_fuel)))
+        pit_lap = current + max(0, int(math.floor(window_fuel)))
+        if pit_lap > session_end:
+            return "CHECKERED"
+        return str(pit_lap)
     forecast = result.get("green_flag_rest_of_race_forecast", {})
     stops = forecast.get("projected_pit_schedule", []) if isinstance(forecast, dict) else []
     if isinstance(stops, list) and stops:
         first = stops[0]
         if isinstance(first, dict):
-            return _safe_int(first.get("estimated_pit_lap"), current)
-    return current
+            pit_lap = _safe_int(first.get("estimated_pit_lap"), current)
+            if pit_lap > session_end:
+                return "CHECKERED"
+            return str(pit_lap)
+    return "CHECKERED" if _can_run_to_finish(telemetry) else str(current)
 
 
 def _target_box_laps(
@@ -1006,10 +1073,15 @@ def _target_box_laps(
 ) -> tuple[int, int] | None:
     m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
     current = _safe_int(m.get("l"), 1)
+    session_end = _session_total_laps(telemetry)
+    if _can_run_to_finish(telemetry) and not _under_caution(telemetry):
+        return None
     window_fuel = _fuel_laps_for_pit_window(telemetry, fuel_laps_left=fuel_laps_left)
     if window_fuel <= 0:
         return None
-    end_lap = current + max(1, int(math.floor(window_fuel)))
+    end_lap = min(session_end, current + max(1, int(math.floor(window_fuel))))
+    if end_lap <= current:
+        return None
     if payback_laps > 0:
         start_lap = max(current + 1, end_lap - max(1, int(round(payback_laps))))
     else:
@@ -1127,14 +1199,14 @@ def format_strategy_dashboard(
     fi = telemetry.get("fi", {}) if isinstance(telemetry.get("fi"), dict) else {}
     current_lap = _safe_int(m.get("l"), 1)
     payback = _resolve_pit_payback_laps(telemetry)
-    target_pit = _target_pit_lap(result, telemetry, action=action, fuel_laps_left=fuel_laps_left)
+    target_pit = _target_pit_label(result, telemetry, action=action, fuel_laps_left=fuel_laps_left)
     service_display = _display_service_type(service, action=action, inside_window=inside_window)
     headline = _why_headline(why)
     reentry_extra = _reentry_detail_lines(telemetry)
 
     call_line = (
         f"STRATEGY CALL :   [ {action.upper()} ]   ·   "
-        f"TARGET PIT: LAP {target_pit}   ·   SERVICE TYPE: {service_display}"
+        f"TARGET PIT: {target_pit}   ·   SERVICE TYPE: {service_display}"
     )
     why_line = f" WHY           :   {headline}"
     lines = [_dash_sep(), call_line, why_line]

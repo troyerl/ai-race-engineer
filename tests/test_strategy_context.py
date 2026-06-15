@@ -17,13 +17,16 @@ from engineer.race_constants import (
 from engineer.strategy_engine import (
     _append_context_notes,
     _apply_context_directive_overrides,
+    _can_run_to_finish,
     _fuel_context,
     _fuel_laps_for_pit_window,
     _post_pit_alert_quiet,
     _steer_forecast_penalty,
     _target_box_laps,
+    _tire_pit_worth_it,
     advice_call_line,
     evaluate_and_forecast_strategy,
+    format_strategy_dashboard,
     incident_push_advice,
     run_strategy,
     should_auto_alert,
@@ -292,7 +295,8 @@ class EvaluateStrategyIntegrationTests(unittest.TestCase):
                 "lr": 30,
                 "sl": 14,
                 "fl": 20.0,
-                "mk": True,
+                "mk": False,
+                "fo": 4.0,
                 "drv": {"ssr": STEER_STD_HIGH},
             },
             s={"tenv": {"tsc": 15, "dt": 0.0, "ref": 28.0, "cur": 28.0}, "flb": {}},
@@ -348,18 +352,18 @@ class ShouldAutoAlertTests(unittest.TestCase):
 
 class PitWindowFuelTests(unittest.TestCase):
     def test_green_after_caution_floors_inflated_fl(self) -> None:
-        """floor(19.5)=19 keeps target box stable vs caution round(20.5)=20."""
+        """floor(19.5)=19 keeps target box stable vs caution round(20.5)=20 when a stop is required."""
         tel = base_live_telemetry(
-            m={"l": 4, "lp": 4, "fl": 19.5, "fcq": "hi", "mk": True, "pb": 2},
+            m={"l": 4, "lp": 4, "fl": 8.5, "fcq": "hi", "mk": False, "pb": 2, "lr": 10},
             r={"ftl": 22, "pl": 46, "ts": 3, "fc": 20.0},
-            s={"flb": {}},
+            s={"flb": {}, "lt": 14},
         )
-        window_fuel = _fuel_laps_for_pit_window(tel, fuel_laps_left=19.5)
-        self.assertEqual(window_fuel, 19.0)
-        box = _target_box_laps(tel, fuel_laps_left=19.5, payback_laps=2.0)
+        window_fuel = _fuel_laps_for_pit_window(tel, fuel_laps_left=8.5)
+        self.assertEqual(window_fuel, 8.0)
+        box = _target_box_laps(tel, fuel_laps_left=8.5, payback_laps=2.0)
         self.assertIsNotNone(box)
         assert box is not None
-        self.assertEqual(box, (21, 23))
+        self.assertEqual(box, (10, 12))
 
     def test_under_caution_keeps_live_fuel_reading(self) -> None:
         tel = base_live_telemetry(
@@ -375,16 +379,53 @@ class PitWindowFuelTests(unittest.TestCase):
             m={
                 "l": 12,
                 "lp": 12,
-                "fl": 18.0,
-                "ful": 18.0,
+                "fl": 8.0,
+                "ful": 8.0,
                 "fpe": 0.264,
                 "fcq": "hi",
                 "pb": 2,
+                "mk": False,
+                "lr": 12,
             },
             r={"ftl": 22},
+            s={"lt": 24},
         )
-        window_fuel = _fuel_laps_for_pit_window(tel, fuel_laps_left=18.0)
-        self.assertAlmostEqual(window_fuel, 18.0, delta=1.0)
+        window_fuel = _fuel_laps_for_pit_window(tel, fuel_laps_left=8.0)
+        self.assertAlmostEqual(window_fuel, 8.0, delta=1.0)
+
+
+class RunToFinishTests(unittest.TestCase):
+    def test_can_run_to_finish_suppresses_pit_window(self) -> None:
+        tel = base_live_telemetry(
+            m={"l": 4, "lr": 16, "fl": 18.0, "mk": True, "fcq": "hi", "pb": 2, "fo": 0.3},
+            r={"ftl": 22, "pl": 46},
+            s={"lt": 20},
+        )
+        self.assertTrue(_can_run_to_finish(tel))
+        self.assertEqual(_fuel_laps_for_pit_window(tel, fuel_laps_left=18.0), 0.0)
+        self.assertIsNone(_target_box_laps(tel, fuel_laps_left=18.0, payback_laps=2.0))
+        result = evaluate_and_forecast_strategy(tel)
+        self.assertEqual(result["green_flag_rest_of_race_forecast"]["projected_pit_schedule"], [])
+
+    def test_forecast_skips_tire_stop_when_pit_loss_exceeds_wear(self) -> None:
+        tel = base_live_telemetry(
+            m={"l": 4, "lr": 16, "fl": 18.0, "mk": True, "fcq": "hi", "sl": 4, "fo": 0.2},
+            r={"ftl": 22, "pl": 46},
+            s={"lt": 20, "tenv": {"tsc": 8}},
+        )
+        self.assertFalse(_tire_pit_worth_it(tel, laps_remaining=16))
+        result = evaluate_and_forecast_strategy(tel)
+        self.assertEqual(result["green_flag_rest_of_race_forecast"]["projected_pit_schedule"], [])
+
+    def test_dashboard_shows_checkered_when_run_to_finish(self) -> None:
+        tel = base_live_telemetry(
+            m={"l": 4, "lr": 16, "fl": 18.0, "mk": True, "fcq": "hi", "pb": 2},
+            s={"lt": 20},
+        )
+        result = evaluate_and_forecast_strategy(tel)
+        dash = format_strategy_dashboard(result, tel)
+        self.assertIn("TARGET PIT: CHECKERED", dash)
+        self.assertNotIn("Target Box:", dash)
 
 
 if __name__ == "__main__":

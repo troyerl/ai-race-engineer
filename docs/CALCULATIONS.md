@@ -209,11 +209,26 @@ twr[corner] = wear_value / twsl
 
 ### 3.4 Pace falloff (`m.fo`)
 
+**Live telemetry (gated):** only laps that pass the clean-lap validator update the tire-wear proxy. Mid-lap polls track incidents (`PlayerCarMyIncidentCount` / component sum), caution flags, and draft exposure (gap ahead &lt; **1.2 s**). On lap complete, the lap time is admitted when:
+
+1. No new incidents mid-lap  
+2. Lap was entirely green (no caution during the lap)  
+3. Draft time ≤ **30%** of reference lap (minimum **4.0 s** cap)
+
+Admitted laps roll in a buffer of **5** for smoothing; the **stint clean baseline** locks the fastest admitted clean lap of the current run (reset on pit exit). When **≥ 3** clean laps exist in the buffer:
+
 ```
-falloff_s = avg_last3_s − best_lap_in_history
+representative_pace = median(clean_pace_buffer)
+falloff_s = representative_pace − stint_clean_baseline
 ```
 
-Positive = slower than your best recent lap (tire/conditions degradation proxy).
+Subtracting `min(clean_pace_buffer)` would let the anchor drift upward as the window rolls, undercounting macro wear on long green runs. The stint baseline preserves cumulative degradation while the median still rejects lap-to-lap noise.
+
+Fewer than 3 clean laps → `m.fo = 0.0` (no panic tire forecast). Implemented in `telemetry.py` (`CleanLapGate`).
+
+**Pre-gate fallback** (first lap / sim packets): `avg_last3_s − best_lap_in_history` as before.
+
+Positive `falloff_s` = slower than your best recent clean pace (tire/conditions degradation proxy).
 
 ### 3.5 Pit payback laps (`m.pb`)
 
@@ -506,12 +521,25 @@ Simulation state after immediate call:
 - If staying out: seed fuel via `_forecast_fuel_laps_seed()`:
   - **Laps 0–3 after pit exit:** `sim_fuel = max(max_tank_stint, green_fuel_laps) − 1` (full-tank stint, not stale pre-pit burn)
   - **Otherwise:** `sim_fuel = green_fuel_laps − 1` from green-flag EMA only (Section 2.3; not caution-inflated `m.fl`)
+  - **Sim / compact packets:** when `green_flag_fuel_laps_from_telemetry()` returns 0 (no `m.ful`), fall back to live `m.fl`; when `m.mk` is true, use `max(green, m.fl)`
 
 ```
 green_fuel_laps = fuel_liters / m.fpe_L     # m.fpe in packet (US gal/lap); convert to L/lap for sim
 ```
 
 Implemented as `green_flag_fuel_laps_from_telemetry()` in `race_constants.py`.
+
+**Run-to-finish** (`_can_run_to_finish()`): when `m.mk` is true **or** `m.fl ≥ m.lr`, the car can reach the checkered without a fuel stop. The forecast loop then:
+
+- Suppresses **fuel-limited** stops for the rest of the simulation.
+- Schedules **tire-limited** stops only when `_tire_pit_worth_it()` passes:
+
+```
+projected_wear_loss_s = m.fo × sim_laps_remaining
+schedule_tire_stop    = projected_wear_loss_s ≥ r.pl
+```
+
+(`m.fo` = tire falloff proxy in seconds; `r.pl` = pit loss seconds.)
 
 Each simulated lap:
 
@@ -530,40 +558,47 @@ Output: list of `{estimated_pit_lap, laps_from_now, service_required}`.
 
 The overlay **TARGET PIT** and **`[ Target Box: Lstart - Lend ]`** lines use `_fuel_laps_for_pit_window()` — the same green-flag fuel projection as §10.3, **not** raw `m.fl` with bankers' rounding.
 
-| Flag state | Window fuel source |
-|------------|-------------------|
-| Yellow / caution | Live `m.fl` from `_fuel_context()` (caution burn is real; forecast is paused) |
-| Green + `m.ful` | `green_flag_fuel_laps_from_telemetry()` (EMA / liters only; ignores caution-instant rate) |
-| Green + compact `m.fl` only (sim) | `floor(m.fl)` so caution savings and `round(19.5) == round(20.5)` do not push the box outward on restart |
+| Flag state | Window fuel source | Dashboard |
+|------------|-------------------|-----------|
+| Yellow / caution | Live `m.fl` from `_fuel_context()` (forecast paused) | Target box from live fuel (capped to `s.lt`) |
+| Green + run-to-finish (`m.mk` or `m.fl ≥ m.lr`) | **0** — no fuel stop required | **TARGET PIT: CHECKERED**; target box omitted |
+| Green + `m.ful` | `green_flag_fuel_laps_from_telemetry()` (EMA / liters) | Lap label or CHECKERED if beyond `s.lt` |
+| Green + compact `m.fl` only (sim) | `floor(m.fl)` when a stop is still required | Box end capped to `s.lt` |
 
 ```
-target_pit_lap = current_lap + floor(window_fuel)     # when staying out
-end_lap        = current_lap + max(1, floor(window_fuel))
-start_lap      = max(current + 1, end_lap − payback_laps)   # when pb > 0
+target_pit_label = CHECKERED                         # run-to-finish on green
+                 | str(current_lap + floor(window))  # when a stop is required
+end_lap          = min(s.lt, current_lap + floor(window_fuel))
 ```
 
-**Why this matters:** Under yellow, fuel burn drops (e.g. 0.25 lap/lap in sim). `m.fl` stays high. On the first green lap, using `round(m.fl)` can keep the rounded laps-left constant while `current_lap` increments — shifting **Target Box** one lap deeper (e.g. L21–L23 → L22–L24). Flooring on green and purging EMA on caution→green prevents that drift.
+**Why flooring matters:** Under yellow, fuel burn drops (e.g. 0.25 lap/lap in sim). On green restart, `round(19.5) == round(20.5)` can freeze rounded fuel laps while `current_lap` increments — shifting the box +1 (e.g. L21–L23 → L22–L24).
 
-Implemented in `strategy_engine.py`: `_fuel_laps_for_pit_window()`, `_target_pit_lap()`, `_target_box_laps()`. EMA purge on yellow lift: `telemetry.py` `_reset_fuel_ema_for_green_restart()` (live iRacing only).
+Implemented in `strategy_engine.py`: `_can_run_to_finish()`, `_fuel_laps_for_pit_window()`, `_target_pit_label()`, `_target_box_laps()`, `_tire_pit_worth_it()`. EMA purge on yellow lift: `telemetry.py` `_reset_fuel_ema_for_green_restart()` (live iRacing only).
+
+#### Worked example: `default` (20 laps, 22-lap tank, 46s pit loss)
+
+| Lap | `m.fl` | `m.mk` | Old behavior | New behavior |
+|-----|--------|--------|--------------|--------------|
+| 1–20 | 21 → 2 | true | TARGET PIT: **LAP 22**, box L20–L22; forecast churn L5/L6… | **TARGET PIT: CHECKERED**; no box; **No further stops** |
+
+A 46s pit on a 20-lap sprint with fuel to the end is never scheduled unless wear loss × laps remaining exceeds pit cost.
 
 #### Worked example: `tactical_caution_gate` Lap 4 green restart
 
 | Lap | Flag | `m.fl` | Old `round(m.fl)` | New `window_fuel` | Target box |
 |-----|------|--------|-------------------|-------------------|------------|
-| 1 | GREEN | 21.0 | 21 | floor(21) = 21 | L20–L22 |
-| 2 | CAUTION | 20.75 | 21 | live 20.75 → floor 20 | L21–L23 |
-| 3 | CAUTION | 20.5 | 20 | live 20.5 → floor 20 | L21–L23 |
-| 4 | GREEN | 19.5 | **20** (stuck) | floor(19.5) = **19** | **L21–L23** (stable) |
-| 4 (bug) | GREEN | 19.5 | 20 | round → end lap 24 | L22–L24 (drift +1) |
+| 1 | GREEN | 21.0 | 21 | floor(21) = 21 | L20–L22 (if stop required) |
+| 2 | CAUTION | 20.75 | 21 | live 20.75 → floor 20 | session-capped box |
+| 3 | CAUTION | 20.5 | 20 | live 20.5 → floor 20 | session-capped box |
+| 4 | GREEN | 19.5 | **20** (stuck) | run-to-finish → **CHECKERED** | **no box** |
 
 Two mechanisms keep Lap 4 stable:
 
 **1. Separation of fuel window sources (caution vs green)**
 
 - **Under caution (L2–L3):** `_fuel_laps_for_pit_window()` returns live `m.fl`. Caution burn is low (`DEFAULT_CAUTION_BURN_L` floor in live telemetry; 0.25 lap/lap in `sim/race_simulator.py`), so remaining fuel laps stay artificially deep. Rest-of-race forecast is paused (`paused_for_caution`).
-- **Under green (L4+):** The dashboard **stops** using raw caution-inflated `m.fl` for the target box. Source selection:
-  - **Live iRacing** (`m.ful` present): `green_flag_fuel_laps_from_telemetry()` — liters ÷ saved green-flag EMA (`m.fpe`), not caution-instant burn.
-  - **Offline sim** (`m.fl` only, no `m.ful`): `floor(m.fl)` — the path that fixes `tactical_caution_gate`; EMA helpers are not in the packet.
+- **Under green (L4+), run-to-finish:** `m.mk` true with fuel for the remaining 5-lap race → **CHECKERED**, no target box (not the old L21–L23 floor path).
+- **Under green when a stop is still required:** use `floor(m.fl)` or EMA path; cap end lap to `s.lt`.
 
 **2. Caution → green EMA purge (live telemetry only)**
 
@@ -800,7 +835,7 @@ Shared helpers in `race_constants.py`: `clamp_fuel_use_kg_h()`, `clamp_nonneg_li
 
 Pre-race helpers in `pre_race_strategy.py`: `find_race_session()`, `race_lap_total_from_yaml()`, `race_tire_set_limit()`.
 
-Strategy helpers in `strategy_engine.py`: `_laps_since_pit_stop()`, `_post_pit_alert_quiet()`, `_forecast_fuel_laps_seed()`, `_fuel_laps_for_pit_window()`, `advice_call_line()`, `resolve_live_advice()`, `tactical_undercut_advice()`, `tactical_defensive_advice()`.
+Strategy helpers in `strategy_engine.py`: `_laps_since_pit_stop()`, `_post_pit_alert_quiet()`, `_forecast_fuel_laps_seed()`, `_can_run_to_finish()`, `_fuel_laps_for_pit_window()`, `_target_pit_label()`, `_tire_pit_worth_it()`, `advice_call_line()`, `resolve_live_advice()`, `tactical_undercut_advice()`, `tactical_defensive_advice()`.
 
 Context helpers in `context_engine.py`: `evaluate_strategy_mode()`, `calculate_rolling_trend()`, `compute_overtake_difficulty_index()`, `adjust_tire_stint_cap_for_track_temp()`.
 
@@ -814,7 +849,7 @@ Reentry helpers in `telemetry.py`: `compute_reentry_verdict()`.
 
 ```
 ================================================================================
-STRATEGY CALL :   [ ACTION ]   ·   TARGET PIT: LAP N   ·   SERVICE TYPE: …
+STRATEGY CALL :   [ ACTION ]   ·   TARGET PIT: CHECKERED | LAP N   ·   SERVICE TYPE: …
  WHY           :   HEADLINE …
                    (optional detail / reentry / context notes)
 ================================================================================

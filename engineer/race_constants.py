@@ -52,6 +52,12 @@ MARBLE_LAPS_REMAINING = 2
 LAT_ACCEL_OFFLINE_THRESHOLD = 1.8
 DRAFT_GAP_SEC = 1.5
 DRAFT_STREAK_ODI_PENALTY = 0.3
+# Clean-lap gate for tire falloff (m.fo) — oval draft / incident filtering
+CLEAN_LAP_DRAFT_GAP_SEC = 1.2
+CLEAN_LAP_DRAFT_FRAC_MAX = 0.30
+CLEAN_LAP_BUFFER_DEPTH = 5
+CLEAN_LAP_FALLOFF_MIN_SAMPLES = 3
+TELEMETRY_POLL_INTERVAL_S = 0.25
 ODI_PACK_PENALTY = 0.5
 ODI_STAY_OUT_THRESHOLD = 0.5
 ODI_UNDERCUT_THRESHOLD = -0.3
@@ -99,6 +105,16 @@ PIT_LOSS_SUPER_MIN_LENGTH_MI = 2.3
 PIT_LOSS_SHORT_MAX_LENGTH_MI = 1.2
 
 _PIT_LOSS_UNKNOWN_LENGTH_MI = 1.5
+
+# Long-race offline simulation distances (sim/race_simulator.py scenarios)
+LONG_RACE_LAPS_SHORT_TRACK = 120
+LONG_RACE_LAPS_MEDIUM_TRACK = 90
+LONG_RACE_LAPS_LARGE_TRACK = 60
+
+# Representative track lengths (mi) for long-race sim pit-loss defaults
+LONG_RACE_SHORT_TRACK_LENGTH_MI = 0.533
+LONG_RACE_MEDIUM_TRACK_LENGTH_MI = 1.5
+LONG_RACE_LARGE_TRACK_LENGTH_MI = 2.5
 
 
 # ==============================================================================

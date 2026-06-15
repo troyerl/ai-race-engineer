@@ -28,8 +28,16 @@ python3 race_simulator.py --scenario join_leader_lap12
 # Tactical regression gate (yellow L2–3)
 python3 race_simulator.py --scenario tactical_caution_gate -v
 
+# Long green-flag races by track class
+python3 race_simulator.py --scenario long_short_track    # 120 laps, short oval
+python3 race_simulator.py --scenario long_medium_track     # 90 laps, intermediate
+python3 race_simulator.py --scenario long_large_track    # 60 laps, superspeedway
+
 # Custom lap count / log path
 python3 race_simulator.py --scenario undercut --laps 30 --log sim_logs/my_run.log
+
+# Run every built-in scenario (logs under sim_logs/)
+python3 scripts/run_all_simulations.py
 ```
 
 No iRacing install required. Uses the same Python environment as the app (`python3 -m unittest discover -s tests` includes `tests/test_race_simulator.py`).
@@ -115,7 +123,7 @@ python3 race_simulator.py --scenario join_traffic_p8_lap30   # 40-car grid, P18
 | Scenario | Cars | Hero grid spot |
 |----------|------|----------------|
 | `race_full` | 35 | P12 |
-| `default` | 28 | P11 |
+| `default` | 28 | P11 | Green to checkered on one tank (20-lap sprint); expect **CHECKERED**, no phantom L22 box. |
 | `caution_lap8` | 32 | P10 |
 | `tactical_caution_gate` | 28 | P2 |
 | `defensive_pressure` | 30 | P14 |
@@ -126,6 +134,9 @@ python3 race_simulator.py --scenario join_traffic_p8_lap30   # 40-car grid, P18
 | `join_last_lap18` | 35 | P35 (last) |
 | `undercut` | 35 | P6 |
 | `lapped_danger` | 36 | P28 |
+| `long_short_track` | 32 | P12 | 120-lap Bristol-style short oval |
+| `long_medium_track` | 32 | P12 | 90-lap Charlotte-style intermediate |
+| `long_large_track` | 32 | P12 | 60-lap Daytona-style superspeedway |
 
 ### Log file behavior
 
@@ -142,7 +153,24 @@ python3 race_simulator.py --scenario join_traffic_p8_lap30   # 40-car grid, P18
 | Name | Laps simulated | Entry | Focus |
 |------|----------------|-------|--------|
 | `race_full` | 1 → 30 | P12, lap 1 | Complete green-flag race from start to checkered. |
-| `default` | 1 → 20 | P11, lap 1 | Shorter opening stint (legacy default). |
+| `default` | 1 → 20 | P11, lap 1 | Shorter opening stint; **run-to-finish** (22-lap tank, 20-lap race) — no pit window. |
+
+### Long races (track class)
+
+Full green-flag races from lap 1 with track-length pit loss (`get_default_pit_loss_seconds`) and fuel cycling tuned for multiple stops over the distance.
+
+| Name | Laps | Track (representative) | Length | Pit loss | Tank (laps) |
+|------|------|------------------------|--------|----------|-------------|
+| `long_short_track` | **120** | Bristol Motor Speedway | 0.53 mi | 42s | 35 |
+| `long_medium_track` | **90** | Charlotte Motor Speedway | 1.5 mi | 46s | 28 |
+| `long_large_track` | **60** | Daytona International Speedway | 2.5 mi | 58s | 18 |
+
+```bash
+python3 race_simulator.py --scenario long_medium_track -v
+python3 race_simulator.py --scenario long_short_track --log sim_logs/bristol_120.log
+```
+
+Override lap count for a quicker smoke run: `--laps 30` (still uses scenario fuel/tank profile).
 
 ### Mid-race join — position & traffic
 
@@ -192,6 +220,12 @@ python3 race_simulator.py --scenario join_traffic_p5_lap22 --start-lap 25
 - `force_pit_laps={9}`: hero enters pit road on L9 (`m.pr` / `m.ps`), completes service end of lap.
 - After service: position loss, fuel/tire reset, `caution_pit_complete` so L10+ does not repeat **PIT** under yellow.
 
+**`default`**
+
+- 20-lap race, 22-lap tank, 46s pit loss — strategy should **never** project a stop beyond lap 20.
+- Expect every lap: `TARGET PIT: CHECKERED`, no `Target Box:` line, `FORECAST: No further stops if green to the end`.
+- Validates `_can_run_to_finish()` and forecast fuel-seed fallback for sim packets (`m.fl` only). See [CALCULATIONS.md §10.3](CALCULATIONS.md#103-green-flag-rest-of-race-forecast).
+
 **`tactical_caution_gate`**
 
 - Short 5-lap script for unit tests and manual inspection of caution + tactical behavior.
@@ -203,7 +237,7 @@ python3 race_simulator.py --scenario join_traffic_p5_lap22 --start-lap 25
 - **Green (live):** Box uses `green_flag_fuel_laps_from_telemetry()` after EMA purge on yellow lift.
 - **Green (sim, `m.fl` only):** Box uses `floor(m.fl)` — no EMA in sim packets.
 
-The `tactical_caution_gate` log validates Lap 4 **Target Box: L21–L23** staying stable (not L22–L24) via the floor path.
+- On **L4 green**, expect **TARGET PIT: CHECKERED** and no target box (5-lap race, fuel covers the distance).
 
 **`undercut`**
 
@@ -255,7 +289,8 @@ VOICE:
 | `Mode` | `fi.sm.n` from context tracker (`BALANCED` / `OFFENSIVE` / `DEFENSIVE`). |
 | `TACTICAL` | Post-tick snapshot: context mode, `fi.odi.uc`, apex loss, thermal state, `fi.tac` flags, fired alert IDs. |
 | `SIM TELEMETRY` | Values synthesized by `generate_simulated_packet_extras` before the context poll. |
-| `Target Box` | Pit window from `_fuel_laps_for_pit_window()` ([CALCULATIONS.md §10.3.1](CALCULATIONS.md#1031-target-pit-lap--target-box-dashboard)); stable across caution→green when fuel burns slowly under yellow. |
+| `TARGET PIT` | `CHECKERED` when run-to-finish; else lap number capped to race distance. |
+| `Target Box` | Pit window from `_fuel_laps_for_pit_window()` ([CALCULATIONS.md §10.3.1](CALCULATIONS.md#1031-target-pit-lap--target-box-dashboard)); omitted on run-to-finish. |
 | `IMMEDIATE DIRECTIVE` | Raw output from `evaluate_and_forecast_strategy()` §10.2 table. |
 | `ENGINEER ADVICE` | What the overlay/voice use (`resolve_live_advice()` priority chain). |
 | `FORECAST STOPS` | `green_flag_rest_of_race_forecast.projected_pit_schedule`. |
@@ -356,7 +391,8 @@ Covers:
 - **Tactical state transitions under caution** (`tactical_caution_gate`)
 - **Caution suppresses offensive undercut** (yellow on undercut lap)
 - **Defensive mode under synthetic pressure** (`defensive_pressure` L11)
-- **Green-restart target box stability** (lap 4 box does not drift outward after yellow; see [CALCULATIONS.md §10.3.1](CALCULATIONS.md#1031-target-pit-lap--target-box-dashboard))
+- **Green-restart target box stability** (`tactical_caution_gate` lap 4 → CHECKERED)
+- **`default` run-to-finish** — no L22 phantom box or rolling forecast stops
 - `generate_simulated_packet_extras` default geometry
 - Tactical block present in written logs
 

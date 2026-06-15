@@ -196,14 +196,65 @@ class RaceSimulatorTests(unittest.TestCase):
             self.assertIn("Mode: DEFENSIVE", text)
 
     def test_green_restart_target_box_does_not_drift_outward(self) -> None:
-        """Lap 4 green after caution should not push target box past lap 3 caution box."""
+        """Lap 4 green after caution: run-to-finish shows CHECKERED, not an out-of-range box."""
         scenario = SCENARIOS["tactical_caution_gate"]
         sim = RaceSimulator(scenario, seed=1)
         records = sim.run()
         lap3 = next(r for r in records if r.lap == 3)
         lap4 = next(r for r in records if r.lap == 4)
-        self.assertIn("Target Box: L21 - L23", lap3.advice)
-        self.assertIn("Target Box: L21 - L23", lap4.advice)
+        self.assertIn("Target Box:", lap3.advice)
+        self.assertIn("TARGET PIT: CHECKERED", lap4.advice)
+        self.assertNotIn("Target Box:", lap4.advice)
+        self.assertIn("No further stops", lap4.advice)
+
+    def test_default_scenario_run_to_finish_no_phantom_stops(self) -> None:
+        scenario = SCENARIOS["default"]
+        sim = RaceSimulator(scenario, seed=1)
+        records = sim.run()
+        for rec in records:
+            self.assertIn("TARGET PIT: CHECKERED", rec.advice)
+            self.assertNotIn("Target Box:", rec.advice)
+            self.assertIn("No further stops", rec.advice)
+            self.assertNotIn("L22", rec.advice)
+
+
+class LongRaceScenarioTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _load_scenarios()
+
+    def test_long_race_scenario_configs(self) -> None:
+        short = SCENARIOS["long_short_track"]
+        medium = SCENARIOS["long_medium_track"]
+        large = SCENARIOS["long_large_track"]
+        self.assertEqual(short.total_laps, 120)
+        self.assertEqual(medium.total_laps, 90)
+        self.assertEqual(large.total_laps, 60)
+        self.assertAlmostEqual(short.pit_loss_sec, 42.0)
+        self.assertAlmostEqual(medium.pit_loss_sec, 46.0)
+        self.assertAlmostEqual(large.pit_loss_sec, 58.0)
+        self.assertEqual(short.track_name, "Bristol Motor Speedway")
+        self.assertEqual(medium.track_name, "Charlotte Motor Speedway")
+        self.assertEqual(large.track_name, "Daytona International Speedway")
+
+    def test_long_medium_track_completes_all_laps(self) -> None:
+        scenario = SCENARIOS["long_medium_track"]
+        sim = RaceSimulator(scenario, seed=7)
+        records = sim.run()
+        self.assertEqual(len(records), 90)
+        self.assertEqual(records[-1].lap, 90)
+        self.assertTrue(all(rec.advice.strip() for rec in records))
+
+    def test_long_short_track_log_includes_track(self) -> None:
+        scenario = SCENARIOS["long_short_track"]
+        sim = RaceSimulator(scenario, seed=1)
+        records = sim.run()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "long.log"
+            write_sim_log(records, scenario=scenario, log_path=path)
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("Bristol Motor Speedway", text)
+            self.assertIn("LAP 120", text)
 
 
 if __name__ == "__main__":
