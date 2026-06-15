@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import unittest
 
-from strategy_engine import (
+from engineer.strategy_engine import (
     LAPPED_DANGER_WHY,
     evaluate_and_forecast_strategy,
     format_engineer_advice,
     lapped_danger_voice_for_advice,
     run_strategy,
 )
-from telemetry import compute_reentry_verdict
+from engineer.telemetry import compute_reentry_verdict
 from tests.advice_assertions import assert_advice
 from tests.fixtures import inside_window_telemetry
 

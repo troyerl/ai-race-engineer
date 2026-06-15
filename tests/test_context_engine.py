@@ -5,13 +5,13 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-from context_engine import (
+from engineer.context_engine import (
     DriverContextTracker,
     adjust_tire_stint_cap_for_track_temp,
     adjusted_live_tire_stint_cap,
     compute_overtake_difficulty_index,
 )
-from race_constants import (
+from engineer.race_constants import (
     DRAFT_STREAK_ODI_PENALTY,
     HIGH_LAT_SECTOR_END,
     HIGH_LAT_SECTOR_START,

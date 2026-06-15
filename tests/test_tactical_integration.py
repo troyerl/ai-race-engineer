@@ -6,11 +6,11 @@ import json
 import unittest
 from typing import Any
 
-from auto_alert_engine import AutoMonitorState, evaluate_auto_alert_tick
-from context_engine import DriverContextTracker, StrategyMode
-from race_constants import INCIDENT_OT_ALERT_COUNT, MODE_OFFENSIVE_GAP_BEHIND_MIN
-from speech import _speech_lines
-from strategy_engine import (
+from engineer.auto_alert_engine import AutoMonitorState, evaluate_auto_alert_tick
+from engineer.context_engine import DriverContextTracker, StrategyMode
+from engineer.race_constants import INCIDENT_OT_ALERT_COUNT, MODE_OFFENSIVE_GAP_BEHIND_MIN
+from engineer.speech import _speech_lines
+from engineer.strategy_engine import (
     format_engineer_advice,
     incident_push_advice,
     resolve_live_advice,
@@ -300,7 +300,7 @@ class DivebombSpeechIntegrationTests(unittest.TestCase):
         self.assertEqual(lines, ["Divebomb threat inside, guard the entry."])
 
     def test_speech_lines_lapped_danger_still_wins_over_divebomb(self) -> None:
-        from strategy_engine import LAPPED_DANGER_WHY
+        from engineer.strategy_engine import LAPPED_DANGER_WHY
 
         advice = format_engineer_advice(
             "STAY OUT",

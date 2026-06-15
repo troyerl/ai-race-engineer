@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from race_constants import (
+from engineer.race_constants import (
     TIRE_COST_THRESHOLD_BUMP,
     clamp_nonneg_liters,
     first_lap_triangular_cost_exceeds,

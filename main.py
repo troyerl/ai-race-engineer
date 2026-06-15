@@ -4,10 +4,10 @@ import sys
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from broadcaster_ui import BroadcasterWindow
-from race_link import DEFAULT_RACE_LINK_PORT
-from role_picker import pick_startup_role
-from ui import AIRaceEngineer
+from engineer.broadcaster_ui import BroadcasterWindow
+from engineer.race_link import DEFAULT_RACE_LINK_PORT
+from engineer.role_picker import pick_startup_role
+from engineer.ui import AIRaceEngineer
 
 
 def _resource_path(relative_path: str) -> str:
@@ -66,7 +66,7 @@ def main():
     if _f.pointSizeF() <= 0:
         _f.setPointSizeF(10.0)
     app.setFont(_f)
-    icon_path = _resource_path("icon.png")
+    icon_path = _resource_path("assets/icon.png")
     icon = QIcon(icon_path)
     app.setWindowIcon(icon)
 

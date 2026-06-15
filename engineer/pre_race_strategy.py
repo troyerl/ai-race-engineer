@@ -10,8 +10,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from context_engine import adjust_tire_stint_cap_for_track_temp
-from race_constants import IRSDK_TIRE_SETS_UNLIMITED, TIRE_COST_THRESHOLD_BUMP, first_lap_triangular_cost_exceeds
+from .context_engine import adjust_tire_stint_cap_for_track_temp
+from .race_constants import IRSDK_TIRE_SETS_UNLIMITED, TIRE_COST_THRESHOLD_BUMP, first_lap_triangular_cost_exceeds
 
 _IRACING_LAPS_UNKNOWN_MIN = 32000
 

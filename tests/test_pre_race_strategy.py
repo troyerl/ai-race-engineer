@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from pre_race_strategy import (
+from engineer.pre_race_strategy import (
     baseline_from_telemetry,
     find_race_session,
     generate_pre_race_green_plan,

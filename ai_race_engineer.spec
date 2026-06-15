@@ -3,30 +3,17 @@
 
 import sys
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 
-# icon.png must be bundled for Qt window icon at runtime.
-datas = [("icon.png", ".")]
+# Bundle assets/ for Qt window icon and spinner SVGs.
+datas = [("assets", "assets")]
 binaries = []
 hiddenimports = [
     "irsdk",
-    "app_config",
-    "pre_race_strategy",
-    "strategy_engine",
-    "strategy_worker",
-    "broadcaster_ui",
-    "hotkey",
-    "lan_discovery",
-    "race_link",
-    "race_memory",
-    "receiver_theme",
-    "remote_telemetry",
-    "role_picker",
-    "speech",
-    "telemetry",
-    "ui",
+    "engineer",
+    *collect_submodules("engineer"),
 ]
 
 for pkg in ("PySide6",):
@@ -69,7 +56,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon="icon.ico" if sys.platform.startswith("win") else None,
+    icon="assets/icon.ico" if sys.platform.startswith("win") else None,
 )
 
 coll = COLLECT(

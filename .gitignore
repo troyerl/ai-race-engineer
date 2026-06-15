@@ -11,6 +11,8 @@ __pycache__/
 
 .DS_Store
 
+sim_logs/
+
 dist/
 build/
 *.spec

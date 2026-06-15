@@ -7,10 +7,11 @@ local race strategy engine (no cloud AI).
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
-from race_constants import (
+from .race_constants import (
     ALERT_LAP_HORIZON,
     DEFAULT_CAUTION_BURN_L,
     INCIDENT_OT_ALERT_COUNT,
@@ -29,7 +30,7 @@ from race_constants import (
     green_flag_fuel_laps_from_telemetry,
     triangular_payback_lap,
 )
-from pre_race_strategy import run_pre_race_plan
+from .pre_race_strategy import run_pre_race_plan
 
 # ================================================================
 # 1. TELEMETRY DATA DICTIONARY SCHEMA
@@ -201,6 +202,29 @@ def _forecast_fuel_laps_seed(telemetry: dict[str, Any], *, max_tank_stint: float
     if since is not None and since <= 3:
         return max(0.0, max(max_tank_stint, green) - 1.0)
     return max(0.0, green - 1.0)
+
+
+def _fuel_laps_for_pit_window(telemetry: dict[str, Any], *, fuel_laps_left: float) -> float:
+    """
+    Laps-left for target box / target pit lap (§10.3).
+
+    Under caution, use the live tank reading. Under green, prefer green-flag EMA when
+    liters are available; otherwise floor the live reading so caution savings and
+    bankers-rounding do not push the window outward.
+    """
+    if _under_caution(telemetry):
+        return fuel_laps_left
+
+    m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
+    if m.get("ful") is not None:
+        green = green_flag_fuel_laps_from_telemetry(
+            telemetry,
+            fallback_l_per_lap=DEFAULT_CAUTION_BURN_L,
+        )
+        if green > 0:
+            return green
+
+    return math.floor(fuel_laps_left)
 
 
 LAPPED_DANGER_WHY = (
@@ -962,8 +986,9 @@ def _target_pit_lap(
     act = (action or "").upper()
     if act in ("PIT", "PIT NOW"):
         return current
-    if fuel_laps_left > 0:
-        return current + max(0, int(round(fuel_laps_left)))
+    window_fuel = _fuel_laps_for_pit_window(telemetry, fuel_laps_left=fuel_laps_left)
+    if window_fuel > 0:
+        return current + max(0, int(math.floor(window_fuel)))
     forecast = result.get("green_flag_rest_of_race_forecast", {})
     stops = forecast.get("projected_pit_schedule", []) if isinstance(forecast, dict) else []
     if isinstance(stops, list) and stops:
@@ -981,9 +1006,10 @@ def _target_box_laps(
 ) -> tuple[int, int] | None:
     m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
     current = _safe_int(m.get("l"), 1)
-    if fuel_laps_left <= 0:
+    window_fuel = _fuel_laps_for_pit_window(telemetry, fuel_laps_left=fuel_laps_left)
+    if window_fuel <= 0:
         return None
-    end_lap = current + max(1, int(round(fuel_laps_left)))
+    end_lap = current + max(1, int(math.floor(window_fuel)))
     if payback_laps > 0:
         start_lap = max(current + 1, end_lap - max(1, int(round(payback_laps))))
     else:
@@ -1420,7 +1446,7 @@ def should_auto_alert(
     return False
 
 
-from pre_race_strategy import run_pre_race_plan
+from .pre_race_strategy import run_pre_race_plan
 
 
 def run_strategy(telemetry: dict[str, Any], *, mode: str = "live", track_name: str | None = None) -> str:

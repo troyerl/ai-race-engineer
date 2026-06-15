@@ -9,12 +9,12 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
 
-from app_config import ensure_default_config_file, load_config, write_config
-from race_link import DEFAULT_RACE_LINK_PORT, BroadcasterService
-from lan_discovery import BroadcasterBeacon
-from speech import speak_engineer_advice
-from strategy_engine import advice_call_line
-from telemetry import DEFAULT_TIRE_SETS_FALLBACK, TelemetryTracker
+from .app_config import ensure_default_config_file, load_config, write_config
+from .race_link import DEFAULT_RACE_LINK_PORT, BroadcasterService
+from .lan_discovery import BroadcasterBeacon
+from .speech import speak_engineer_advice
+from .strategy_engine import advice_call_line
+from .telemetry import DEFAULT_TIRE_SETS_FALLBACK, TelemetryTracker
 
 # Receiver overrides pit loss on the engineer PC; tire sets stream from SDK on the sim PC.
 _BCAST_PIT_LOSS_SEC = 8

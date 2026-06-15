@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from strategy_engine import (
+from engineer.strategy_engine import (
     OFFENSIVE_UNDERCUT_WHY,
     _undercut_opportunity,
     _undercut_runway_ok,

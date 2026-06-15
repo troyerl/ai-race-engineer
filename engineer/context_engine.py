@@ -12,7 +12,7 @@ from collections import deque
 from enum import IntEnum
 from typing import Any, Callable
 
-from race_constants import (
+from .race_constants import (
     APEX_LOSS_DEFEND_PCT,
     APEX_STEER_DELTA_MIN,
     BRAKE_ZONE_LAP_DIST_END,
@@ -708,7 +708,7 @@ def adjusted_live_tire_stint_cap(
     max_lap: int = 80,
 ) -> int | None:
     """Triangular tire cap with §16.1.1 temperature adjustment."""
-    from race_constants import TIRE_COST_THRESHOLD_BUMP
+    from .race_constants import TIRE_COST_THRESHOLD_BUMP
 
     exceed = first_lap_triangular_cost_exceeds(
         pit_loss_sec + TIRE_COST_THRESHOLD_BUMP,

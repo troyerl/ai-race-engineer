@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import unittest
 
-from race_constants import (
+from engineer.race_constants import (
     INCIDENT_OT_ALERT_COUNT,
     ODI_STAY_OUT_THRESHOLD,
     STEER_STD_HIGH,
     TRACK_TEMP_SHIFT_THRESHOLD_C,
 )
-from strategy_engine import advice_call_line, incident_push_advice, parse_call_line, run_strategy
+from engineer.strategy_engine import advice_call_line, incident_push_advice, parse_call_line, run_strategy
 from tests.advice_assertions import assert_advice, assert_telemetry_advice, parse_advice
 from tests.fixtures import base_live_telemetry, inside_window_telemetry
 

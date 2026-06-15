@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from strategy_engine import advice_call_line, incident_push_advice, resolve_live_advice, run_strategy, should_auto_alert
+from .strategy_engine import advice_call_line, incident_push_advice, resolve_live_advice, run_strategy, should_auto_alert
 
 
 @dataclass

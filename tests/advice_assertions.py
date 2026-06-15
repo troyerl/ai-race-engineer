@@ -7,7 +7,7 @@ import unittest
 from dataclasses import dataclass
 from typing import Any
 
-from strategy_engine import advice_call_line, parse_advice_why, parse_call_line, run_strategy
+from engineer.strategy_engine import advice_call_line, parse_advice_why, parse_call_line, run_strategy
 
 
 @dataclass(frozen=True)

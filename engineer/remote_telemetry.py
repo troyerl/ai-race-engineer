@@ -7,8 +7,8 @@ import json
 import time
 from typing import Any
 
-from race_memory import RaceMemory
-from telemetry import _is_caution_flags, parse_tire_sets_available
+from .race_memory import RaceMemory
+from .telemetry import _is_caution_flags, parse_tire_sets_available
 
 
 class RemoteTelemetrySource:

@@ -14,7 +14,7 @@ from typing import Any
 
 import irsdk
 
-from race_constants import (
+from .race_constants import (
     DEFAULT_AVG_LAP_S,
     FUEL_EMA_ALPHA,
     FUEL_LAPS_CLAMP_MULTIPLIER,
@@ -32,8 +32,8 @@ from race_constants import (
     triangular_payback_lap,
     wrap_lap_distance_delta,
 )
-from context_engine import DriverContextTracker
-from pre_race_strategy import find_race_session, race_lap_total_from_session
+from .context_engine import DriverContextTracker
+from .pre_race_strategy import find_race_session, race_lap_total_from_session
 
 # AI-facing packet uses US customary fuel units (internal math stays liters + kg/h).
 _KG_TO_LB = 2.204622621847693185
@@ -578,6 +578,7 @@ class TelemetryTracker:
         self._fuel_per_lap_ema_L: float | None = None
         self._fuel_last_lap_burn_L: float | None = None
         self._fuel_burn_samples_L: deque = deque(maxlen=12)
+        self._last_is_caution: bool | None = None
 
         # Session pit-lane time (PitiExtTime proxy when SDK omits it).
         self._cumulative_pit_time_s: float = 0.0
@@ -688,6 +689,15 @@ class TelemetryTracker:
 
         self._fuel_prev_lap = lap_int
         self._fuel_prev_level_L = fuel_level
+
+    def _reset_fuel_ema_for_green_restart(self, lap_now: Any, fuel_level: float) -> None:
+        """Purge caution-skewed burn history when yellow lifts (§2.3)."""
+        self._fuel_per_lap_ema_L = None
+        self._fuel_last_lap_burn_L = None
+        self._fuel_burn_samples_L.clear()
+        if isinstance(lap_now, int):
+            self._fuel_prev_lap = lap_now
+            self._fuel_prev_level_L = fuel_level
 
     def _tracked_indices(self, player_idx: int, player_pos: int, positions: list) -> set[int]:
         tracked = {player_idx}
@@ -1227,6 +1237,9 @@ class TelemetryTracker:
             self._ir_get("PitsOpen", None),
         )
         is_caution = bool(flags.get("cau") or flags.get("yel"))
+        if self._last_is_caution and not is_caution:
+            self._reset_fuel_ema_for_green_restart(lap_now, fuel_level)
+        self._last_is_caution = is_caution
         on_track = bool(self._ir_get("IsOnTrack", False))
         avg_lap_s = self._avg_lap_s_for_idx(player_idx, fallback=DEFAULT_AVG_LAP_S)
         ahead_idx = self._idx_by_class_pos(player_pos - 1) if player_pos else None

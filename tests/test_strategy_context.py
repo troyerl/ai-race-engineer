@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-from race_constants import (
+from engineer.race_constants import (
     INCIDENT_OT_ALERT_COUNT,
     ODI_STAY_OUT_THRESHOLD,
     ODI_UNDERCUT_THRESHOLD,
@@ -14,12 +14,14 @@ from race_constants import (
     STEER_STD_HIGH,
     TRACK_TEMP_SHIFT_THRESHOLD_C,
 )
-from strategy_engine import (
+from engineer.strategy_engine import (
     _append_context_notes,
     _apply_context_directive_overrides,
     _fuel_context,
+    _fuel_laps_for_pit_window,
     _post_pit_alert_quiet,
     _steer_forecast_penalty,
+    _target_box_laps,
     advice_call_line,
     evaluate_and_forecast_strategy,
     incident_push_advice,
@@ -342,6 +344,47 @@ class ShouldAutoAlertTests(unittest.TestCase):
         self.assertFalse(
             should_auto_alert(tel, "STAY OUT — THIS LAP — NONE", caution_ended=True)
         )
+
+
+class PitWindowFuelTests(unittest.TestCase):
+    def test_green_after_caution_floors_inflated_fl(self) -> None:
+        """floor(19.5)=19 keeps target box stable vs caution round(20.5)=20."""
+        tel = base_live_telemetry(
+            m={"l": 4, "lp": 4, "fl": 19.5, "fcq": "hi", "mk": True, "pb": 2},
+            r={"ftl": 22, "pl": 46, "ts": 3, "fc": 20.0},
+            s={"flb": {}},
+        )
+        window_fuel = _fuel_laps_for_pit_window(tel, fuel_laps_left=19.5)
+        self.assertEqual(window_fuel, 19.0)
+        box = _target_box_laps(tel, fuel_laps_left=19.5, payback_laps=2.0)
+        self.assertIsNotNone(box)
+        assert box is not None
+        self.assertEqual(box, (21, 23))
+
+    def test_under_caution_keeps_live_fuel_reading(self) -> None:
+        tel = base_live_telemetry(
+            m={"l": 3, "lp": 3, "fl": 20.5, "fcq": "hi", "pb": 2},
+            r={"ftl": 22},
+            s={"flb": {"yel": True, "cau": True}},
+        )
+        window_fuel = _fuel_laps_for_pit_window(tel, fuel_laps_left=20.5)
+        self.assertEqual(window_fuel, 20.5)
+
+    def test_green_ema_path_when_ful_present(self) -> None:
+        tel = base_live_telemetry(
+            m={
+                "l": 12,
+                "lp": 12,
+                "fl": 18.0,
+                "ful": 18.0,
+                "fpe": 0.264,
+                "fcq": "hi",
+                "pb": 2,
+            },
+            r={"ftl": 22},
+        )
+        window_fuel = _fuel_laps_for_pit_window(tel, fuel_laps_left=18.0)
+        self.assertAlmostEqual(window_fuel, 18.0, delta=1.0)
 
 
 if __name__ == "__main__":

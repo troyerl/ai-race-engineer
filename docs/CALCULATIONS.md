@@ -6,15 +6,16 @@ Primary source files:
 
 | Area | Module |
 |------|--------|
-| Telemetry ingestion & packet | `telemetry.py` |
-| Live calls & forecast | `strategy_engine.py` |
-| Garage / pre-race plan | `pre_race_strategy.py` |
-| Track pit-loss default | `ui.py` |
-| Receiver LAN snapshots | `remote_telemetry.py`, `race_memory.py` |
-| Voice relay | `speech.py`, `broadcaster_ui.py` |
-| Auto-alert orchestration | `auto_alert_engine.py` |
-| Driver / environment context (§16) | `context_engine.py` |
-| Shared scalars | `race_constants.py` |
+| Telemetry ingestion & packet | `engineer/telemetry.py` |
+| Live calls & forecast | `engineer/strategy_engine.py` |
+| Garage / pre-race plan | `engineer/pre_race_strategy.py` |
+| Track pit-loss default | `engineer/ui.py` |
+| Receiver LAN snapshots | `engineer/remote_telemetry.py`, `engineer/race_memory.py` |
+| Voice relay | `engineer/speech.py`, `engineer/broadcaster_ui.py` |
+| Auto-alert orchestration | `engineer/auto_alert_engine.py` |
+| Driver / environment context (§16) | `engineer/context_engine.py` |
+| Shared scalars | `engineer/race_constants.py` |
+| Offline race simulation | `sim/race_simulator.py` |
 
 §§1–16 = **implemented** in the repository (SDK fields may be missing per car/session; documented fallbacks apply).
 
@@ -100,6 +101,8 @@ fuel_per_lap_ema = FUEL_EMA_ALPHA × sample + (1 − FUEL_EMA_ALPHA) × previous
 Lap counter going **backward** (session reset) clears the EMA.
 
 **After pit exit** (transition `OnPitRoad: true → false`): if `FuelLevel ≥ 88%` of tank capacity, clear the lap EMA and lap-boundary trackers so the first flying laps after a fill-up are not skewed by pit-road burn.
+
+**After caution lifts** (transition yellow → green): clear `_fuel_per_lap_ema_L`, `_fuel_last_lap_burn_L`, and `_fuel_burn_samples_L`, and reset lap-boundary fuel trackers to the current lap/level. Caution laps burn far less fuel; without this purge, the EMA stays depressed for several green laps and inflates `m.fl` / target windows.
 
 ### 2.2 Instantaneous estimate (fallback)
 
@@ -523,6 +526,53 @@ sim_fuel −= 1
 
 Output: list of `{estimated_pit_lap, laps_from_now, service_required}`.
 
+### 10.3.1 Target pit lap & target box (dashboard)
+
+The overlay **TARGET PIT** and **`[ Target Box: Lstart - Lend ]`** lines use `_fuel_laps_for_pit_window()` — the same green-flag fuel projection as §10.3, **not** raw `m.fl` with bankers' rounding.
+
+| Flag state | Window fuel source |
+|------------|-------------------|
+| Yellow / caution | Live `m.fl` from `_fuel_context()` (caution burn is real; forecast is paused) |
+| Green + `m.ful` | `green_flag_fuel_laps_from_telemetry()` (EMA / liters only; ignores caution-instant rate) |
+| Green + compact `m.fl` only (sim) | `floor(m.fl)` so caution savings and `round(19.5) == round(20.5)` do not push the box outward on restart |
+
+```
+target_pit_lap = current_lap + floor(window_fuel)     # when staying out
+end_lap        = current_lap + max(1, floor(window_fuel))
+start_lap      = max(current + 1, end_lap − payback_laps)   # when pb > 0
+```
+
+**Why this matters:** Under yellow, fuel burn drops (e.g. 0.25 lap/lap in sim). `m.fl` stays high. On the first green lap, using `round(m.fl)` can keep the rounded laps-left constant while `current_lap` increments — shifting **Target Box** one lap deeper (e.g. L21–L23 → L22–L24). Flooring on green and purging EMA on caution→green prevents that drift.
+
+Implemented in `strategy_engine.py`: `_fuel_laps_for_pit_window()`, `_target_pit_lap()`, `_target_box_laps()`. EMA purge on yellow lift: `telemetry.py` `_reset_fuel_ema_for_green_restart()` (live iRacing only).
+
+#### Worked example: `tactical_caution_gate` Lap 4 green restart
+
+| Lap | Flag | `m.fl` | Old `round(m.fl)` | New `window_fuel` | Target box |
+|-----|------|--------|-------------------|-------------------|------------|
+| 1 | GREEN | 21.0 | 21 | floor(21) = 21 | L20–L22 |
+| 2 | CAUTION | 20.75 | 21 | live 20.75 → floor 20 | L21–L23 |
+| 3 | CAUTION | 20.5 | 20 | live 20.5 → floor 20 | L21–L23 |
+| 4 | GREEN | 19.5 | **20** (stuck) | floor(19.5) = **19** | **L21–L23** (stable) |
+| 4 (bug) | GREEN | 19.5 | 20 | round → end lap 24 | L22–L24 (drift +1) |
+
+Two mechanisms keep Lap 4 stable:
+
+**1. Separation of fuel window sources (caution vs green)**
+
+- **Under caution (L2–L3):** `_fuel_laps_for_pit_window()` returns live `m.fl`. Caution burn is low (`DEFAULT_CAUTION_BURN_L` floor in live telemetry; 0.25 lap/lap in `sim/race_simulator.py`), so remaining fuel laps stay artificially deep. Rest-of-race forecast is paused (`paused_for_caution`).
+- **Under green (L4+):** The dashboard **stops** using raw caution-inflated `m.fl` for the target box. Source selection:
+  - **Live iRacing** (`m.ful` present): `green_flag_fuel_laps_from_telemetry()` — liters ÷ saved green-flag EMA (`m.fpe`), not caution-instant burn.
+  - **Offline sim** (`m.fl` only, no `m.ful`): `floor(m.fl)` — the path that fixes `tactical_caution_gate`; EMA helpers are not in the packet.
+
+**2. Caution → green EMA purge (live telemetry only)**
+
+On the first green tick after yellow, `telemetry.py` clears `_fuel_per_lap_ema_L`, `_fuel_last_lap_burn_L`, `_fuel_burn_samples_L`, and resets lap-boundary fuel trackers. Low-burn caution laps cannot bleed into the rolling average that feeds `m.fpe` and `green_flag_fuel_laps_from_telemetry()`.
+
+The offline simulator does **not** run this purge — it never builds an EMA. Sim stability comes from **`floor(window_fuel)`** on green: Lap 3 `floor(20.5)=20` and Lap 4 `floor(19.5)=19` both yield end lap 23 when `current_lap` increments, whereas `round(19.5)=round(20.5)=20` caused the +1 drift.
+
+`MACHINE STATE · FUEL LEFT` still shows live `m.fl` (19.5 on L4). Only **Target Box** and **TARGET PIT** use `_fuel_laps_for_pit_window()`.
+
 ### 10.4 Trigger & confidence labels
 
 Heuristic from WHY text and flags:
@@ -750,7 +800,7 @@ Shared helpers in `race_constants.py`: `clamp_fuel_use_kg_h()`, `clamp_nonneg_li
 
 Pre-race helpers in `pre_race_strategy.py`: `find_race_session()`, `race_lap_total_from_yaml()`, `race_tire_set_limit()`.
 
-Strategy helpers in `strategy_engine.py`: `_laps_since_pit_stop()`, `_post_pit_alert_quiet()`, `_forecast_fuel_laps_seed()`, `advice_call_line()`, `resolve_live_advice()`, `tactical_undercut_advice()`, `tactical_defensive_advice()`.
+Strategy helpers in `strategy_engine.py`: `_laps_since_pit_stop()`, `_post_pit_alert_quiet()`, `_forecast_fuel_laps_seed()`, `_fuel_laps_for_pit_window()`, `advice_call_line()`, `resolve_live_advice()`, `tactical_undercut_advice()`, `tactical_defensive_advice()`.
 
 Context helpers in `context_engine.py`: `evaluate_strategy_mode()`, `calculate_rolling_trend()`, `compute_overtake_difficulty_index()`, `adjust_tire_stint_cap_for_track_temp()`.
 
@@ -769,6 +819,7 @@ STRATEGY CALL :   [ ACTION ]   ·   TARGET PIT: LAP N   ·   SERVICE TYPE: …
                    (optional detail / reentry / context notes)
 ================================================================================
  MACHINE STATE :   CURRENT LAP … · FUEL LEFT … · TARGET FUEL BURN …
+                   [ Target Box: Lstart - Lend ]   # §10.3.1; optional Green EMA when m.fpe present
 --------------------------------------------------------------------------------
  PERFORMANCE   :   LAP PACE … · INPUT SMOOTHNESS … · INCIDENTS …
 ================================================================================

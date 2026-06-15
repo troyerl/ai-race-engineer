@@ -5,13 +5,13 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-from auto_alert_engine import (
+from engineer.auto_alert_engine import (
     AutoMonitorState,
     evaluate_auto_alert_tick,
     reset_auto_monitor_state,
 )
-from race_constants import INCIDENT_OT_ALERT_COUNT, POST_PIT_ALERT_MIN_STINT_LAPS
-from strategy_engine import advice_call_line, incident_push_advice, run_strategy
+from engineer.race_constants import INCIDENT_OT_ALERT_COUNT, POST_PIT_ALERT_MIN_STINT_LAPS
+from engineer.strategy_engine import advice_call_line, incident_push_advice, run_strategy
 from tests.advice_assertions import assert_advice, parse_advice
 from tests.fixtures import base_live_telemetry, inside_window_telemetry
 

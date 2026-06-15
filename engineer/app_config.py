@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import os
 
-from hotkey import DEFAULT_HOTKEY, normalize_hotkey
-from race_link import DEFAULT_RACE_LINK_PORT
+from .hotkey import DEFAULT_HOTKEY, normalize_hotkey
+from .race_link import DEFAULT_RACE_LINK_PORT
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ai_race_engineer.json")
 

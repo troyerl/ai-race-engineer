@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from context_engine import (
+from engineer.context_engine import (
     DriverContextTracker,
     StrategyMode,
     ThermalStressState,
@@ -12,7 +12,7 @@ from context_engine import (
     compute_overtake_difficulty_index,
     evaluate_strategy_mode,
 )
-from race_constants import (
+from engineer.race_constants import (
     BRAKE_ZONE_LAP_DIST_START,
     HIGH_LAT_SECTOR_END,
     HIGH_LAT_SECTOR_START,
@@ -23,7 +23,7 @@ from race_constants import (
     STEER_SAMPLE_LAT_G,
     THERMAL_GREASY_C,
 )
-from strategy_engine import (
+from engineer.strategy_engine import (
     tactical_defensive_advice,
     tactical_undercut_advice,
 )

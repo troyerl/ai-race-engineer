@@ -51,7 +51,7 @@ def _tts_phrase(line: str) -> str:
 def _speech_lines(full: str, *, include_why: bool) -> list[str]:
     """Content lines to read aloud, in display order."""
     try:
-        from strategy_engine import lapped_danger_voice_for_advice
+        from .strategy_engine import lapped_danger_voice_for_advice
 
         voice_override = lapped_danger_voice_for_advice(full)
         if voice_override:

@@ -21,17 +21,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app_config import (
+from .app_config import (
     ensure_default_config_file,
     load_config,
     merge_config_defaults,
     write_config,
 )
-from auto_alert_engine import AutoMonitorState, evaluate_auto_alert_tick, reset_auto_monitor_state
-from race_constants import ALERT_LAP_HORIZON, get_default_pit_loss_seconds, resolve_track_length_miles
-from strategy_engine import advice_call_line, run_strategy
-from strategy_worker import StrategyWorker
-from hotkey import (
+from .auto_alert_engine import AutoMonitorState, evaluate_auto_alert_tick, reset_auto_monitor_state
+from .race_constants import ALERT_LAP_HORIZON, get_default_pit_loss_seconds, resolve_track_length_miles
+from .strategy_engine import advice_call_line, run_strategy
+from .strategy_worker import StrategyWorker
+from .hotkey import (
     DEFAULT_HOTKEY,
     HOTKEY_CHOICES,
     AnalyzeHotkey,
@@ -40,12 +40,12 @@ from hotkey import (
     mac_accessibility_trusted,
     normalize_hotkey,
 )
-from race_link import DEFAULT_RACE_LINK_PORT, ReceiverClient
-from lan_discovery import LanDeviceDiscovery
-from receiver_theme import RECEIVER_QSS, make_card, make_collapsible_section, make_field_column, make_sidebar_scroll
-from remote_telemetry import RemoteTelemetrySource
-from speech import speak_engineer_advice
-from telemetry import TelemetryTracker
+from .race_link import DEFAULT_RACE_LINK_PORT, ReceiverClient
+from .lan_discovery import LanDeviceDiscovery
+from .receiver_theme import RECEIVER_QSS, make_card, make_collapsible_section, make_field_column, make_sidebar_scroll
+from .remote_telemetry import RemoteTelemetrySource
+from .speech import speak_engineer_advice
+from .telemetry import TelemetryTracker
 
 
 TELEMETRY_POLL_MS = 250

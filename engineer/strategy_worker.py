@@ -7,7 +7,7 @@ import threading
 
 from PySide6.QtCore import QObject, Signal
 
-from strategy_engine import run_strategy
+from .strategy_engine import run_strategy
 
 
 class StrategyWorker(QObject):
