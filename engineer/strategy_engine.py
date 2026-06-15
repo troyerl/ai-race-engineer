@@ -41,6 +41,9 @@ from .race_constants import (
     PACE_STABILITY_MIN_SAMPLES,
     PACE_STABILITY_STD_THRESHOLD_S,
     POST_PIT_ALERT_MIN_STINT_LAPS,
+    FUEL_CRITICAL_LAPS_DEFAULT,
+    GWC_FUEL_RESERVE_LAPS,
+    GWC_OVAL_LAPS_REMAIN_MAX,
     STEER_STD_ELEVATED,
     STEER_STD_HIGH,
     TRACK_TEMP_SHIFT_THRESHOLD_C,
@@ -52,6 +55,7 @@ from .race_constants import (
     triangular_payback_lap,
 )
 from .pre_race_strategy import run_pre_race_plan
+from .tire_model import OVAL_STAGGER_WARN_DELTA_PCT, effective_tire_falloff_s
 
 # ================================================================
 # 1. TELEMETRY DATA DICTIONARY SCHEMA
@@ -317,7 +321,8 @@ def _coast_to_checkered_ok(telemetry: dict[str, Any], *, fuel_laps_left: float) 
     laps_remain = _session_laps_remain(telemetry)
     if laps_remain > WHITE_FLAG_LAPS_REMAINING:
         return False
-    return fuel_laps_left >= float(laps_remain) - 0.01
+    reserve = GWC_FUEL_RESERVE_LAPS if _gwc_overtime_prep(telemetry) else 0.0
+    return fuel_laps_left >= float(laps_remain) + reserve - 0.01
 
 
 def _caution_stay_out_for_track_position(
@@ -491,7 +496,9 @@ def _tire_pit_worth_it(telemetry: dict[str, Any], *, laps_remaining: int) -> boo
     if laps_remaining <= 0:
         return False
     m = telemetry.get("m", {}) if isinstance(telemetry.get("m"), dict) else {}
-    falloff_s = _safe_float(m.get("fo"), 0.0)
+    falloff_s = effective_tire_falloff_s(telemetry)
+    if falloff_s <= 0:
+        falloff_s = _safe_float(m.get("fo"), 0.0)
     if falloff_s <= 0:
         return False
     return falloff_s * float(laps_remaining) >= _pit_loss_seconds(telemetry)
@@ -684,14 +691,51 @@ def lapped_danger_voice_for_advice(advice: str) -> str | None:
     return None
 
 
+def _is_race_session(telemetry: dict[str, Any]) -> bool:
+    s = telemetry.get("s") if isinstance(telemetry.get("s"), dict) else {}
+    ty = str(s.get("ty") or "").strip().lower()
+    st = str(s.get("st") or "").strip().lower()
+    return ty == "race" or st == "racing"
+
+
+def _is_oval_track(telemetry: dict[str, Any]) -> bool:
+    s = telemetry.get("s") if isinstance(telemetry.get("s"), dict) else {}
+    if s.get("ov") in (1, True, "1"):
+        return True
+    from .track_db import is_oval_track
+
+    return is_oval_track(
+        str(s.get("tn") or ""),
+        track_length_miles=s.get("tlmi"),
+        track_type=str(s.get("tcat") or "") or None,
+    )
+
+
+def _gwc_overtime_prep(telemetry: dict[str, Any]) -> bool:
+    """Late-race oval window where an extra lap of fuel should be reserved."""
+    if not _is_race_session(telemetry) or not _is_oval_track(telemetry):
+        return False
+    m = telemetry.get("m") if isinstance(telemetry.get("m"), dict) else {}
+    laps_remain = _safe_int(m.get("lr"), 999)
+    return 0 < laps_remain <= GWC_OVAL_LAPS_REMAIN_MAX
+
+
+def _fuel_critical_threshold(telemetry: dict[str, Any]) -> float:
+    threshold = FUEL_CRITICAL_LAPS_DEFAULT
+    if _gwc_overtime_prep(telemetry):
+        threshold += GWC_FUEL_RESERVE_LAPS
+    return threshold
+
+
 def _fuel_context(telemetry: dict[str, Any]) -> tuple[float, bool, bool]:
     """Return (fuel_laps_left, inside_window, is_fuel_critical)."""
+    crit = _fuel_critical_threshold(telemetry)
     x = telemetry.get("x", {})
     m = telemetry.get("m", {})
     if x.get("fe", 0) == 1 and m.get("fcq") in ("hi", "med"):
         fuel_laps_left = _safe_float(m.get("fl"), 0.0)
         pb_laps = _resolve_pit_payback_laps(telemetry)
-        is_fuel_critical = fuel_laps_left <= 1.0
+        is_fuel_critical = fuel_laps_left <= crit
 
         if _can_run_to_finish(telemetry) and not _under_caution(telemetry):
             inside_window = fuel_laps_left <= pb_laps
@@ -711,7 +755,7 @@ def _fuel_context(telemetry: dict[str, Any]) -> tuple[float, bool, bool]:
         ful = _safe_float(m.get("ful"), 0.0)
         fuel_laps_left = ful / fpl if fpl > 0 else 3.0
         inside_window = fuel_laps_left <= 2.0
-        is_fuel_critical = fuel_laps_left <= 1.0
+        is_fuel_critical = fuel_laps_left <= crit
     return fuel_laps_left, inside_window, is_fuel_critical
 
 
@@ -735,6 +779,10 @@ def _append_context_notes(why: str, telemetry: dict[str, Any]) -> str:
     mar = m.get("mar")
     if isinstance(mar, dict) and _safe_int(mar.get("lr"), 0) > 0:
         notes.append("Pickup on tires — expect understeer for a lap or two; avoid offline passes.")
+
+    stg = m.get("stg") if isinstance(m.get("stg"), dict) else {}
+    if _is_oval_track(telemetry) and abs(_safe_float(stg.get("dg"), 0.0)) >= OVAL_STAGGER_WARN_DELTA_PCT:
+        notes.append("Oval stagger split — left/right wear mismatch; handling may push tire stop earlier.")
 
     drv = m.get("drv")
     if isinstance(drv, dict) and _safe_float(drv.get("ssr"), 0.0) >= STEER_STD_HIGH:
@@ -941,16 +989,22 @@ def _fuel_critical_live_advice(telemetry: dict[str, Any]) -> str | None:
     if m.get("pr") or m.get("ps"):
         return None
     fuel_laps_left, _, is_fuel_critical = _fuel_context(telemetry)
-    if not (is_fuel_critical or fuel_laps_left <= 1.0):
+    if not (is_fuel_critical or fuel_laps_left <= _fuel_critical_threshold(telemetry)):
         return None
     r = telemetry.get("r", {}) if isinstance(telemetry.get("r"), dict) else {}
     tire_sets = _safe_int(r.get("ts"), 0)
     service = "4 TIRES" if tire_sets > 0 else "FUEL ONLY"
+    why = "Fuel critical; absolute limit of current tank reached."
+    if _gwc_overtime_prep(telemetry):
+        why = (
+            "Fuel critical for GWC window — reserve an extra lap; "
+            "absolute limit of current tank reached."
+        )
     return format_engineer_advice(
         "PIT NOW",
         "THIS LAP",
         service,
-        "Fuel critical; absolute limit of current tank reached.",
+        why,
         trigger="FUEL",
         conf="H",
         telemetry=telemetry,
@@ -1429,6 +1483,8 @@ def _why_headline(why: str) -> str:
         return "DIVEBOMB THREAT — GUARD THE ENTRY"
     if "undercut threat" in wl:
         return "UNDERCUT THREAT — PIT WHILE WINDOW OPEN"
+    if "gwc window" in wl:
+        return "GWC FUEL RESERVE — PIT THIS LAP"
     if "fuel critical" in wl and "unless fuel critical" not in wl:
         return "FUEL CRITICAL — PIT THIS LAP"
     if "absolute limit" in wl:

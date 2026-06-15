@@ -2,6 +2,7 @@ import os
 import sys
 import threading
 import json
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QToolButton,
     QSpinBox,
@@ -28,10 +30,14 @@ from .app_config import (
     write_config,
 )
 from .auto_alert_engine import AutoMonitorState, evaluate_auto_alert_tick, reset_auto_monitor_state
-from .race_constants import ALERT_LAP_HORIZON, get_default_pit_loss_seconds, resolve_track_length_miles
+from .race_constants import ALERT_LAP_HORIZON, resolve_track_length_miles
+from .track_db import resolve_high_lat_sector, resolve_track_pit_loss_detail, resolve_track_pit_loss_seconds
 from .strategy_engine import advice_call_line, run_strategy
 from .strategy_worker import StrategyWorker
 from .packet_snapshot import save_telemetry_packet
+from .review_dashboard import open_review_dashboard
+from .session_recorder import SessionRecorder, latest_session_file
+from .session_report import save_session_meta
 from .hotkey import (
     DEFAULT_HOTKEY,
     HOTKEY_CHOICES,
@@ -57,6 +63,8 @@ BTN_LIVE = "ANALYZE FIELD & ADVISE"
 BTN_STRATEGY = "GET RACE STRATEGY"
 BTN_SAVE_PACKET = "SAVE PACKET"
 BTN_DISCONNECTED = "ANALYZE FIELD & ADVISE"
+SESSION_STATE_CHECKERED = 5
+MIN_REVIEW_LAPS = 3
 
 
 def _first_nonempty_line(text: str) -> str:
@@ -135,6 +143,12 @@ class AIRaceEngineer(QWidget):
         self._last_request_mode = "live"
         self._last_ui_mode: str | None = None
         self._strategy_compare_active = False
+        self._session_recorder: SessionRecorder | None = None
+        self._review_dashboard = None
+        self._review_prompted_paths: set[str] = set()
+        self._last_session_state: int | None = None
+        if bool(self._config.get("session_recording", False)) and self._role != "receiver":
+            self._start_session_recorder()
         self._link_host_boot = (link_host or "").strip() or str(self._config.get("race_link_host", "")).strip()
         self._link_port_boot = int(link_port if link_port is not None else self._config.get("race_link_port", DEFAULT_RACE_LINK_PORT))
         if self._role == "receiver":
@@ -568,6 +582,14 @@ class AIRaceEngineer(QWidget):
         )
         self.save_packet_btn.clicked.connect(self.save_packet_snapshot)
 
+        self.review_session_btn = QPushButton("REVIEW SESSION")
+        self.review_session_btn.setObjectName("ghostBtn")
+        self.review_session_btn.setCursor(Qt.PointingHandCursor)
+        self.review_session_btn.setToolTip(
+            "Open post-race strategy review for the latest sim_logs/sessions/*.jsonl recording."
+        )
+        self.review_session_btn.clicked.connect(self._open_review_dashboard)
+
         self.hotkey_hint = QLabel("")
         self.hotkey_hint.setObjectName("settingsHint")
         self.hotkey_hint.setWordWrap(True)
@@ -578,6 +600,7 @@ class AIRaceEngineer(QWidget):
         if not self._is_receiver:
             action_col.addWidget(self.btn)
             action_col.addWidget(self.save_packet_btn)
+            action_col.addWidget(self.review_session_btn)
             action_col.addWidget(self.hotkey_hint)
 
         tire_row = QHBoxLayout()
@@ -665,6 +688,10 @@ class AIRaceEngineer(QWidget):
         self.pit_defaults_btn.setToolTip("Sets pit-road loss from track length immediately.")
         self.pit_defaults_btn.clicked.connect(self._apply_track_default_pit_loss)
 
+        self.pit_source_label = QLabel("")
+        self.pit_source_label.setObjectName("subLabel")
+        self.pit_source_label.setWordWrap(True)
+
         clear_sec_init = int(self._config.get("clear_after_sec", 120))
         clear_on = clear_sec_init > 0
         auto_clear_row = QHBoxLayout()
@@ -717,6 +744,23 @@ class AIRaceEngineer(QWidget):
         auto_alert_row.addWidget(self.auto_pit_alerts_toggle)
         auto_pit_alert_desc = self._setting_desc(
             f"Shows the call and sends voice to the sim PC when a stop is due within {ALERT_LAP_HORIZON} laps."
+        )
+
+        session_rec_row = QHBoxLayout()
+        session_rec_row.setContentsMargins(0, 0, 0, 0)
+        session_rec_label = QLabel("Record session laps")
+        session_rec_label.setObjectName("subLabel")
+        self.session_recording_toggle = self._pill_toggle(
+            bool(self._config.get("session_recording", True))
+        )
+        self.session_recording_toggle.setToolTip(
+            "Save one telemetry packet per lap to sim_logs/sessions/ for post-race review."
+        )
+        session_rec_row.addWidget(session_rec_label)
+        session_rec_row.addStretch(1)
+        session_rec_row.addWidget(self.session_recording_toggle)
+        session_rec_desc = self._setting_desc(
+            "Enables JSONL recording and BASE PLAN sidecar for stop-timing comparison after the race."
         )
 
         voice_enable_row = QHBoxLayout()
@@ -803,6 +847,7 @@ class AIRaceEngineer(QWidget):
         self.voice_why_toggle.toggled.connect(self._on_voice_settings_changed)
         self.show_pit_impact_toggle.toggled.connect(self._on_show_pit_impact_toggled)
         self.auto_pit_alerts_toggle.toggled.connect(self._schedule_save_config)
+        self.session_recording_toggle.toggled.connect(self._on_session_recording_toggled)
         self.auto_track_pit_toggle.toggled.connect(lambda _v: self._schedule_save_config(0))
         self.auto_clear_toggle.toggled.connect(self._on_auto_clear_toggled)
         self.hotkey_enabled_toggle.toggled.connect(self._on_hotkey_settings_changed)
@@ -836,6 +881,7 @@ class AIRaceEngineer(QWidget):
             pit_body.addWidget(auto_pit_desc)
             pit_body.addWidget(self.pit_defaults_btn)
             pit_body.addWidget(pit_defaults_desc)
+            pit_body.addWidget(self.pit_source_label)
             sidebar_root.addWidget(pit_sec)
 
             voice_sec, voice_body = make_collapsible_section("VOICE", expanded=True)
@@ -864,6 +910,10 @@ class AIRaceEngineer(QWidget):
             settings_layout.addLayout(pit_row)
             settings_layout.addLayout(auto_pit_row)
             settings_layout.addWidget(self.pit_defaults_btn)
+            settings_layout.addWidget(self.pit_source_label)
+            settings_layout.addWidget(self._settings_heading("SESSION"))
+            settings_layout.addLayout(session_rec_row)
+            settings_layout.addWidget(session_rec_desc)
             settings_layout.addWidget(self._settings_heading("ADVICE"))
             settings_layout.addLayout(auto_clear_row)
             settings_layout.addWidget(clear_hint)
@@ -982,6 +1032,7 @@ class AIRaceEngineer(QWidget):
             self.layout.addLayout(action_col)
             if self.rejoin_label is not None:
                 self.layout.addWidget(self.rejoin_label)
+            self.layout.addWidget(self.pit_source_label)
             self.layout.addLayout(settings_toggle_row)
             self.layout.addWidget(self.settings_widget)
 
@@ -1032,6 +1083,8 @@ class AIRaceEngineer(QWidget):
         self._update_connection_badge()
         self._update_action_button_text()
         self._set_ai_status("Idle")
+        if not self._is_receiver:
+            self._update_pit_loss_source_label()
         if self._role == "receiver" and self._receiver_link is not None:
             self._connect_receiver_link()
 
@@ -1095,6 +1148,8 @@ class AIRaceEngineer(QWidget):
             data["voice_read_why"] = bool(self.voice_why_toggle.isChecked())
             data["show_pit_impact"] = bool(self.show_pit_impact_toggle.isChecked())
             data["auto_pit_alerts"] = bool(self.auto_pit_alerts_toggle.isChecked())
+            if not self._is_receiver:
+                data["session_recording"] = bool(self.session_recording_toggle.isChecked())
             data["analyze_hotkey"] = self._current_hotkey()
             data["analyze_hotkey_enabled"] = bool(self.hotkey_enabled_toggle.isChecked())
             if self._role == "receiver":
@@ -1241,7 +1296,16 @@ class AIRaceEngineer(QWidget):
         self.telemetry.update_field_history()
         self._maybe_sync_tire_sets_from_sdk()
         if self._role != "receiver":
-            self._check_auto_strategy()
+            self._maybe_record_session_lap()
+            self._maybe_consume_pit_loss_notice()
+            st = self.telemetry.session_state() if hasattr(self.telemetry, "session_state") else None
+            if (
+                st == SESSION_STATE_CHECKERED
+                and self._last_session_state != SESSION_STATE_CHECKERED
+            ):
+                self._maybe_prompt_session_review(reason="checkered")
+            self._last_session_state = st
+        self._check_auto_strategy()
 
     def _style_status_pill(self, label: QLabel, tone: str) -> None:
         if not self._is_receiver:
@@ -1280,6 +1344,14 @@ class AIRaceEngineer(QWidget):
         self._baseline_strategy_text = cleaned
         if self.baseline_strategy_label is not None:
             self.baseline_strategy_label.setText(cleaned)
+        if self._session_recorder is not None:
+            try:
+                save_session_meta(
+                    self._session_recorder.path,
+                    {"baseline_plan": cleaned},
+                )
+            except Exception:
+                pass
         self._apply_strategy_compare_layout()
 
     def _clear_baseline_strategy(self) -> None:
@@ -1361,6 +1433,34 @@ class AIRaceEngineer(QWidget):
         self._auto_monitor = reset_auto_monitor_state()
         self._auto_last_call_line = ""
         self._last_delivered_call_line = ""
+
+    def _maybe_record_session_lap(self) -> None:
+        if self._session_recorder is None:
+            return
+        if not self.telemetry.ensure_connected():
+            return
+        if self.telemetry.ui_mode() == "strategy":
+            return
+        get_state = getattr(self.telemetry, "get_monitor_state", None)
+        if not callable(get_state):
+            return
+        lap, _is_caution = get_state()
+        if lap is None:
+            return
+        try:
+            packet_json = self.telemetry.build_packet(
+                tire_sets_remaining=int(self.tire_spin.value()),
+                pit_loss_sec=int(self.pit_spin.value()),
+            )
+            telemetry = json.loads(packet_json)
+        except Exception:
+            return
+        if not isinstance(telemetry, dict):
+            return
+        try:
+            self._session_recorder.append_on_lap_change(telemetry)
+        except Exception:
+            pass
 
     def _check_auto_strategy(self) -> None:
         if not bool(self.auto_pit_alerts_toggle.isChecked()):
@@ -1499,6 +1599,118 @@ class AIRaceEngineer(QWidget):
         self._set_ai_status("Saved")
         self._set_advice_text(f"Packet saved → {path.resolve()}")
 
+    def _start_session_recorder(self) -> None:
+        if self._is_receiver:
+            return
+        try:
+            track = self.telemetry.track_name() if hasattr(self.telemetry, "track_name") else None
+            self._session_recorder = SessionRecorder.start(track_name=track)
+        except Exception:
+            self._session_recorder = None
+
+    def _on_session_recording_toggled(self, on: bool) -> None:
+        if self._is_receiver:
+            return
+        if on:
+            if self._session_recorder is None:
+                self._start_session_recorder()
+        else:
+            self._session_recorder = None
+        self._schedule_save_config(0)
+
+    def _session_path_for_review(self) -> Path | None:
+        from .session_recorder import load_session
+
+        if self._session_recorder is not None and self._session_recorder.path.is_file():
+            if self._session_recorder.packet_count >= MIN_REVIEW_LAPS:
+                return self._session_recorder.path
+        latest = latest_session_file()
+        if latest is None:
+            return None
+        try:
+            if len(load_session(latest)) >= MIN_REVIEW_LAPS:
+                return latest
+        except Exception:
+            return None
+        return None
+
+    def _maybe_prompt_session_review(self, *, reason: str) -> None:
+        if self._is_receiver:
+            return
+        path = self._session_path_for_review()
+        if path is None:
+            return
+        key = str(path.resolve())
+        if key in self._review_prompted_paths:
+            return
+        self._review_prompted_paths.add(key)
+        title = "Review session?"
+        if reason == "checkered":
+            text = f"Race finished — open strategy review for {path.name}?"
+        else:
+            text = f"Session ended — open strategy review for {path.name}?"
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            self._review_dashboard = open_review_dashboard(self, session_path=path)
+
+    def _update_pit_loss_source_label(self) -> None:
+        if not hasattr(self, "pit_source_label"):
+            return
+        if self._is_receiver and not self.telemetry.is_connected():
+            self.pit_source_label.setText("")
+            return
+        name = self.telemetry.track_name() if hasattr(self.telemetry, "track_name") else ""
+        length_mi = resolve_track_length_miles(
+            self.telemetry.track_length_miles() if hasattr(self.telemetry, "track_length_miles") else None
+        )
+        detail = resolve_track_pit_loss_detail(name, length_mi)
+        spin_val = int(self.pit_spin.value())
+        line = f"Pit loss source: {detail.label()}"
+        if abs(spin_val - int(detail.pit_loss_sec)) >= 1:
+            line += f" · spinner {spin_val}s"
+        self.pit_source_label.setText(line)
+
+    def _maybe_consume_pit_loss_notice(self) -> None:
+        pop = getattr(self.telemetry, "pop_pit_loss_learned_notice", None)
+        if not callable(pop):
+            return
+        notice = pop()
+        if notice is None:
+            return
+        pit_sec, track_name = notice
+        if self._pit_user_modified:
+            self._set_advice_text(
+                f"Learned pit loss for {track_name or 'track'}: {pit_sec:.0f}s (spinner unchanged — manual override)."
+            )
+        else:
+            self.pit_spin.blockSignals(True)
+            self.pit_spin.setValue(int(round(pit_sec)))
+            self.pit_spin.blockSignals(False)
+            self._set_advice_text(
+                f"Learned pit loss for {track_name or 'track'}: {pit_sec:.0f}s — applied to pit-road loss."
+            )
+        self._update_pit_loss_source_label()
+
+    def _open_review_dashboard(self) -> None:
+        if self._is_receiver:
+            self._set_advice_text("Session review is available on the sim PC (local mode).")
+            return
+        session_path = None
+        if self._session_recorder is not None and self._session_recorder.path.is_file():
+            session_path = self._session_recorder.path
+        else:
+            session_path = latest_session_file()
+        if session_path is None:
+            self._set_advice_text(
+                "No session recording found. Enable session_recording in config and run a race."
+            )
+            return
+        self._review_dashboard = open_review_dashboard(self, session_path=session_path)
+
     def clear_and_cancel(self):
         self._request_watchdog.stop()
         self._idle_clear_timer.stop()
@@ -1598,6 +1810,7 @@ class AIRaceEngineer(QWidget):
             return
 
         connected = self.telemetry.is_connected()
+        was_connected = self._last_sdk_connected
         ui_mode = self.telemetry.ui_mode() if connected else None
         if (
             not self._is_receiver
@@ -1618,18 +1831,21 @@ class AIRaceEngineer(QWidget):
             self.conn_badge.setStyleSheet(
                 "QLabel#connBadge { border-color: rgba(231, 76, 60, 160); }"
             )
-            if self._last_sdk_connected:
+            if was_connected:
                 self._reset_auto_monitor()
                 self._clear_baseline_strategy()
+                self._maybe_prompt_session_review(reason="disconnect")
 
         # On initial connect or reconnect, set a sensible default pit-loss
         # (but only if the user hasn't overridden it).
-        if connected and (self._last_sdk_connected is None or self._last_sdk_connected is False):
+        if connected and (was_connected is None or was_connected is False):
             self._maybe_set_default_pit_loss()
             self._maybe_sync_tire_sets_from_sdk()
             self._reset_auto_monitor()
             self._clear_baseline_strategy()
+            self._last_session_state = None
         self._last_sdk_connected = connected
+        self._update_pit_loss_source_label()
         self._apply_strategy_compare_layout()
         self._update_action_button_text()
 
@@ -1690,12 +1906,14 @@ class AIRaceEngineer(QWidget):
 
         name = self.telemetry.track_name() or ""
         length_mi = resolve_track_length_miles(self.telemetry.track_length_miles())
-        default_sec = int(get_default_pit_loss_seconds(name, length_mi))
+        detail = resolve_track_pit_loss_detail(name, length_mi)
+        default_sec = int(detail.pit_loss_sec)
 
         # Set without marking as user-modified.
         self.pit_spin.blockSignals(True)
         self.pit_spin.setValue(default_sec)
         self.pit_spin.blockSignals(False)
+        self._update_pit_loss_source_label()
 
     def _set_ai_status(self, status: str):
         self.ai_badge.setText(f"Engine · {status}")

@@ -121,6 +121,10 @@ LONG_RACE_LARGE_TRACK_LENGTH_MI = 2.5
 
 # End-of-race / caution track-position guards (strategy_engine.py)
 WHITE_FLAG_LAPS_REMAINING = 1
+# Green-white-checkered / overtime fuel reserve on ovals (strategy_engine.py)
+GWC_OVAL_LAPS_REMAIN_MAX = 3
+GWC_FUEL_RESERVE_LAPS = 1.0
+FUEL_CRITICAL_LAPS_DEFAULT = 1.0
 CAUTION_STAY_OUT_TOP_POSITION = 10
 CAUTION_STAY_OUT_MIN_SPOTS_LOST = 1
 CAUTION_GREEN_RUN_BUFFER_LAPS = 5

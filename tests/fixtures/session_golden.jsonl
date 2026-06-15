@@ -1,0 +1,4 @@
+{"m": {"l": 1, "p": 8, "lr": 19, "fl": 20.0, "pr": false, "ps": false, "lp": 0}, "s": {"lt": 20, "flb": {}, "tn": "Test Speedway"}, "r": {"pl": 46, "ftl": 22}, "fi": {"sm": {"n": "GREEN"}}}
+{"m": {"l": 2, "p": 7, "lr": 18, "fl": 19.0, "pr": false, "ps": false, "lp": 0}, "s": {"lt": 20, "flb": {}}, "r": {"pl": 46, "ftl": 22}}
+{"m": {"l": 3, "p": 6, "lr": 17, "fl": 18.0, "pr": true, "ps": false, "lp": 2}, "s": {"lt": 20, "flb": {}}, "r": {"pl": 46, "ftl": 22}}
+{"m": {"l": 4, "p": 9, "lr": 16, "fl": 17.0, "pr": false, "ps": false, "lp": 3}, "s": {"lt": 20, "flb": {}}, "r": {"pl": 46, "ftl": 22}}

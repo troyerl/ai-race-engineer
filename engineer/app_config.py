@@ -22,6 +22,7 @@ def _apply_feature_toggle_defaults(c: dict, *, force_all_on: bool = False) -> No
         "auto_apply_track_pit_loss",
         "analyze_hotkey_enabled",
         "auto_pit_alerts",
+        "session_recording",
     )
     if force_all_on:
         for key in toggles:

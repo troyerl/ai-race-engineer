@@ -213,6 +213,20 @@ class DriverContextTracker:
         self._last_cool_tires_lap: int | None = None
         self._last_divebomb_voice_at: float | None = None
         self.current_mode: StrategyMode = StrategyMode.BALANCED
+        self._high_lat_sector_start = HIGH_LAT_SECTOR_START
+        self._high_lat_sector_end = HIGH_LAT_SECTOR_END
+
+    def set_high_lat_sector(self, start: float | None, end: float | None) -> None:
+        """Override default corner sector bounds (from track DB / practice learning)."""
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            lo = float(start)
+            hi = float(end)
+            if 0.0 <= lo < hi <= 1.0:
+                self._high_lat_sector_start = lo
+                self._high_lat_sector_end = hi
+                return
+        self._high_lat_sector_start = HIGH_LAT_SECTOR_START
+        self._high_lat_sector_end = HIGH_LAT_SECTOR_END
 
     def set_incident_limit(self, limit: int | None) -> None:
         if limit is not None and limit > 0:
@@ -269,7 +283,10 @@ class DriverContextTracker:
                 steer_f = None
 
         speed_mps = _as_float(ir_get("Speed", 0.0), 0.0)
-        in_corner = HIGH_LAT_SECTOR_START <= lap_dist <= HIGH_LAT_SECTOR_END and lat_g >= STEER_SAMPLE_LAT_G
+        in_corner = (
+            self._high_lat_sector_start <= lap_dist <= self._high_lat_sector_end
+            and lat_g >= STEER_SAMPLE_LAT_G
+        )
 
         in_draft = (
             not is_caution

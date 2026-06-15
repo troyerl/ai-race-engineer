@@ -42,6 +42,14 @@ from .race_constants import (
 )
 from .context_engine import DriverContextTracker
 from .pre_race_strategy import find_race_session, race_lap_total_from_session
+from .track_db import (
+    SectorLearner,
+    get_track_database,
+    is_oval_track,
+    normalize_track_key,
+    resolve_high_lat_sector,
+)
+from .tire_model import compute_stagger_from_corners, effective_tire_falloff_s
 
 # AI-facing packet uses US customary fuel units (internal math stays liters + kg/h).
 _KG_TO_LB = 2.204622621847693185
@@ -774,6 +782,12 @@ class TelemetryTracker:
         self._incident_limit_loaded = False
         self._clean_lap_gate = CleanLapGate()
 
+        self._track_db = get_track_database()
+        self._active_track_key: str | None = None
+        self._sector_learner = SectorLearner()
+        self._last_sector_flush_lap: int | None = None
+        self._pit_loss_learned_notice: tuple[float, str] | None = None
+
     def ensure_connected(self) -> bool:
         if not self.ir.is_connected:
             self.ir.startup()
@@ -821,6 +835,22 @@ class TelemetryTracker:
         flags = _parse_session_flags_bools(self._ir_get("SessionFlags", 0), self._ir_get("PitsOpen", None))
         is_caution = bool(flags.get("yel") or flags.get("cau"))
         return lap, is_caution
+
+    def session_state(self) -> int | None:
+        """iRacing SessionState (5 = checkered)."""
+        if not self.is_connected():
+            return None
+        try:
+            raw = self._ir_get("SessionState", None)
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def pop_pit_loss_learned_notice(self) -> tuple[float, str] | None:
+        """Return and clear a one-shot (seconds, track name) after a measured pit stop."""
+        notice = self._pit_loss_learned_notice
+        self._pit_loss_learned_notice = None
+        return notice
 
     def _ir_get(self, key: str, default=None):
         try:
@@ -1198,6 +1228,98 @@ class TelemetryTracker:
                 return v.strip()
         return None
 
+    def _is_practice_like_session(self) -> bool:
+        session_type = str(self._ir_get("SessionType", "") or "").strip().lower()
+        session_name = str(self._ir_get("SessionName", "") or "").strip().upper()
+        if session_type in ("practice", "test", "open"):
+            return True
+        if session_name in ("PRACTICE", "OPEN", "TEST", "QUALIFY", "QUALIFYING"):
+            return True
+        return False
+
+    def _sync_track_profile(self) -> None:
+        name = self.track_name()
+        key = normalize_track_key(name) if name else None
+        if key == self._active_track_key:
+            return
+        self._flush_sector_learning()
+        self._active_track_key = key
+        self._sector_learner.reset()
+        self._last_sector_flush_lap = None
+        if name:
+            start, end = resolve_high_lat_sector(name)
+            self._ctx.set_high_lat_sector(start, end)
+        else:
+            self._ctx.set_high_lat_sector(None, None)
+
+    def _tick_sector_learning(self, *, on_track: bool) -> None:
+        if not on_track or not self._is_practice_like_session() or not self._active_track_key:
+            return
+        ldp = clamp_lap_distance_pct(self._ir_get("LapDistPct", None))
+        if ldp is None:
+            return
+        try:
+            lat_g = abs(float(self._ir_get("LatAccel", 0.0) or 0.0)) / 9.81
+        except (TypeError, ValueError):
+            return
+        self._sector_learner.observe(ldp, lat_g)
+
+    def _maybe_persist_sector_map(self, lap: int) -> None:
+        if not self._is_practice_like_session() or not self._active_track_key:
+            return
+        if self._last_sector_flush_lap == lap:
+            return
+        self._last_sector_flush_lap = lap
+        result = self._sector_learner.compute_sector()
+        if result is None:
+            return
+        start, end, peak = result
+        self._track_db.record_learned_sector(
+            self._active_track_key,
+            display_name=self.track_name(),
+            sector_start=start,
+            sector_end=end,
+            peak_lat_g=peak,
+            sample_count=self._sector_learner.sample_count,
+        )
+        self._ctx.set_high_lat_sector(start, end)
+
+    def _flush_sector_learning(self) -> None:
+        if not self._active_track_key:
+            return
+        if not self._is_practice_like_session():
+            self._sector_learner.reset()
+            return
+        result = self._sector_learner.compute_sector()
+        if result is None:
+            return
+        start, end, peak = result
+        self._track_db.record_learned_sector(
+            self._active_track_key,
+            display_name=self.track_name(),
+            sector_start=start,
+            sector_end=end,
+            peak_lat_g=peak,
+            sample_count=self._sector_learner.sample_count,
+        )
+
+    def _maybe_record_measured_pit_loss(self) -> None:
+        pit_sec = float(self._cumulative_pit_time_s)
+        if pit_sec < 8.0 or not self._active_track_key:
+            self._cumulative_pit_time_s = 0.0
+            return
+        self._track_db.record_measured_pit_loss(
+            self._active_track_key,
+            display_name=self.track_name(),
+            length_mi=self.track_length_miles(),
+            pit_loss_sec=pit_sec,
+        )
+        self._pit_loss_learned_notice = (
+            round(float(pit_sec), 1),
+            str(self.track_name() or ""),
+        )
+        self._cumulative_pit_time_s = 0.0
+
     def get_session_yaml_dict(self) -> dict[str, Any] | None:
         """Parse iRacing SessionInfo YAML for pre-race strategy."""
         if not self.is_connected():
@@ -1310,6 +1432,8 @@ class TelemetryTracker:
         if not self.ensure_connected():
             return
 
+        self._sync_track_profile()
+
         # Track pit road transitions to estimate current tire stint length.
         on_pit_road = bool(self._ir_get("OnPitRoad", False))
         in_stall = bool(self._ir_get("PlayerCarInPitStall", False))
@@ -1357,6 +1481,7 @@ class TelemetryTracker:
                 if isinstance(lap_now, int):
                     self._stint_start_lap = lap_now
                     self._last_pit_lap = lap_now
+                self._maybe_record_measured_pit_loss()
                 fuel_level = clamp_nonneg_liters(self._ir_get("FuelLevel", 0.0))
                 fuel_cap = self._ir_get("FuelCapacity", None)
                 try:
@@ -1421,6 +1546,9 @@ class TelemetryTracker:
             self._reset_fuel_ema_for_green_restart(lap_now, fuel_level)
         self._last_is_caution = is_caution
         on_track = bool(self._ir_get("IsOnTrack", False))
+        self._tick_sector_learning(on_track=on_track)
+        if isinstance(lap_now, int):
+            self._maybe_persist_sector_map(lap_now)
         avg_lap_s = self._avg_lap_s_for_idx(player_idx, fallback=DEFAULT_AVG_LAP_S)
         ahead_idx = self._idx_by_class_pos(player_pos - 1) if player_pos else None
         behind_idx = self._idx_by_class_pos(player_pos + 1) if player_pos else None
@@ -1854,6 +1982,20 @@ class TelemetryTracker:
         race_laps_total = race_lap_total_from_session(race_session)
         tire_set_limit = self.read_tire_set_limit()
 
+        track_nm = self.track_name()
+        length_mi = self.track_length_miles()
+        track_type_raw = self._ir_get("TrackType", None) or self._ir_get("TrackCategory", None)
+        track_is_oval = is_oval_track(
+            track_nm,
+            track_length_miles=length_mi,
+            track_type=str(track_type_raw) if track_type_raw is not None else None,
+        )
+        stagger = (
+            compute_stagger_from_corners(tire_wear_last_known)
+            if track_is_oval and tire_wear_last_known
+            else None
+        )
+
         # Compact schema to reduce tokens (short keys, no nulls, rounded floats).
         fc_us_gal = None
         try:
@@ -1882,6 +2024,10 @@ class TelemetryTracker:
                 "cls": player_class,
                 "flb": flags_bools,
                 "pto": pit_lane_penalty_s,
+                "tn": track_nm,
+                "tlmi": round(float(length_mi), 3) if isinstance(length_mi, (int, float)) else None,
+                "tcat": str(track_type_raw).strip() if track_type_raw is not None else None,
+                "ov": 1 if track_is_oval else 0,
             },
             "m": {  # me
                 "l": self._ir_get("Lap", None),
@@ -1966,6 +2112,10 @@ class TelemetryTracker:
         fi_extra = ctx_extras.get("fi")
         if isinstance(fi_extra, dict) and fi_extra:
             packet.setdefault("fi", {}).update(fi_extra)
+
+        if stagger:
+            packet["m"]["stg"] = stagger
+        packet["m"]["foe"] = effective_tire_falloff_s(packet)
 
         if session_yaml:
             packet["sy"] = session_yaml

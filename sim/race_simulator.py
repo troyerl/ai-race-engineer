@@ -45,8 +45,10 @@ from engineer.race_constants import (
     THERMAL_WARM_C,
     get_default_pit_loss_seconds,
 )
+from engineer.track_db import resolve_high_lat_sector, resolve_track_pit_loss_seconds
 from engineer.telemetry import CleanLapGate
 from engineer.speech import _speech_lines
+from sim.fuel_ema import SimFuelTracker
 from engineer.strategy_engine import (
     evaluate_and_forecast_strategy,
     incident_push_advice,
@@ -63,6 +65,13 @@ _TRK_APPROACHING_PITS = 2
 MIN_FIELD_SIZE = 22
 MAX_FIELD_SIZE = 40
 DEFAULT_FIELD_SIZE = 32
+
+# Sub-lap context polls per green-flag lap: (LapDistPct, SteeringWheelAngle, LatAccel).
+SIM_LAP_CONTEXT_SAMPLES: tuple[tuple[float, float, float], ...] = (
+    (0.12, 0.05, 11.0),
+    (0.42, 0.14, 14.0),
+    (0.78, 0.06, 11.5),
+)
 
 
 def clamp_field_size(size: int) -> int:
@@ -238,7 +247,7 @@ def _register_scenario(scenario: RaceScenario) -> RaceScenario:
     scenario.field_size = fs
     scenario.hero_position = hp
     if scenario.track_length_miles is not None:
-        scenario.pit_loss_sec = get_default_pit_loss_seconds(
+        scenario.pit_loss_sec = resolve_track_pit_loss_seconds(
             scenario.track_name,
             float(scenario.track_length_miles),
         )
@@ -1098,6 +1107,14 @@ class RaceSimulator:
         self._pass_streak = 0
         self._passed_from_behind_streak = 0
         self._clean_lap_gate = CleanLapGate()
+        self._fuel_tracker = SimFuelTracker(
+            tank_laps=scenario.fuel_tank_laps,
+            fuel_laps_left=self.fuel_laps_left,
+        )
+        self._prev_is_caution = False
+        if scenario.track_name:
+            sec_start, sec_end = resolve_high_lat_sector(scenario.track_name)
+            self.context.set_high_lat_sector(sec_start, sec_end)
         self._apply_start_state()
         self._apply_hero_lap_seed()
 
@@ -1140,6 +1157,7 @@ class RaceSimulator:
 
         if st.fuel_laps_left is not None:
             self.fuel_laps_left = st.fuel_laps_left
+            self._fuel_tracker.sync_from_fuel_laps(st.fuel_laps_left)
         if st.tire_sets_remaining is not None:
             self.tire_sets_remaining = st.tire_sets_remaining
 
@@ -1243,6 +1261,7 @@ class RaceSimulator:
         self.hero.pit(lap=lap)
         self._apply_pit_position_loss(spots)
         self.fuel_laps_left = self.scenario.fuel_tank_laps
+        self._fuel_tracker.sync_from_fuel_laps(self.fuel_laps_left)
         self.tire_sets_remaining = max(0, self.tire_sets_remaining - 1)
         self.context.reset_stint(track_temp_c=32.0)
         self._clean_lap_gate.reset_stint()
@@ -1464,6 +1483,22 @@ class RaceSimulator:
         telemetry: dict[str, Any],
         irsdk: SimIRSDK,
     ) -> dict[str, Any]:
+        self._context_poll_irsdk(
+            lap=lap,
+            is_caution=is_caution,
+            telemetry=telemetry,
+            irsdk=irsdk,
+        )
+        return self._build_context_extras(telemetry)
+
+    def _context_poll_irsdk(
+        self,
+        *,
+        lap: int,
+        is_caution: bool,
+        telemetry: dict[str, Any],
+        irsdk: SimIRSDK,
+    ) -> None:
         m = telemetry.get("m", {})
         rv = telemetry.get("rv", {})
         ahead = rv.get("ahead", {}) if isinstance(rv.get("ahead"), dict) else {}
@@ -1497,6 +1532,12 @@ class RaceSimulator:
             tire_falloff_s=float(m.get("fo", 0)),
         )
 
+    def _build_context_extras(self, telemetry: dict[str, Any]) -> dict[str, Any]:
+        m = telemetry.get("m", {})
+        rv = telemetry.get("rv", {})
+        ga = m.get("ga")
+        gb = m.get("gb")
+        gap_behind = float(gb) if isinstance(gb, (int, float)) else None
         fi = telemetry.get("fi", {})
         rej = fi.get("rej", {}) if isinstance(fi.get("rej"), dict) else {}
         track_temp = self.scenario.track_temp_c if self.scenario.track_temp_c is not None else 32.0
@@ -1509,9 +1550,66 @@ class RaceSimulator:
             rivals=rv,
             you_pace=m.get("pc", {}),
             reentry_verdict=str(rej.get("v", "CLEAN")),
-            current_lap=lap,
+            current_lap=int(m.get("l", 0) or 0),
             gap_behind_s=gap_behind,
         )
+
+    def _poll_context_multi_sample(
+        self,
+        *,
+        lap: int,
+        is_caution: bool,
+        telemetry: dict[str, Any],
+        sim_extras: dict[str, Any],
+        ir_overrides: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run several sub-lap IRSDK polls so steering / divebomb paths get exercised."""
+        tactical_meta = sim_extras.get("tactical", {})
+        apex_baseline = tactical_meta.get("apex_baseline_speed")
+        if apex_baseline and not is_caution:
+            self.context._apex_speed_baseline = float(apex_baseline)
+
+        base_irsdk = sim_extras.get("irsdk", {})
+        if self.context._prev_steer is None and float(base_irsdk.get("SteeringWheelAngle", 0.05)) > 0.08:
+            self.context._prev_steer = 0.02
+
+        samples: tuple[tuple[float, float, float], ...]
+        if is_caution:
+            samples = (
+                (
+                    float(base_irsdk.get("LapDistPct", 0.12)),
+                    float(base_irsdk.get("SteeringWheelAngle", 0.05)),
+                    float(base_irsdk.get("LatAccel", 11.0)),
+                ),
+            )
+        else:
+            samples = SIM_LAP_CONTEXT_SAMPLES
+
+        for ldp, steer, lat in samples:
+            irsdk_state = {
+                **base_irsdk,
+                "LapDistPct": ldp,
+                "SteeringWheelAngle": steer,
+                "LatAccel": lat,
+                **ir_overrides,
+            }
+            irsdk = SimIRSDK({"Lap": lap, **irsdk_state})
+            self._context_poll_irsdk(
+                lap=lap,
+                is_caution=is_caution,
+                telemetry=telemetry,
+                irsdk=irsdk,
+            )
+
+        return self._build_context_extras(telemetry)
+
+    def _apply_fuel_ema_to_packet(self, packet: dict[str, Any], *, lap: int) -> None:
+        """Inject ``m.ful`` / ``m.fpe`` after context polls."""
+        # Sim burn is abstract (1 green lap = nominal liters); do not apply draft skip here.
+        self._fuel_tracker.on_lap_boundary(lap, exclude_sample=False)
+        m = packet.setdefault("m", {})
+        if isinstance(m, dict):
+            m.update(self._fuel_tracker.packet_m_fields())
 
     @staticmethod
     def _merge_extras(packet: dict[str, Any], extras: dict[str, Any]) -> None:
@@ -1540,6 +1638,11 @@ class RaceSimulator:
             self._step_caution_physics(caution)  # type: ignore[arg-type]
         else:
             self._step_green_physics(lap)
+
+        was_caution = self._prev_is_caution
+        self._fuel_tracker.sync_from_fuel_laps(self.fuel_laps_left)
+        if was_caution and not is_caution:
+            self._fuel_tracker.reset_for_green_restart(lap)
 
         if not (self.hero.on_pit_road or self.hero.in_stall):
             self._commit_hero_clean_lap(lap=lap, is_caution=is_caution)
@@ -1572,20 +1675,20 @@ class RaceSimulator:
             _apply_fi_patch(base_packet.setdefault("fi", {}), sim_extras["fi_patch"])
 
         ir_overrides = self.scenario.irsdk_overrides.get(lap, {})
-        irsdk_state = {**sim_extras["irsdk"], **ir_overrides}
-        tactical_meta = sim_extras.get("tactical", {})
-        apex_baseline = tactical_meta.get("apex_baseline_speed")
-        if apex_baseline and not is_caution:
-            self.context._apex_speed_baseline = float(apex_baseline)
-        if self.context._prev_steer is None and float(irsdk_state.get("SteeringWheelAngle", 0.05)) > 0.08:
-            self.context._prev_steer = 0.02
 
-        irsdk = SimIRSDK({"Lap": lap, **irsdk_state})
-
-        extras = self._poll_context(lap=lap, is_caution=is_caution, telemetry=base_packet, irsdk=irsdk)
+        extras = self._poll_context_multi_sample(
+            lap=lap,
+            is_caution=is_caution,
+            telemetry=base_packet,
+            sim_extras=sim_extras,
+            ir_overrides=ir_overrides,
+        )
         packet = json.loads(json.dumps(base_packet))
         packet.setdefault("r", {})["ts"] = self.tire_sets_remaining
         self._merge_extras(packet, extras)
+        self._apply_fuel_ema_to_packet(packet, lap=lap)
+
+        self._prev_is_caution = is_caution
 
         advice = resolve_live_advice(packet, mode="live")
         tactical_alerts = _collect_tactical_alerts(packet)

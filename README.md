@@ -37,6 +37,8 @@ tests/                  # unittest suite (169 tests)
 docs/
   CALCULATIONS.md       # Formula & decision reference
   SIMULATIONS.md        # Offline sim guide
+  ROADMAP.md            # Planned expansions (Phase B–D)
+  FEATURES.md           # Feature list
 assets/                 # icon.png, icon.ico, UI SVGs
 scripts/                # make_icon_ico.py, build_windows.bat, build_mac.sh
 ```

@@ -9,7 +9,10 @@ Primary source files:
 | Telemetry ingestion & packet | `engineer/telemetry.py` |
 | Live calls & forecast | `engineer/strategy_engine.py` |
 | Garage / pre-race plan | `engineer/pre_race_strategy.py` |
-| Track pit-loss default | `engineer/ui.py` |
+| Track pit-loss default | `engineer/ui.py`, `engineer/track_db.py` |
+| Session record / replay | `engineer/session_recorder.py` |
+| Post-race analytics | `engineer/session_report.py`, `engineer/review_dashboard.py` |
+| Predictive tire / stagger | `engineer/tire_model.py` |
 | Receiver LAN snapshots | `engineer/remote_telemetry.py`, `engineer/race_memory.py` |
 | Voice relay | `engineer/speech.py`, `engineer/broadcaster_ui.py` |
 | Auto-alert orchestration | `engineer/auto_alert_engine.py` |
@@ -17,7 +20,7 @@ Primary source files:
 | Shared scalars | `engineer/race_constants.py` |
 | Offline race simulation | `sim/race_simulator.py` |
 
-§§1–16 = **implemented** in the repository (SDK fields may be missing per car/session; documented fallbacks apply).
+§§1–17 = **implemented** in the repository (SDK fields may be missing per car/session; documented fallbacks apply).
 
 ---
 
@@ -243,6 +246,29 @@ For lap = 1, 2, 3, …:
 
 `falloff_s` = `m.fo` (avg_last3 − best lap). Strategy engine falls back to the same function via `_resolve_pit_payback_laps()` when `m.pb` is absent.
 
+### 3.6 Predictive falloff & oval stagger
+
+`engineer/tire_model.py` computes **`effective_tire_falloff_s()`** — a multiplier-adjusted falloff used by `_tire_pit_worth_it()` when deciding if tires justify a stop:
+
+```
+effective_falloff = m.fo × product(multipliers)
+```
+
+Multipliers apply when:
+
+| Signal | Packet field | Effect |
+|--------|--------------|--------|
+| Greasy thermal | `m.drv.tsn == GREASY` | ×1.15 |
+| High steering fatigue | `m.drv.ssr ≥ STEER_STD_HIGH` | ×1.10 |
+| Elevated steering | `m.drv.ssr ≥ STEER_STD_ELEVATED` | ×1.05 |
+| Hot track vs baseline | `s.ttc` shift | ×1.08 |
+| Wear rate present | `m.twr` corners | ×1.10 |
+| Oval stagger (left vs right tread) | `m.stg.dg` | ×1.12 (warn) or ×1.22 (severe) |
+
+**Stagger** (`compute_stagger_from_corners`): average LF/LR vs RF/RR tread remaining; exposed as `m.stg = {la, ra, dg}` when corner wear is available. Warn threshold: **3.0** pp delta; severe: **6.0** pp.
+
+Packet also exposes **`m.foe`** = effective falloff for dashboard/debug. Live `m.fo` from §3.4 is unchanged; predictive layer only affects pit-worthiness gates.
+
 ---
 
 ## 4. Pit window helpers
@@ -446,6 +472,16 @@ Voice (`speech.py`): *"Stay out, stay out. Pitting now puts us a lap down. Exten
 
 Defined in `race_constants.py` as `get_default_pit_loss_seconds(track_name, track_length_miles)`.
 
+**Track database** (`engineer/track_db.py`, SQLite at `~/.ai_race_engineer_tracks.db`):
+
+```
+resolve_track_pit_loss_seconds(track_name, track_length_miles)
+  → measured pit_loss_sec from DB row when present
+  → else get_default_pit_loss_seconds() heuristic (§9 table)
+```
+
+The UI calls this when **Auto pit loss on connect** is on. Measured pit stops and curated seed rows (ovals, road courses) improve on the length-only heuristic. **Sector learning** (`SectorLearner` in practice) persists peak `|LatAccel|` vs `LapDistPct` per track; `DriverContextTracker.set_high_lat_sector()` uses the learned window instead of static 0.33–0.55 defaults.
+
 When **Auto pit loss on connect** is on and you have not manually changed pit loss:
 
 | Track type | Rule | Constant / value |
@@ -473,8 +509,18 @@ fuel_laps_left = m.fl
 target_stop    = m.l + floor(_fuel_laps_for_pit_window())
 inside_window  = (m.l ≥ target_stop − m.pb) OR (fuel_laps_left ≤ m.pb)
                  # when m.mk: inside_window = fuel_laps_left ≤ m.pb only
-fuel_critical  = fuel_laps_left ≤ 1
+fuel_critical  = fuel_laps_left ≤ _fuel_critical_threshold()   # §10.1.1
 ```
+
+### 10.1.1 GWC / overtime fuel reserve (ovals)
+
+When **all** of the following hold:
+
+- Race session (`SessionType` race)
+- Oval track (`track_db.is_oval` or name heuristic)
+- `0 < m.lr ≤ GWC_OVAL_LAPS_REMAIN_MAX` (3 laps to checkered)
+
+…then `_fuel_critical_threshold()` adds **`GWC_FUEL_RESERVE_LAPS` (1.0)** to the default 1-lap critical floor. This reserves fuel for a potential green-white-checker extra lap without changing the core forecast math. `_gwc_overtime_prep()` also gates coast-to-checkered and GWC-specific advice headlines.
 
 **Untrusted:**
 
@@ -808,6 +854,8 @@ All alignment scalars live in **`race_constants.py`** (GridNotes v1.0.x — Sect
 | Pre-race tire cost buffer | `TIRE_COST_THRESHOLD_BUMP` | 30.0 s | `pre_race_strategy.py` |
 | Fuel laps clamp multiplier | `FUEL_LAPS_CLAMP_MULTIPLIER` | 2.0 | `telemetry.py` |
 | Fuel laps clamp offset | `FUEL_LAPS_CLAMP_OFFSET` | 30.0 laps | `telemetry.py` |
+| GWC oval laps remain max | `GWC_OVAL_LAPS_REMAIN_MAX` | 3 laps | `race_constants.py` |
+| GWC fuel reserve | `GWC_FUEL_RESERVE_LAPS` | 1.0 lap | `race_constants.py` |
 | Super pit loss | `PIT_LOSS_SUPER_SEC` | 58.0 s | `race_constants.py` → `ui.py` |
 | Short pit loss | `PIT_LOSS_SHORT_SEC` | 42.0 s | `race_constants.py` → `ui.py` |
 | Intermediate pit loss | `PIT_LOSS_INTERMEDIATE_SEC` | 46.0 s | `race_constants.py` → `ui.py` |
@@ -1078,4 +1126,61 @@ Constants for §16 live in `race_constants.py`; engineer-call text and priority 
 
 ---
 
-*This file describes behavior as implemented in the repository (§§1–16). iRacing SDK availability varies by car/session; when data is missing, documented fallbacks apply.*
+## 17. Post-race session analytics
+
+Deterministic reporting only — **no changes** to live `resolve_live_advice()` rules. Modules: `engineer/session_recorder.py`, `engineer/session_report.py`, `engineer/review_dashboard.py`.
+
+### 17.1 Session recording
+
+When `"session_recording": true` in `~/.ai_race_engineer.json` (local/sim PC), `SessionRecorder` appends one telemetry packet per completed lap to:
+
+```
+sim_logs/sessions/session_<track_slug>_<UTC_ts>.jsonl
+```
+
+Optional sidecar metadata (written when BASE PLAN is pinned during recording):
+
+```
+sim_logs/sessions/session_<track_slug>_<UTC_ts>.meta.json
+  { "baseline_plan": "<garage strategy text>" }
+```
+
+### 17.2 Replay
+
+`replay_session(path)` loads JSONL packets and runs each through the **production** stack:
+
+```
+resolve_live_advice(packet, mode="live")
+evaluate_auto_alert_tick(...)   # optional
+```
+
+Returns per-packet advice, call line, and auto-alert decision — same path as live Analyze.
+
+### 17.3 Report metrics (`build_session_report`)
+
+| Metric | Source | Formula / rule |
+|--------|--------|----------------|
+| Grid → finish | First / last lap `m.p` | `position_delta = start − finish` (positive = positions gained) |
+| Pit events | `m.pr` or `m.ps` rising edge | One event per pit entry; skip consecutive pit-road laps |
+| Pit position delta | Position at pit lap vs next lap | `positions_delta = after − at_pit` |
+| Stint pace σ | `m.pc.std_clean_s` per green stint | `pstdev(samples)` when stint has ≥3 clean-lap samples |
+| Planned stops | `parse_planned_stop_laps(baseline)` | Regex on `L12`, `lap N` near pit/stop keywords |
+| Actual stops | Pit event lap numbers | — |
+| Stop timing delta | Per stop index | `actual_lap − planned_lap` |
+| Notable calls | Replay call lines | PIT / STAY OUT / GUARD INSIDE / COOL TIRES when line changes |
+
+### 17.4 Executive summary (D3)
+
+`generate_executive_summary(report)` produces plain-language sentences from the metrics above (position change, pace consistency bands, pit net position, stop timing vs plan). Included in markdown export and the review dashboard. Optional LLM rewrite can consume exported JSON without touching the cockpit engine.
+
+### 17.5 CLI & UI
+
+| Entry | Purpose |
+|-------|---------|
+| `scripts/post_race_report.py` | Markdown or `--json` export; `--no-replay` for fast metrics-only |
+| `scripts/replay_session.py` | Lap-by-lap advice replay to stdout |
+| **REVIEW SESSION** (local overlay) | Qt timeline: pos, fuel, mode, thermal, replayed calls + optional BASE PLAN |
+
+---
+
+*This file describes behavior as implemented in the repository (§§1–17). iRacing SDK availability varies by car/session; when data is missing, documented fallbacks apply.*

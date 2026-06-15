@@ -41,9 +41,37 @@ python3 race_simulator.py --scenario undercut --laps 30 --log sim_logs/my_run.lo
 
 # Run every built-in scenario (logs under sim_logs/)
 python3 scripts/run_all_simulations.py
+
+# Replay a recorded live session (JSONL under sim_logs/sessions/)
+python3 scripts/replay_session.py sim_logs/sessions/session_my_track_20260101_120000.jsonl -v
+
+# Post-race report (markdown or JSON; uses newest session if path omitted)
+python3 scripts/post_race_report.py sim_logs/sessions/session_my_track_20260101_120000.jsonl
+python3 scripts/post_race_report.py -o sim_logs/report.md
+python3 scripts/post_race_report.py --json -o sim_logs/report.json
 ```
 
-No iRacing install required. Uses the same Python environment as the app (`python3 -m unittest discover -s tests` includes `tests/test_race_simulator.py`).
+Enable live session recording by setting `"session_recording": true` in `~/.ai_race_engineer.json` (local/sim PC). One packet per lap is appended automatically while connected. Pin a garage **BASE PLAN** before going on track to save it in the session `.meta.json` sidecar for stop-timing comparison.
+
+No iRacing install required.
+
+---
+
+## Session recording & post-race analytics
+
+Recorded sessions exercise the **same production strategy path** as live Analyze, but offline:
+
+1. **Record** — `SessionRecorder` writes JSONL under `sim_logs/sessions/` (one packet per lap).
+2. **Replay** — `scripts/replay_session.py` runs `resolve_live_advice()` (+ auto-alerts) on each packet.
+3. **Report** — `scripts/post_race_report.py` builds deterministic metrics (pit position deltas, stint σ, stop timing vs BASE PLAN) via `engineer/session_report.py`.
+4. **Review UI** — local overlay **REVIEW SESSION** opens `engineer/review_dashboard.py` (timeline + executive summary).
+
+Calculation reference for report metrics: [CALCULATIONS.md §17](CALCULATIONS.md#17-post-race-session-analytics).
+
+```bash
+# Fast metrics-only (skip replay)
+python3 scripts/post_race_report.py session.jsonl --no-replay
+```
 
 ---
 
@@ -53,8 +81,8 @@ Each simulated lap:
 
 1. **Physics step** — green-flag pace/tire wear/gap evolution, or caution pacing (compressed 0.15s gaps, no draft).
 2. **Packet build** — `m`, `s`, `r`, `fi`, `rv`, `x` shaped like live telemetry (`compute_reentry_verdict()` for `fi.rej`).
-3. **Tactical telemetry synthesis** — `generate_simulated_packet_extras()` maps scenario state + `irsdk_overrides` into `SimIRSDK` vars (`Speed`, tire temps, corner sector) and optional `fi.hd` / `fi.cpi` patches.
-4. **Context poll** — `DriverContextTracker.poll(..., is_caution=...)` + `build_packet_extras()` → `fi.sm`, `fi.odi`, `fi.tac`, `m.drv` (apex loss, thermal stress).
+3. **Context poll** — three sub-lap IRSDK samples per green lap (`SIM_LAP_CONTEXT_SAMPLES`) for steering smoothness and divebomb paths; single sample under caution.
+4. **Fuel EMA** — `sim/fuel_ema.py` injects `m.ful` / `m.fpe` and purges on yellow lift (matches live §2.3).
 5. **Strategy** — `resolve_live_advice()` (incident → undercut → defensive → main strategy) then `evaluate_and_forecast_strategy()`.
 6. **Auto-alert** — `evaluate_auto_alert_tick()` (lap/caution transitions).
 7. **Voice** — `_speech_lines()` for TTS preview.
@@ -232,7 +260,7 @@ python3 race_simulator.py --scenario join_traffic_p5_lap22 --start-lap 25
 
 - 20-lap race, 22-lap tank, 46s pit loss — strategy should **never** project a stop beyond lap 20.
 - Expect every lap: `TARGET PIT: CHECKERED`, no `Target Box:` line, `FORECAST: No further stops if green to the end`.
-- Validates `_can_run_to_finish()` and forecast fuel-seed fallback for sim packets (`m.fl` only). See [CALCULATIONS.md §10.3](CALCULATIONS.md#103-green-flag-rest-of-race-forecast).
+- Validates `_can_run_to_finish()` and forecast fuel-seed via `m.ful` / `m.fpe` (sim fuel EMA). See [CALCULATIONS.md §10.3](CALCULATIONS.md#103-green-flag-rest-of-race-forecast).
 
 **`tactical_caution_gate`**
 
@@ -243,7 +271,7 @@ python3 race_simulator.py --scenario join_traffic_p5_lap22 --start-lap 25
 
 - **Yellow:** Target box uses live `m.fl` (low burn keeps fuel laps high); forecast paused.
 - **Green (live):** Box uses `green_flag_fuel_laps_from_telemetry()` after EMA purge on yellow lift.
-- **Green (sim, `m.fl` only):** Box uses `floor(m.fl)` — no EMA in sim packets.
+- **Green (sim):** Same path — sim injects `m.ful`, `m.fpe`, `m.fpl` via `sim/fuel_ema.py` and purges EMA on yellow lift.
 
 - On **L4 green**, expect **TARGET PIT: CHECKERED** and no target box (5-lap race, fuel covers the distance).
 
@@ -404,6 +432,8 @@ Explicit IRSDK keys in a lap override win over synthesized defaults from `genera
 
 ```bash
 python3 -m unittest tests.test_race_simulator -v
+python3 -m unittest tests.test_session_report -v
+python3 -m unittest tests.test_sim_parity -v
 ```
 
 Covers:
@@ -417,19 +447,21 @@ Covers:
 - **Defensive mode under synthetic pressure** (`defensive_pressure` L11)
 - **Green-restart target box stability** (`tactical_caution_gate` lap 4 → CHECKERED)
 - **`default` run-to-finish** — no L22 phantom box or rolling forecast stops
+- **Session replay** — JSONL round-trip and strategy replay (`test_sim_parity`)
+- **Post-race report** — pit events, stint σ, baseline stop parsing (`test_session_report`)
 - `generate_simulated_packet_extras` default geometry
 - Tactical block present in written logs
 
-Full suite: `python3 -m unittest discover -s tests` (includes `test_tactical_integration.py`).
+Full suite: `python3 -m unittest discover -s tests` (261+ tests; includes `test_tactical_integration.py`, `test_session_report.py`).
 
 ---
 
 ## Limitations
 
 - Not a physics or AI driving sim — gaps and positions are heuristic.
-- No UI overlay; output is log files (and optional stdout with `-v`).
+- No UI overlay in the **race simulator CLI**; output is log files (and optional stdout with `-v`). Post-race review uses a separate Qt dashboard in the main app.
 - Strategy output is only as realistic as the synthesized packets; edge cases may need manual `irsdk_overrides` or hooks.
-- Does not replay recorded iRacing sessions (synthetic packets only).
-- Single context poll per lap; apex baseline is seeded (not multi-sample corner replay).
+- **Recorded live sessions** replay through production strategy via `scripts/replay_session.py` and `scripts/post_race_report.py` (synthetic scenarios remain separate from JSONL replay).
+- Sim uses **three sub-lap context polls** per green lap (`SIM_LAP_CONTEXT_SAMPLES`); caution laps use a single poll.
 
 For live behavior and formulas, see [CALCULATIONS.md](CALCULATIONS.md).
