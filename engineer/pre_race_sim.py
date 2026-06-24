@@ -71,6 +71,21 @@ class PreRaceBranchResult:
     finish_position: int
     start_position: int
     green_stops: int
+    positions_by_lap: list[list[int]]
+
+
+def _position_series_from_records(records: list[Any]) -> list[list[int]]:
+    out: list[list[int]] = []
+    for rec in records:
+        lap = getattr(rec, "lap", None)
+        pos = getattr(rec, "position", None)
+        if lap is None or pos is None:
+            continue
+        try:
+            out.append([int(lap), int(pos)])
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _parse_track_length_miles(sy: dict[str, Any]) -> float | None:
@@ -553,6 +568,7 @@ def run_caution_branch(
         finish_position=finish,
         start_position=ctx.hero_position,
         green_stops=len(pit_stops),
+        positions_by_lap=_position_series_from_records(records),
     )
 
 

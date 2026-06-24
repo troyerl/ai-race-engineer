@@ -49,6 +49,18 @@ class RemoteTelemetrySource:
     def record_advice(self, text: str) -> None:
         self._memory.record_advice(text, mode=self.ui_mode())
 
+    def position_history(self) -> list[list[int]]:
+        """Lap → class position series accumulated from streamed snapshots."""
+        by_lap = getattr(self._memory, "_pos_by_lap", {})
+        if not isinstance(by_lap, dict):
+            return []
+        out: list[list[int]] = []
+        for lap in sorted(by_lap.keys()):
+            pos = by_lap.get(lap)
+            if isinstance(lap, int) and isinstance(pos, int):
+                out.append([lap, pos])
+        return out
+
     def _fresh(self) -> bool:
         if not self._link_up or self._packet is None:
             return False

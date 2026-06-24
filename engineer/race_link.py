@@ -32,7 +32,7 @@ def _encode_line(obj: dict) -> bytes:
 
 
 class _AdviceBridge(QObject):
-    received = Signal(str, bool, bool, bool)  # text, partial, speak, include_why
+    received = Signal(str, bool, bool, bool, str)  # text, partial, speak, include_why, driver_line
 
 
 class _ClientPool:
@@ -75,7 +75,7 @@ class BroadcasterService(QObject):
 
     clients_changed = Signal(int)
     iracing_changed = Signal(bool)
-    advice_received = Signal(str, bool, bool, bool)  # text, partial, speak, include_why
+    advice_received = Signal(str, bool, bool, bool, str)  # text, partial, speak, include_why, driver_line
 
     def __init__(
         self,
@@ -182,7 +182,8 @@ class BroadcasterService(QObject):
                         partial = bool(msg.get("partial"))
                         speak = bool(msg.get("speak", True))
                         include_why = bool(msg.get("why", True))
-                        self._advice_bridge.received.emit(text, partial, speak, include_why)
+                        driver_line = str(msg.get("driver_line") or "")
+                        self._advice_bridge.received.emit(text, partial, speak, include_why, driver_line)
         finally:
             self._pool.remove(sock)
             self.clients_changed.emit(self._pool.count())
@@ -262,6 +263,7 @@ class ReceiverClient(QObject):
         partial: bool = False,
         speak: bool = True,
         include_why: bool = True,
+        driver_line: str | None = None,
     ) -> bool:
         """Send finished advice to the sim PC. Returns False if not linked or socket write fails."""
         if not self.is_linked():
@@ -270,6 +272,7 @@ class ReceiverClient(QObject):
             {
                 "t": "advice",
                 "text": str(text or ""),
+                "driver_line": str(driver_line or ""),
                 "partial": bool(partial),
                 "speak": bool(speak),
                 "why": bool(include_why),

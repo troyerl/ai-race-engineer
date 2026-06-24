@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QTabWidget,
     QToolButton,
     QSpinBox,
     QSizePolicy,
@@ -32,9 +34,11 @@ from .app_config import (
 from .auto_alert_engine import AutoMonitorState, evaluate_auto_alert_tick, reset_auto_monitor_state
 from .race_constants import ALERT_LAP_HORIZON, resolve_track_length_miles
 from .track_db import resolve_high_lat_sector, resolve_track_pit_loss_detail, resolve_track_pit_loss_seconds
-from .strategy_engine import advice_call_line, run_strategy
+from .strategy_engine import advice_call_line, driver_call_line, run_strategy
 from .strategy_worker import StrategyWorker
 from .packet_snapshot import save_telemetry_packet
+from .race_history import branches_to_meta, finalize_receiver_session_meta, finalize_session_trajectory
+from .race_history_tab import RaceHistoryTab
 from .review_dashboard import open_review_dashboard
 from .session_recorder import SessionRecorder, latest_session_file
 from .session_report import save_session_meta
@@ -147,6 +151,7 @@ class AIRaceEngineer(QWidget):
         self._review_dashboard = None
         self._review_prompted_paths: set[str] = set()
         self._last_session_state: int | None = None
+        self._history_session_path: Path | None = None
         if bool(self._config.get("session_recording", False)) and self._role != "receiver":
             self._start_session_recorder()
         self._link_host_boot = (link_host or "").strip() or str(self._config.get("race_link_host", "")).strip()
@@ -239,6 +244,12 @@ class AIRaceEngineer(QWidget):
                 border: none;
                 padding: 0 0 4px 0;
                 letter-spacing: 0.06em;
+            }
+            QLabel#driverCall {
+                color: #F0FFF4;
+                font-size: 22px;
+                font-weight: 800;
+                padding: 6px 4px;
             }
             QLabel#adviceLiveHeader {
                 color: rgba(180, 220, 190, 255);
@@ -463,6 +474,21 @@ class AIRaceEngineer(QWidget):
         self.advice_label.setMinimumHeight(280 if self._is_receiver else 160)
         self.advice_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
+        self.driver_call_label = QLabel(_standby_advice_text(True))
+        self.driver_call_label.setObjectName("driverCall")
+        self.driver_call_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.driver_call_label.setWordWrap(True)
+        self.driver_call_label.setMinimumHeight(44)
+
+        self.engineer_detail_label = QLabel(_standby_advice_text(True))
+        self.engineer_detail_label.setObjectName("adviceText")
+        self.engineer_detail_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.engineer_detail_label.setWordWrap(True)
+        self.engineer_detail_label.setMinimumHeight(200)
+        self.engineer_detail_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+
+        self._race_history_tab = RaceHistoryTab()
+
         self.baseline_strategy_column: QWidget | None = None
         self.baseline_strategy_label: QLabel | None = None
         self.live_strategy_column: QWidget | None = None
@@ -554,7 +580,22 @@ class AIRaceEngineer(QWidget):
                 "Press Analyze when you want a pit/strategy recommendation.",
             )
             self._advice_card.setObjectName("card")
-            advice_card_layout.addWidget(self.advice_label, 1)
+            driver_hdr = QLabel("DRIVER CALL")
+            driver_hdr.setObjectName("adviceColumnHeader")
+            eng_hdr = QLabel("ENGINEER DETAIL")
+            eng_hdr.setObjectName("adviceColumnHeader")
+            advice_card_layout.addWidget(driver_hdr)
+            advice_card_layout.addWidget(self.driver_call_label)
+            advice_card_layout.addWidget(eng_hdr)
+            detail_scroll = QScrollArea()
+            detail_scroll.setWidgetResizable(True)
+            detail_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+            detail_wrap = QWidget()
+            detail_layout = QVBoxLayout(detail_wrap)
+            detail_layout.setContentsMargins(0, 0, 0, 0)
+            detail_layout.addWidget(self.engineer_detail_label)
+            detail_scroll.setWidget(detail_wrap)
+            advice_card_layout.addWidget(detail_scroll, 1)
 
             self._lan_discovery = LanDeviceDiscovery(self)
             self._lan_discovery.devices_changed.connect(self._refresh_lan_device_list)
@@ -1002,24 +1043,27 @@ class AIRaceEngineer(QWidget):
             self._header_widget = header
             self.layout.addWidget(header)
 
-            left_col = QWidget()
-            left_col.setObjectName("mainColumn")
-            left_layout = QVBoxLayout(left_col)
-            left_layout.setContentsMargins(0, 0, 0, 0)
-            left_layout.setSpacing(14)
+            self._main_tabs = QTabWidget()
+            self._main_tabs.setObjectName("mainTabs")
+            live_tab = QWidget()
+            live_tab_layout = QVBoxLayout(live_tab)
+            live_tab_layout.setContentsMargins(0, 0, 0, 0)
+            live_tab_layout.setSpacing(14)
             if self._lan_panel is not None:
-                left_layout.addWidget(self._lan_panel)
+                live_tab_layout.addWidget(self._lan_panel)
             if self._advice_card is not None:
-                left_layout.addWidget(self._advice_card, 1)
+                live_tab_layout.addWidget(self._advice_card, 1)
             if self._action_bar is not None:
-                left_layout.addWidget(self._action_bar)
+                live_tab_layout.addWidget(self._action_bar)
             if self.rejoin_label is not None:
-                left_layout.addWidget(self.rejoin_label)
+                live_tab_layout.addWidget(self.rejoin_label)
+            self._main_tabs.addTab(live_tab, "Live")
+            self._main_tabs.addTab(self._race_history_tab, "Race history")
 
             split_row = QHBoxLayout()
             split_row.setContentsMargins(0, 0, 0, 0)
             split_row.setSpacing(20)
-            split_row.addWidget(left_col, 1)
+            split_row.addWidget(self._main_tabs, 1)
             if self._sidebar_scroll is not None:
                 split_row.addWidget(self._sidebar_scroll, 0)
             self.layout.addLayout(split_row, 1)
@@ -1027,7 +1071,11 @@ class AIRaceEngineer(QWidget):
             self.layout.addLayout(top_row)
             if self._lan_panel is not None:
                 self.layout.addWidget(self._lan_panel)
-            self.layout.addWidget(self.advice_panel)
+            self._main_tabs = QTabWidget()
+            self._main_tabs.setObjectName("mainTabs")
+            self._main_tabs.addTab(self.advice_panel, "Live")
+            self._main_tabs.addTab(self._race_history_tab, "Race history")
+            self.layout.addWidget(self._main_tabs)
             self.layout.addLayout(tire_row)
             self.layout.addLayout(action_col)
             if self.rejoin_label is not None:
@@ -1270,6 +1318,8 @@ class AIRaceEngineer(QWidget):
 
     def _on_receiver_link_changed(self, up: bool) -> None:
         self.telemetry.set_link_up(up)
+        if self._role == "receiver" and not up and self._history_session_path is not None:
+            self._finalize_session_for_history(self._history_session_path)
         self._update_connection_badge()
         if self._role == "receiver":
             self._refresh_lan_device_list()
@@ -1378,13 +1428,17 @@ class AIRaceEngineer(QWidget):
         self._relayout_overlay()
 
     def _set_advice_text(self, text: str):
-        self.advice_label.setText(text)
         if self._is_receiver:
+            radio = driver_call_line(str(text)) or _first_nonempty_line(str(text))
+            self.driver_call_label.setText(radio or _standby_advice_text(True))
+            self.engineer_detail_label.setText(str(text))
             name = "adviceStandby" if self._is_standby_advice(text) else "adviceText"
-            if self.advice_label.objectName() != name:
-                self.advice_label.setObjectName(name)
-                self.advice_label.style().unpolish(self.advice_label)
-                self.advice_label.style().polish(self.advice_label)
+            if self.engineer_detail_label.objectName() != name:
+                self.engineer_detail_label.setObjectName(name)
+                self.engineer_detail_label.style().unpolish(self.engineer_detail_label)
+                self.engineer_detail_label.style().polish(self.engineer_detail_label)
+        else:
+            self.advice_label.setText(text)
         self._apply_strategy_compare_layout()
         self.layout.activate()
         self._relayout_overlay()
@@ -1599,6 +1653,61 @@ class AIRaceEngineer(QWidget):
         self._set_ai_status("Saved")
         self._set_advice_text(f"Packet saved → {path.resolve()}")
 
+    def _save_pre_race_branch_trajectories(self) -> None:
+        """Persist 3-branch position series to session meta for race history charts."""
+        try:
+            from .pre_race_sim import run_pre_race_simulation
+            from .session_recorder import SessionRecorder
+
+            packet_json = self.telemetry.build_packet(
+                tire_sets_remaining=int(self.tire_spin.value()),
+                pit_loss_sec=int(self.pit_spin.value()),
+            )
+            telemetry = json.loads(packet_json)
+            track = self.telemetry.track_name() if hasattr(self.telemetry, "track_name") else None
+            ctx, _green, branches = run_pre_race_simulation(telemetry, track_name=track)
+            meta = {
+                "pre_race_branches": branches_to_meta(branches),
+                "track_name": ctx.track_name,
+            }
+            if self._session_recorder is not None:
+                save_session_meta(self._session_recorder.path, meta)
+            else:
+                rec = SessionRecorder.start(track_name=ctx.track_name)
+                save_session_meta(rec.path, meta)
+                if not self._is_receiver and bool(self.session_recording_toggle.isChecked()):
+                    self._session_recorder = rec
+                else:
+                    self._history_session_path = rec.path
+        except Exception:
+            pass
+
+    def _finalize_session_for_history(self, session_path: Path | None = None) -> None:
+        try:
+            path = session_path
+            if path is None:
+                path = self._session_path_for_review()
+            if path is None and self._history_session_path is not None:
+                path = self._history_session_path
+            if path is None:
+                return
+            if self._is_receiver and hasattr(self.telemetry, "position_history"):
+                positions = self.telemetry.position_history()
+                if len(positions) >= 2:
+                    finalize_receiver_session_meta(
+                        path,
+                        positions,
+                        track_name=self.telemetry.track_name(),
+                    )
+                else:
+                    finalize_session_trajectory(path)
+            else:
+                finalize_session_trajectory(path)
+            if hasattr(self, "_race_history_tab"):
+                self._race_history_tab.refresh()
+        except Exception:
+            pass
+
     def _start_session_recorder(self) -> None:
         if self._is_receiver:
             return
@@ -1655,7 +1764,10 @@ class AIRaceEngineer(QWidget):
         box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         box.setDefaultButton(QMessageBox.StandardButton.Yes)
         if box.exec() == QMessageBox.StandardButton.Yes:
+            self._finalize_session_for_history(path)
             self._review_dashboard = open_review_dashboard(self, session_path=path)
+        else:
+            self._finalize_session_for_history(path)
 
     def _update_pit_loss_source_label(self) -> None:
         if not hasattr(self, "pit_source_label"):
@@ -1762,6 +1874,7 @@ class AIRaceEngineer(QWidget):
             return
         if self._last_request_mode == "strategy":
             self._pin_baseline_strategy(str(text))
+            self._save_pre_race_branch_trajectories()
         call_line = advice_call_line(str(text))
         if call_line:
             self._auto_last_call_line = call_line
@@ -1834,6 +1947,9 @@ class AIRaceEngineer(QWidget):
             if was_connected:
                 self._reset_auto_monitor()
                 self._clear_baseline_strategy()
+                path = self._session_path_for_review()
+                if path is not None:
+                    self._finalize_session_for_history(path)
                 self._maybe_prompt_session_review(reason="disconnect")
 
         # On initial connect or reconnect, set a sensible default pit-loss
@@ -2023,6 +2139,7 @@ class AIRaceEngineer(QWidget):
             partial=partial,
             speak=speak,
             include_why=bool(self.voice_why_toggle.isChecked()),
+            driver_line=driver_call_line(str(text)),
         )
         if speak and not sent:
             print("[WARN] Advice voice relay to sim PC failed (socket write)")

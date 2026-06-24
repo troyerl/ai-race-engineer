@@ -1736,6 +1736,14 @@ def format_strategy_dashboard(
         lines.append(f"                   {detail}")
     if reentry_extra:
         lines.append(f"                   {reentry_extra}")
+    try:
+        from .race_memory_strategy import race_memory_context_lines
+
+        rm = race_memory_context_lines(telemetry)
+        if rm:
+            lines.append(f"                   [ Race memory: {rm} ]")
+    except Exception:
+        pass
     lines.append(_dash_sep())
 
     fuel_short = m.get("ls")
@@ -1874,6 +1882,19 @@ def advice_call_line(advice: str) -> str:
     if action:
         return f"{action} — {timing or 'THIS LAP'} — {service or 'NONE'}"
     return _first_call_line(advice)
+
+
+def driver_call_line(advice: str) -> str:
+    """Short radio-style call for the driver / sim PC TTS."""
+    action, _timing, service = parse_call_line(advice)
+    if not action:
+        head = _first_call_line(advice)
+        return head[:96] if head else ""
+    parts = [action.replace("_", " ")]
+    svc = (service or "").upper()
+    if svc and svc not in ("NONE", ""):
+        parts.append(svc.replace("_", " "))
+    return " · ".join(parts)
 
 
 def _normalize_display_service(service_raw: str) -> str:

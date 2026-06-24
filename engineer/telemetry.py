@@ -49,6 +49,7 @@ from .track_db import (
     normalize_track_key,
     resolve_high_lat_sector,
 )
+from .race_memory import RaceMemory
 from .tire_model import compute_stagger_from_corners, effective_tire_falloff_s
 
 # AI-facing packet uses US customary fuel units (internal math stays liters + kg/h).
@@ -787,6 +788,7 @@ class TelemetryTracker:
         self._sector_learner = SectorLearner()
         self._last_sector_flush_lap: int | None = None
         self._pit_loss_learned_notice: tuple[float, str] | None = None
+        self._race_memory = RaceMemory()
 
     def ensure_connected(self) -> bool:
         if not self.ir.is_connected:
@@ -2130,6 +2132,16 @@ class TelemetryTracker:
                 rr.pop("ftl", None)
 
         packet = drop_nones(packet)
+
+        self._race_memory.record_snapshot(
+            {
+                "packet": packet,
+                "track": self.track_name(),
+                "iracing": True,
+                "mode": self.ui_mode(),
+            }
+        )
+        packet = self._race_memory.enrich_packet(packet)
 
         return json.dumps(packet, separators=(",", ":"))
 

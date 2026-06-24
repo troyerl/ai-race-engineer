@@ -152,7 +152,9 @@ Settings persist to `~/.ai_race_engineer.json`. Per-track pit loss and learned c
 
 - **Broadcaster** listens on the LAN and pushes telemetry snapshots.
 - **Receiver** discovers sim PCs on the network and connects over TCP.
-- Strategy runs on the engineer PC; **RaceMemory** accumulates long-horizon context from streamed snapshots.
+- Strategy runs on the engineer PC; **RaceMemory** accumulates long-horizon context from streamed snapshots and feeds the strategy dashboard (`[ Race memory: … ]` lines).
+- **Driver call vs engineer detail** (receiver): short **DRIVER CALL** radio line; full **ENGINEER DETAIL** panel with WHY/FORECAST. Sim PC TTS speaks the driver line only (optional WHY after).
+- **Race history tab**: line chart comparing LIGHT / MODERATE / HEAVY pre-race branch projections vs **ACTUAL** lap-by-lap position (P start → P finish in legend).
 - Voice can play on the sim PC while advice displays on the engineer PC.
 
 ---

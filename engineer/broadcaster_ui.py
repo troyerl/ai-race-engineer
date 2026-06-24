@@ -13,7 +13,7 @@ from .app_config import ensure_default_config_file, load_config, write_config
 from .race_link import DEFAULT_RACE_LINK_PORT, BroadcasterService
 from .lan_discovery import BroadcasterBeacon
 from .speech import speak_engineer_advice
-from .strategy_engine import advice_call_line
+from .strategy_engine import advice_call_line, driver_call_line, parse_advice_why
 from .telemetry import DEFAULT_TIRE_SETS_FALLBACK, TelemetryTracker
 
 # Receiver overrides pit loss on the engineer PC; tire sets stream from SDK on the sim PC.
@@ -246,7 +246,7 @@ class BroadcasterWindow(QWidget):
             "packet": packet,
         }
 
-    def _on_advice(self, text: str, partial: bool, speak: bool, include_why: bool) -> None:
+    def _on_advice(self, text: str, partial: bool, speak: bool, include_why: bool, driver_line: str = "") -> None:
         if partial:
             return
         if not speak:
@@ -256,17 +256,21 @@ class BroadcasterWindow(QWidget):
         if not body or body.startswith(("AI Error", "Error:")):
             self.voice_badge.setText("Voice: engineer PC reported an error")
             return
-        call_line = advice_call_line(body)
-        if call_line and call_line == self._last_spoken_call_line:
+        radio = (driver_line or "").strip() or driver_call_line(body) or advice_call_line(body)
+        if radio and radio == self._last_spoken_call_line:
             return
-        if call_line:
-            self._last_spoken_call_line = call_line
-        self.voice_badge.setText("Voice: speaking engineer call…")
+        if radio:
+            self._last_spoken_call_line = radio
+        self.voice_badge.setText("Voice: speaking driver call…")
 
         def _speak() -> None:
             ok = False
             try:
-                ok = bool(speak_engineer_advice(body, include_why=include_why))
+                ok = bool(speak_engineer_advice(radio, include_why=False))
+                if include_why:
+                    why = parse_advice_why(body)
+                    if why:
+                        speak_engineer_advice(why, include_why=False)
             except Exception as exc:
                 print(f"[WARN] broadcaster TTS failed: {exc}")
             finally:
